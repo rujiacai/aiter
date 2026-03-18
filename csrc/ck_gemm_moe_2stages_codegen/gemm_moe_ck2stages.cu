@@ -83,6 +83,8 @@ void ck_moe_stage1(torch::Tensor &hidden_states,     // [m, k], input token
     int sorted_size = std::min(int64_t(tokens * topk * block_m.value()), sorted_token_ids.size(0));
     int E = w1.size(0);
     int N = w1.size(1) / 2;
+    if (w1.size(1) == w2.size(2))
+        N = w1.size(1);
     int K = hidden_states.size(-1);
     int MPerBlock = block_m.value();
 

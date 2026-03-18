@@ -94,8 +94,8 @@ def get_flydsl_stage2_kernels(
 
 def _register_all_configs():
     """Pre-populate _KERNEL_PARAMS with all supported configs at import time."""
-    for a in ("fp8", "fp4", "fp16"):
-        for b in ("fp4",):
+    for a in ("fp8", "fp4", "fp16", "int8"):
+        for b in ("fp4", "int8"):
             for out in ("bf16", "f16"):
                 _KERNEL_PARAMS.update(get_flydsl_stage1_kernels(a, b, out))
                 _KERNEL_PARAMS.update(get_flydsl_stage2_kernels(a, b, out))
@@ -116,8 +116,13 @@ def compile_flydsl_moe_stage1(
     a_dtype: str,
     b_dtype: str,
     out_dtype: str,
+    g1u0: bool = False,
 ):
-    """Compile stage1 kernel (cached via underlying lru_cache)."""
+    """Compile stage1 kernel (cached via underlying lru_cache).
+
+    g1u0: if True, G1U0 mode (1 Gate 0 Up): W1 [experts, inter_dim, model_dim],
+          output Silu(gate). If False, G1U1 with SwiGLU/silu*gate*up.
+    """
     if b_dtype == "fp4":
         from .kernels.mixed_moe_gemm_2stage import compile_mixed_moe_gemm1
 
@@ -134,6 +139,7 @@ def compile_flydsl_moe_stage1(
             b_dtype=b_dtype,
             out_dtype=out_dtype,
             use_cshuffle_epilog=(out_dtype == "fp8"),
+            g1u0=g1u0,
         )
     else:
         from .kernels.moe_gemm_2stage import compile_moe_gemm1
@@ -149,6 +155,8 @@ def compile_flydsl_moe_stage1(
             doweight_stage1=doweight_stage1,
             in_dtype=a_dtype,
             out_dtype=out_dtype,
+            use_cshuffle_epilog=(out_dtype == "f16"),
+            g1u0=g1u0,
         )
 
 
@@ -219,6 +227,7 @@ def _get_compiled_stage1(
     a_dtype: str,
     b_dtype: str,
     out_dtype: str,
+    g1u0: bool = False,
 ):
     """Compile and cache stage1 kernel, return a tensor_api closure."""
     exe = compile_flydsl_moe_stage1(
@@ -233,9 +242,11 @@ def _get_compiled_stage1(
         a_dtype=a_dtype,
         b_dtype=b_dtype,
         out_dtype=out_dtype,
+        g1u0=g1u0,
     )
     is_fp4 = b_dtype == "fp4"
-    _n_in = inter_dim * 2 if is_fp4 else inter_dim
+    # G1U0: W1 N-dim = inter_dim; G1U1/fp4: 2*inter_dim for gate+up
+    _n_in = inter_dim if g1u0 else (inter_dim * 2 if is_fp4 else inter_dim)
     _k_in = model_dim
 
     def tensor_api(
@@ -429,15 +440,18 @@ def flydsl_moe_stage1(
     w1_scale: Optional[torch.Tensor] = None,
     a1_scale: Optional[torch.Tensor] = None,
     sorted_weights: Optional[torch.Tensor] = None,
+    g1u0: bool = False,
 ) -> torch.Tensor:
     """Fused gate+up GEMM (MOE stage1).
 
-    a: (token_num, model_dim), w1: (E, 2*inter_dim, model_dim) pre-shuffled.
+    a: (token_num, model_dim).
+    w1: (E, 2*inter_dim, model_dim) pre-shuffled for G1U1, or (E, inter_dim, model_dim) for G1U0.
+    g1u0: if True, W1 is (E, inter_dim, model_dim) and output is Silu(gate); else gate+up / SwiGLU.
     Returns (token_num, topk, inter_dim).
     """
     token_num = a.shape[0]
     E = w1.shape[0]
-    inter_dim = w1.shape[1] // 2
+    inter_dim = w1.shape[1] if g1u0 else (w1.shape[1] // 2)
     model_dim = a.shape[1]
 
     if a_dtype == "fp4":
@@ -475,6 +489,7 @@ def flydsl_moe_stage1(
         a_dtype=a_dtype,
         b_dtype=b_dtype,
         out_dtype=out_dtype,
+        g1u0=g1u0,
     )
     tensor_api(
         out.view(-1),

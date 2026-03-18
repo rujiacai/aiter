@@ -24,7 +24,8 @@ from flydsl.lang.ir.types import T as I
 
 from flydsl.dialects.ext import arith, gpu, buffer_ops, llvm, vector, rocdl, scf, memref
 
-from flydsl.kernels.mfma_preshuffle_pipeline import (
+#from flydsl.kernels.mfma_preshuffle_pipeline import (
+from aiter.ops.flydsl.kernels.mfma_preshuffle_pipeline import (
     buffer_copy_gmem16_dwordx4,
     lds_store_4b_xor16,
     lds_store_8b_xor16,
@@ -33,7 +34,7 @@ from flydsl.kernels.mfma_preshuffle_pipeline import (
     load_b_pack_k32,
     tile_chunk_coord_i32,
 )
-from flydsl.kernels.mfma_epilogues import c_shuffle_epilog, default_epilog, mfma_epilog
+from aiter.ops.flydsl.kernels.mfma_epilogues import c_shuffle_epilog, default_epilog, mfma_epilog
 from flydsl.kernels.kernels_common import stream_ptr_to_async_token
 
 
@@ -52,8 +53,12 @@ def compile_moe_gemm1(
     in_dtype: str = "fp8",
     out_dtype: str = "f16",
     use_cshuffle_epilog: bool | None = None,
+    g1u0: bool = False,
 ):
     """Compile stage1 kernel (`moe_gemm1`) and return the compiled executable.
+
+    g1u0: if True, G1U0 mode (1 Gate 0 Up): W1 [experts, inter_dim, model_dim],
+          output Silu(gate) only. If False, G1U1: W1 [experts, 2*inter_dim, model_dim] (gate+up).
 
     in_dtype:
       - "fp8": X/W are fp8
@@ -102,11 +107,13 @@ def compile_moe_gemm1(
             )
 
     DYN = ir.ShapedType.get_dynamic_size()
+    # G1U0: W1 N-dim = inter_dim; G1U1: W1 N-dim = 2*inter_dim
+    effective_n_per_expert = inter_dim if g1u0 else (2 * inter_dim)
     # W is packed int4 for W4A8: 2 values per byte.
     (
-        (experts * (2 * inter_dim) * model_dim) // 2
+        (experts * effective_n_per_expert * model_dim) // 2
         if is_int4
-        else (experts * (2 * inter_dim) * model_dim)
+        else (experts * effective_n_per_expert * model_dim)
     )
 
     total_threads = 256
@@ -150,8 +157,9 @@ def compile_moe_gemm1(
     epilog_tag = "cshuffle" if use_cshuffle_epilog else "direct"
     # IMPORTANT: module name participates in FlyDSL's compile cache key.
     # Keep an explicit ABI tag so signature changes can't accidentally reuse an old binary.
+    g1u_tag = "g1u0" if g1u0 else "g1u1"
     module_name = (
-        f"mfma_moe1_{in_dtype}_{out_dtype}_{epilog_tag}"
+        f"mfma_moe1_{in_dtype}_{out_dtype}_{epilog_tag}_{g1u_tag}"
         f"_t{tile_m}x{tile_n}x{tile_k}"
         f"_abi3"  # also mask sentinel token ids on loads (X/scale_x) to avoid illegal address faults
     ).replace("-", "_")
@@ -189,7 +197,7 @@ def compile_moe_gemm1(
                 DYN, I.f16 if is_f16 else (I.i8 if is_int8 else I.f8)
             ),
             arg_scale_x: lambda: T.memref(DYN, T.f32()),
-            arg_scale_w: lambda: T.memref(experts * (2 * inter_dim), T.f32()),
+            arg_scale_w: lambda: T.memref(experts * effective_n_per_expert, T.f32()),
             arg_sorted_token_ids: lambda: T.memref(DYN, T.i32()),
             arg_expert_ids: lambda: T.memref(DYN, T.i32()),
             arg_sorted_weights: lambda: T.memref(DYN, T.f32()),
@@ -241,8 +249,8 @@ def compile_moe_gemm1(
             # Layouts
             flir.make_layout((tokens_in, k_in), stride=(k_in, 1))
 
-            # B preshuffle layout: match GEMM test helper exactly.
-            c_n_total = arith.constant(experts * (2 * inter_dim), index=True)
+            # B preshuffle layout: match GEMM test helper exactly. G1U0: N = experts*inter_dim; G1U1: experts*2*inter_dim
+            c_n_total = arith.constant(experts * effective_n_per_expert, index=True)
             kpack_bytes = 8 if is_int4 else 16
             b_layout = make_preshuffle_b_layout(
                 flir,
@@ -369,7 +377,8 @@ def compile_moe_gemm1(
                     expert_rsrc, bx, vec_width=1, dtype=i32
                 )
                 expert_idx = arith.index_cast(ir.IndexType.get(), expert_i32)
-                inter2_idx = arith.constant(2 * inter_dim, index=True)
+                # G1U0: N = inter_dim per expert; G1U1: 2*inter_dim (gate+up)
+                inter2_idx = arith.constant(effective_n_per_expert, index=True)
                 expert_off_idx = expert_idx * inter2_idx  # index
 
                 # ---- X gmem->reg prefetch (match preshuffle GEMM mapping) ----
@@ -549,7 +558,8 @@ def compile_moe_gemm1(
                     col_g_list.append(col_g)
 
                     row_gate = expert_off_idx + col_g
-                    row_up = row_gate + inter_idx
+                    # G1U0: no up rows; use gate coords for "up" load so we stay in-bounds (up acc skipped).
+                    row_up = row_gate + (inter_idx if not g1u0 else arith.constant(0, index=True))
 
                     coord_gate = flir.idx2crd(row_gate, layout_n_blk_intra)
                     n_blk_gate.append(flir.get(coord_gate, 0))
@@ -723,7 +733,7 @@ def compile_moe_gemm1(
                         for ni in range_constexpr(num_acc_n):
                             col_g = col_g_list[ni]
                             row_gate_idx = expert_off_pf + col_g
-                            row_up_idx = row_gate_idx + inter_idx
+                            row_up_idx = row_gate_idx + (inter_idx if not g1u0 else arith.constant(0, index=True))
                             sw_gate_pf.append(
                                 arith.f32(1.0)
                                 if is_f16
@@ -733,7 +743,7 @@ def compile_moe_gemm1(
                             )
                             sw_up_pf.append(
                                 arith.f32(1.0)
-                                if is_f16
+                                if is_f16 or g1u0
                                 else buffer_ops.buffer_load(
                                     sw_rsrc, row_up_idx, vec_width=1, dtype=f32
                                 )
@@ -781,13 +791,14 @@ def compile_moe_gemm1(
                                     b_gate_packs0[ni],
                                     b_gate_packs1[ni],
                                 )
-                                up_list[acc_idx] = mfma_k64(
-                                    up_list[acc_idx],
-                                    a0,
-                                    a1,
-                                    b_up_packs0[ni],
-                                    b_up_packs1[ni],
-                                )
+                                if not g1u0:
+                                    up_list[acc_idx] = mfma_k64(
+                                        up_list[acc_idx],
+                                        a0,
+                                        a1,
+                                        b_up_packs0[ni],
+                                        b_up_packs1[ni],
+                                    )
                     return gate_list, up_list, epilogue_pf
 
                 # ---------------- 2-stage pipeline (ping-pong LDS + B tile prefetch) ----------------
@@ -953,7 +964,7 @@ def compile_moe_gemm1(
                     for ni in range_constexpr(num_acc_n):
                         col_g = col_g_list[ni]
                         row_gate_idx = expert_off + col_g
-                        row_up_idx = row_gate_idx + inter_idx
+                        row_up_idx = row_gate_idx + (inter_idx if not g1u0 else arith.constant(0, index=True))
                         sw_gate_vals.append(
                             arith.f32(1.0)
                             if is_f16
@@ -963,7 +974,7 @@ def compile_moe_gemm1(
                         )
                         sw_up_vals.append(
                             arith.f32(1.0)
-                            if is_f16
+                            if is_f16 or g1u0
                             else buffer_ops.buffer_load(
                                 sw_rsrc, row_up_idx, vec_width=1, dtype=f32
                             )
@@ -1044,9 +1055,10 @@ def compile_moe_gemm1(
                                 vg = arith.sitofp(f32, vg)
                                 vu = arith.sitofp(f32, vu)
                             vg = vg * sx * sw_gate
-                            vu = vu * sx * sw_up
+                            if not g1u0:
+                                vu = vu * sx * sw_up
 
-                            y = silu(vg) * vu
+                            y = silu(vg) * (vu if not g1u0 else arith.constant(1.0, type=T.f16()))
                             if doweight_stage1:
                                 y = y * tw
                             y16 = arith.trunc_f(T.f16(), y)
@@ -1162,9 +1174,10 @@ def compile_moe_gemm1(
                                 vg = arith.sitofp(f32, vg)
                                 vu = arith.sitofp(f32, vu)
                             vg = vg * sx * sw_gate
-                            vu = vu * sx * sw_up
+                            if not g1u0:
+                                vu = vu * sx * sw_up
 
-                            y = silu(vg) * vu
+                            y = silu(vg) * (vu if not g1u0 else arith.constant(1.0, type=out_mlir()))
                             if doweight_stage1:
                                 y = y * tw
                             y = arith.trunc_f(out_mlir(), y)
@@ -1192,7 +1205,7 @@ def compile_moe_gemm1(
                 DYN, I.f16 if is_f16 else (I.i8 if is_int8 else I.f8)
             ),
             arg_scale_x: lambda: T.memref(DYN, T.f32()),
-            arg_scale_w: lambda: T.memref(experts * (2 * inter_dim), T.f32()),
+            arg_scale_w: lambda: T.memref(experts * effective_n_per_expert, T.f32()),
             arg_sorted_token_ids: lambda: T.memref(DYN, T.i32()),
             arg_expert_ids: lambda: T.memref(DYN, T.i32()),
             arg_sorted_weights: lambda: T.memref(DYN, T.f32()),

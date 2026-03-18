@@ -79,6 +79,30 @@ MoeKernel moe_dispatch(int M, int N, int K, int block_m, int activation, bool ha
                     M, N, K, block_m);
             }
         }
+        else if (activation == 1 && has_bias) {
+            if (stage == 1)
+            {
+                return moe_gemm1_heuristic_dispatcher<ADataType, BDataType, AccDataType, CDataType, 1, true, true>::dispatch(
+                    M, N, K, block_m);
+            }
+            else
+            {
+                return moe_gemm2_heuristic_dispatcher<ADataType, BDataType, AccDataType, CDataType, 1, true, true>::dispatch(
+                    M, N, K, block_m);
+            }
+        }
+        else if (activation == 1 && !has_bias) {
+            if (stage == 1)
+            {
+                return moe_gemm1_heuristic_dispatcher<ADataType, BDataType, AccDataType, CDataType, 1, false, true>::dispatch(
+                    M, N, K, block_m);
+            }
+            else
+            {
+                return moe_gemm2_heuristic_dispatcher<ADataType, BDataType, AccDataType, CDataType, 1, false, true>::dispatch(
+                    M, N, K, block_m);
+            }
+        }
         else if (activation == 0 && has_bias) {
             if (stage == 1)
             {
@@ -128,6 +152,30 @@ MoeKernel moe_dispatch(int M, int N, int K, int block_m, int activation, bool ha
             else
             {
                 return moe_gemm2_heuristic_dispatcher<ADataType, BDataType, AccDataType, CDataType, 2, false, false>::dispatch(
+                    M, N, K, block_m);
+            }
+        }
+        else if (activation == 1 && has_bias) {
+            if (stage == 1)
+            {
+                return moe_gemm1_heuristic_dispatcher<ADataType, BDataType, AccDataType, CDataType, 1, true, false>::dispatch(
+                    M, N, K, block_m);
+            }
+            else
+            {
+                return moe_gemm2_heuristic_dispatcher<ADataType, BDataType, AccDataType, CDataType, 1, true, false>::dispatch(
+                    M, N, K, block_m);
+            }
+        }
+        else if (activation == 1 && !has_bias) {
+            if (stage == 1)
+            {
+                return moe_gemm1_heuristic_dispatcher<ADataType, BDataType, AccDataType, CDataType, 1, false, false>::dispatch(
+                    M, N, K, block_m);
+            }
+            else
+            {
+                return moe_gemm2_heuristic_dispatcher<ADataType, BDataType, AccDataType, CDataType, 1, false, false>::dispatch(
                     M, N, K, block_m);
             }
         }
@@ -232,18 +280,81 @@ torch::Tensor cktile_moe_gemm1(torch::Tensor& XQ,
                 act_op,
                 k_batch);
         }
+        else if (WQ.dtype() == torch_fp8 && Y.dtype() == at::ScalarType::BFloat16)
+        {
+            std::cout << "====================== call kernel1 a8w8 moe_dispatch<fp8, fp8, float, bf16, 1> ======================" << std::endl;
+            moe_dispatch<fp8, fp8, float, bf16, 1>(M, N, K, MPerBlock, act_op, has_bias, k_batch)(
+                XQ,
+                WQ,
+                Y,
+                sorted_ids,
+                sorted_expert_ids,
+                max_token_ids,
+                topk,
+                n_padded_zeros,
+                k_padded_zeros,
+                topk_weight,
+                x_scale,
+                w_scale,
+                exp_bias,
+                act_op,
+                k_batch);
+        }
+    }
+    else if(XQ.dtype() == torch::kInt8)
+    {
+        if (WQ.dtype() == torch::kInt8 && Y.dtype() == at::ScalarType::BFloat16)
+        {
+            std::cout << "====================== call kernel1 a8w8 moe_dispatch<int8, int8, float, bf16, 1> ======================" << std::endl;
+            moe_dispatch<int8_t, int8_t, float, bf16, 1>(M, N, K, MPerBlock, act_op, has_bias, k_batch)(
+                XQ,
+                WQ,
+                Y,
+                sorted_ids,
+                sorted_expert_ids,
+                max_token_ids,
+                topk,
+                n_padded_zeros,
+                k_padded_zeros,
+                topk_weight,
+                x_scale,
+                w_scale,
+                exp_bias,
+                act_op,
+                k_batch);
+        }
     }
     else if((XQ.dtype() == at::ScalarType::BFloat16 || XQ.dtype() == at::ScalarType::Half) &&
-            (WQ.dtype() == torch_fp4x2)) // a16w4
+            (WQ.dtype() == torch_fp4x2 || WQ.dtype() == torch::kInt8)) // a16w4
     {
         // if (Y.dtype() == at::ScalarType::Half)
         // {
         //    moe_dispatch<fp16, pk_fp4, float, fp16, 1>(M, N, K, MPerBlock)(XQ, WQ, Y, sorted_ids,
         //    sorted_expert_ids, max_token_ids, topk, topk_weight, x_scale, w_scale, exp_bias);
         // }
-        if(Y.dtype() == at::ScalarType::BFloat16)
+        if(Y.dtype() == at::ScalarType::BFloat16 && WQ.dtype() == torch_fp4x2)
         {
             moe_dispatch<bf16, pk_fp4, float, bf16, 1>(M, N, K, MPerBlock, act_op, has_bias, k_batch)(
+                XQ,
+                WQ,
+                Y,
+                sorted_ids,
+                sorted_expert_ids,
+                max_token_ids,
+                topk,
+                n_padded_zeros,
+                k_padded_zeros,
+                topk_weight,
+                x_scale,
+                w_scale,
+                exp_bias,
+                act_op,
+                k_batch);
+        }
+        else if(Y.dtype() == at::ScalarType::BFloat16 && WQ.dtype() == torch::kInt8)
+        {
+            std::cout << "====================== call kernel1 a16w8 moe_dispatch<bf16, int8, float, bf16, 1> ======================" << std::endl;
+            moe_dispatch<bf16, int8_t, float, bf16, 1>(M, N, K, MPerBlock, act_op, has_bias, k_batch)(
                 XQ,
                 WQ,
                 Y,
@@ -334,18 +445,81 @@ torch::Tensor cktile_moe_gemm2(torch::Tensor& XQ,
                 act_op,
                 k_batch);
         }
+        else if (WQ.dtype() == torch_fp8 && Y.dtype() == at::ScalarType::BFloat16)
+        {
+            std::cout << "====================== call kernel2 a8w8 moe_dispatch<fp8, fp8, float, bf16, 1> ======================" << std::endl;
+            moe_dispatch<fp8, fp8, float, bf16, 2>(M, N, K, MPerBlock, act_op, has_bias, k_batch)(
+                XQ,
+                WQ,
+                Y,
+                sorted_ids,
+                sorted_expert_ids,
+                max_token_ids,
+                topk,
+                n_padded_zeros,
+                k_padded_zeros,
+                topk_weight,
+                x_scale,
+                w_scale,
+                exp_bias,
+                act_op,
+                k_batch);
+        }
+    }
+    else if (XQ.dtype() == torch::kInt8)
+    {
+        if (WQ.dtype() == torch::kInt8 && Y.dtype() == at::ScalarType::BFloat16)
+        {
+            std::cout << "====================== call kernel2 a8w8 moe_dispatch<fp8, fp8, float, bf16, 1> ======================" << std::endl;
+            moe_dispatch<int8_t, int8_t, float, bf16, 2>(M, N, K, MPerBlock, act_op, has_bias, k_batch)(
+                XQ,
+                WQ,
+                Y,
+                sorted_ids,
+                sorted_expert_ids,
+                max_token_ids,
+                topk,
+                n_padded_zeros,
+                k_padded_zeros,
+                topk_weight,
+                x_scale,
+                w_scale,
+                exp_bias,
+                act_op,
+                k_batch);
+        }
     }
     else if((XQ.dtype() == at::ScalarType::BFloat16 || XQ.dtype() == at::ScalarType::Half) &&
-            (WQ.dtype() == torch_fp4x2)) // a16w4
+            (WQ.dtype() == torch_fp4x2 || WQ.dtype() == torch::kInt8)) // a16w4
     {
         // if (Y.dtype() == at::ScalarType::Half)
         // {
         //    moe_dispatch<fp16, pk_fp4, float, fp16, 2>(M, N, K, MPerBlock)(XQ, WQ, Y, sorted_ids,
         //    sorted_expert_ids, max_token_ids, topk, topk_weight, x_scale, w_scale, exp_bias);
         // }
-        if(Y.dtype() == at::ScalarType::BFloat16)
+        if(Y.dtype() == at::ScalarType::BFloat16 && WQ.dtype() == torch_fp4x2)
         {
             moe_dispatch<bf16, pk_fp4, float, bf16, 2>(M, N, K, MPerBlock, act_op, has_bias, k_batch)(
+                XQ,
+                WQ,
+                Y,
+                sorted_ids,
+                sorted_expert_ids,
+                max_token_ids,
+                topk,
+                n_padded_zeros,
+                k_padded_zeros,
+                topk_weight,
+                x_scale,
+                w_scale,
+                exp_bias,
+                act_op,
+                k_batch);
+        }
+        else if(Y.dtype() == at::ScalarType::BFloat16 && WQ.dtype() == torch::kInt8)
+        {
+            std::cout << "====================== call kernel2 a16w8 moe_dispatch<fp8, fp8, float, bf16, 1> ======================" << std::endl;
+            moe_dispatch<bf16, int8_t, float, bf16, 2>(M, N, K, MPerBlock, act_op, has_bias, k_batch)(
                 XQ,
                 WQ,
                 Y,

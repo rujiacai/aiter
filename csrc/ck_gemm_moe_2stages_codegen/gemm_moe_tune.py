@@ -150,7 +150,10 @@ class FmoeTuner(TunerCommon):
         q_type,
         act_type,
     ):
-        inter_dim = w1_qt_shffle_ck.shape[1] // 2
+        if w1_qt_shffle_ck.shape[1] == w2_qt_shffle_ck.shape[2]:
+            inter_dim = w1_qt_shffle_ck.shape[1]
+        else:
+            inter_dim = w1_qt_shffle_ck.shape[1] // 2
         token_num = a1_qt.shape[0]
         out = torch.empty(
             (token_num, topk, inter_dim),
@@ -203,13 +206,12 @@ class FmoeTuner(TunerCommon):
     ):
         model_dim = w2_qt_shffle_ck.shape[1]
         token_num = a2_qt.shape[0]
-
         out = torch.zeros(
             (token_num, model_dim),
             dtype=dtype,
             device=a2_qt.device,
         )
-        return ck_moe_stage2_fwd(
+        outr = ck_moe_stage2_fwd(
             a2_qt,
             w1_qt_shffle_ck,
             w2_qt_shffle_ck,
@@ -226,6 +228,7 @@ class FmoeTuner(TunerCommon):
             q_type,
             act_type,
         )
+        return outr
 
     @staticmethod
     def run_flydsl_stage1_out(
@@ -261,6 +264,7 @@ class FmoeTuner(TunerCommon):
             w1_scale=w1_scale,
             a1_scale=a1_scale,
             sorted_weights=sorted_weights,
+            g1u0=(w1_qt_shffle_ck.shape[1] == w2_qt_shffle_ck.shape[2]),
         )
 
     @staticmethod
@@ -1670,7 +1674,7 @@ class FmoeTuner(TunerCommon):
             True,  # bpreshuffle
         )
         for blockM in blockMs:
-            if blockM in [16, 32, 64, 128] and use_g1u1:
+            if blockM in [16, 32, 64, 128]:# and use_g1u1:
                 for kernel in ck_stage1_kernels.values():
                     if kernel.MPerBlock != blockM:
                         continue
@@ -1793,17 +1797,18 @@ class FmoeTuner(TunerCommon):
             doweight_stage1,
         ) = info
 
-        if q_type != QuantType.per_1x32 or q_dtype_w != dtypes.fp4x2:
+        if (q_type != QuantType.per_1x32 and q_type != QuantType.per_Token) or (q_dtype_w != dtypes.fp4x2 and q_dtype_w != dtypes.i8):
             return tasks_flydsl
 
         _a_dtype_map = {
+            dtypes.i8: "int8",
             dtypes.fp8: "fp8",
             dtypes.fp4x2: "fp4",
             dtypes.fp16: "fp16",
             dtypes.bf16: "fp16",
         }
         a_dtype_str = _a_dtype_map.get(q_dtype_a, "fp8")
-        b_dtype_str = "fp4"
+        b_dtype_str = _a_dtype_map.get(q_dtype_w, "fp4")#"fp4"
         out_dtype_str = "bf16" if dtype == dtypes.bf16 else "f16"
 
         if a_dtype_str != "fp4":
@@ -1818,7 +1823,7 @@ class FmoeTuner(TunerCommon):
         )
 
         for blockM in blockMs:
-            if blockM not in [32, 64, 128] or not use_g1u1:
+            if blockM not in [32, 64, 128]: #or not use_g1u1:
                 continue
             for kname, kparams in flydsl_s1_kernels.items():
                 if kparams["tile_m"] != blockM:
@@ -1959,12 +1964,12 @@ class FmoeTuner(TunerCommon):
             q_type = eval(q_type)
             q_type = QuantType.per_1x128 if q_type == QuantType.per_128x128 else q_type
             print("\nStart tuning", line)
-            if get_gfx() not in ["gfx950"] and q_type == aiter.QuantType.per_1x32:
-                print(f"{q_type} is not supported on {get_gfx()}")
-                return []
-            if not use_g1u1:
-                print("no moe solution(g1u0) can tune for ", line)
-                continue
+            #if get_gfx() not in ["gfx950"] and q_type == aiter.QuantType.per_1x32:
+            #    print(f"{q_type} is not supported on {get_gfx()}")
+            #    return []
+            #if not use_g1u1:
+            #    print("no moe solution(g1u0) can tune for ", line)
+            #    continue
             act_type = eval(act_type)
             info = (
                 cu_num,

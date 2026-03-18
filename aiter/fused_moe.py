@@ -632,6 +632,46 @@ class MOEMetadata:
     use_non_temporal_load: bool = True
 
 
+def _flydsl_stage1_wrapper(
+    a,
+    w1,
+    w2,
+    sorted_token_ids,
+    sorted_expert_ids,
+    num_valid_ids,
+    out,
+    topk,
+    kernelName="",
+    w1_scale=None,
+    a1_scale=None,
+    sorted_weights=None,
+    **_kwargs,
+):
+
+    parsed = aiter.ops.flydsl.moe_kernels.get_flydsl_kernel_params(kernelName)
+    if parsed is None:
+        raise ValueError(f"Invalid FlyDSL kernel name: {kernelName}")
+    return aiter.ops.flydsl.flydsl_moe_stage1(
+        a=a,
+        w1=w1,
+        sorted_token_ids=sorted_token_ids,
+        sorted_expert_ids=sorted_expert_ids,
+        num_valid_ids=num_valid_ids,
+        out=out,
+        topk=topk,
+        tile_m=parsed["tile_m"],
+        tile_n=parsed["tile_n"],
+        tile_k=parsed["tile_k"],
+        a_dtype=parsed["a_dtype"],
+        b_dtype=parsed["b_dtype"],
+        out_dtype=parsed["out_dtype"],
+        w1_scale=w1_scale,
+        a1_scale=a1_scale,
+        sorted_weights=sorted_weights,
+        g1u0=(w1.shape[1]==w2.shape[2]),
+    )
+
+
 def _flydsl_stage2_wrapper(
     inter_states,
     w1,
@@ -651,7 +691,7 @@ def _flydsl_stage2_wrapper(
     parsed = aiter.ops.flydsl.moe_kernels.get_flydsl_kernel_params(kernelName)
     if parsed is None:
         raise ValueError(f"Invalid FlyDSL kernel name: {kernelName}")
-    aiter.ops.flydsl.flydsl_moe_stage2(
+    return aiter.ops.flydsl.flydsl_moe_stage2(
         inter_states=inter_states,
         w2=w2,
         sorted_token_ids=sorted_token_ids,
@@ -905,9 +945,24 @@ def get_2stage_cfgs(
         )
     if (
         dtype in [dtypes.bf16, dtypes.fp16]
-        and q_type == QuantType.per_1x32
-        and activation == ActivationType.Swiglu
+        and (q_type == QuantType.per_1x32 or q_type == QuantType.per_Token)
+        and (activation == ActivationType.Swiglu or activation == ActivationType.Gelu)
     ):
+        if (kernelName1.startswith("flydsl_") and kernelName2.startswith("flydsl_") and is_flydsl_available()):
+            return MOEMetadata(
+                functools.partial(
+                    _flydsl_stage1_wrapper,
+                    kernelName=kernelName1,
+                ),
+                functools.partial(
+                    _flydsl_stage2_wrapper,
+                    kernelName=kernelName2,
+                ),
+                get_block_m(),
+                ksplit,
+                False,
+                True,
+            )
         return MOEMetadata(
             functools.partial(
                 cktile_moe_stage1,
@@ -963,6 +1018,7 @@ def get_2stage_cfgs(
                 torch.uint32,
                 dtypes.fp4x2,
                 dtypes.fp8,
+                dtypes.i8,
             ]
         )
     ):
