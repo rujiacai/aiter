@@ -283,6 +283,7 @@ def _get_compiled_stage1(
                 stream,
             )
         else:
+            stream = torch.cuda.current_stream().cuda_stream
             exe(
                 out,
                 a,
@@ -297,6 +298,7 @@ def _get_compiled_stage1(
                 _n_in,
                 _k_in,
                 size_expert_ids_in,
+                stream,
             )
 
     return tensor_api
@@ -391,6 +393,7 @@ def _get_compiled_stage2(
                 stream,
             )
         else:
+            stream = torch.cuda.current_stream().cuda_stream
             exe(
                 target,
                 a,
@@ -405,6 +408,7 @@ def _get_compiled_stage2(
                 _n_in,
                 _k_in,
                 blocks,
+                stream,
             )
 
         if not accumulate:
