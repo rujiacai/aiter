@@ -949,6 +949,8 @@ def get_2stage_cfgs(
         and (activation == ActivationType.Swiglu or activation == ActivationType.Gelu)
     ):
         if (kernelName1.startswith("flydsl_") and kernelName2.startswith("flydsl_") and is_flydsl_available()):
+            flydsl_parsed = aiter.ops.flydsl.moe_kernels.get_flydsl_kernel_params(kernelName1)
+            flydsl_block_m = flydsl_parsed["tile_m"] if flydsl_parsed else get_block_m()
             return MOEMetadata(
                 functools.partial(
                     _flydsl_stage1_wrapper,
@@ -958,7 +960,7 @@ def get_2stage_cfgs(
                     _flydsl_stage2_wrapper,
                     kernelName=kernelName2,
                 ),
-                get_block_m(),
+                flydsl_block_m,
                 ksplit,
                 False,
                 True,
