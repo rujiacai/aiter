@@ -13,6 +13,7 @@ Usage:
     python op_tests/test_flydsl_moe_a4w4.py --stage stage1          # stage1 only
     python op_tests/test_flydsl_moe_a4w4.py --stage stage2          # stage2 only
     python op_tests/test_flydsl_moe_a4w4.py --stage e2e             # end-to-end only
+    python op_tests/test_flydsl_moe_a4w4.py --g1u0 true             # run g1u0
     python op_tests/test_flydsl_moe_a4w4.py -t 16 -t 128            # specific token counts
     python op_tests/test_flydsl_moe_a4w4.py --block-m 16 32 64      # specific block sizes
 """
@@ -56,6 +57,7 @@ def _generate_a4w4_data(
     block_m: int,
     dtype=torch.bfloat16,
     doweight_stage1: bool = False,
+    g1u0: bool = False,
 ):
     """Generate quantised a4w4 data with torch reference outputs for stage1 and stage2."""
     torch_quant = aiter.get_torch_quant(Q_TYPE)
@@ -64,7 +66,8 @@ def _generate_a4w4_data(
     torch.cuda.manual_seed(0)
 
     inp = torch.randn((token, model_dim), dtype=dtype) / 10
-    w1 = torch.randn((E, inter_dim * 2, model_dim), dtype=dtype) / 10
+    w1_n = inter_dim if g1u0 else inter_dim * 2
+    w1 = torch.randn((E, w1_n, model_dim), dtype=dtype) / 10
     w2 = torch.randn((E, model_dim, inter_dim), dtype=dtype) / 10
     score = torch.randn((token, E), dtype=dtype)
     topk_weights, topk_ids = fused_topk(inp, score, topk, True)
@@ -180,11 +183,13 @@ def _generate_a4w4_data(
         inter_dim=inter_dim,
         E=E,
         topk=topk,
+        g1u0=g1u0,
     )
 
 
 def _check_result(ref_out, test_out, label, atol=1.0, rtol=0.05, pass_pct=95.0):
     """Compare outputs and print result. Returns (passed, max_delta, pct_close)."""
+    print(f"ref_out: {ref_out.shape}, test_out: {test_out.shape}")
     max_delta = (ref_out.float() - test_out.float()).abs().max().item()
     close_mask = torch.isclose(ref_out.float(), test_out.float(), atol=atol, rtol=rtol)
     pct_close = close_mask.float().mean().item() * 100
@@ -213,6 +218,7 @@ def test_flydsl_stage1_a4w4(
     block_m: int = 32,
     atol: float = 1.0,
     rtol: float = 0.05,
+    g1u0: bool = False,
 ):
     from aiter.ops.flydsl.moe_kernels import flydsl_moe_stage1
 
@@ -230,6 +236,7 @@ def test_flydsl_stage1_a4w4(
         E=E,
         topk=topk,
         block_m=block_m,
+        g1u0=g1u0,
     )
 
     out_dtype_str = "bf16" if data["dtype"] == torch.bfloat16 else "f16"
@@ -250,6 +257,7 @@ def test_flydsl_stage1_a4w4(
         w1_scale=data["w1_scale_shuf"],
         a1_scale=data["a1_scale_sort"],
         sorted_weights=data["sorted_weights_s1"],
+        g1u0=g1u0,
     )
     torch.cuda.synchronize()
 
@@ -272,6 +280,7 @@ def test_flydsl_stage2_a4w4(
     mode: str = "atomic",
     atol: float = 1.0,
     rtol: float = 0.05,
+    g1u0: bool = False,
 ):
     from aiter.ops.flydsl.moe_kernels import flydsl_moe_stage2
 
@@ -289,6 +298,7 @@ def test_flydsl_stage2_a4w4(
         E=E,
         topk=topk,
         block_m=block_m,
+        g1u0=g1u0,
     )
 
     out_dtype_str = "bf16" if data["dtype"] == torch.bfloat16 else "f16"
@@ -332,6 +342,7 @@ def test_flydsl_e2e_a4w4(
     mode: str = "atomic",
     atol: float = 1.0,
     rtol: float = 0.05,
+    g1u0: bool = False,
 ):
     """End-to-end test: FlyDSL stage1 output -> quantise -> FlyDSL stage2."""
     from aiter.ops.flydsl.moe_kernels import flydsl_moe_stage1, flydsl_moe_stage2
@@ -352,6 +363,7 @@ def test_flydsl_e2e_a4w4(
         E=E,
         topk=topk,
         block_m=block_m,
+        g1u0=g1u0,
     )
 
     out_dtype_str = "bf16" if data["dtype"] == torch.bfloat16 else "f16"
@@ -373,6 +385,7 @@ def test_flydsl_e2e_a4w4(
         w1_scale=data["w1_scale_shuf"],
         a1_scale=data["a1_scale_sort"],
         sorted_weights=data["sorted_weights_s1"],
+        g1u0=g1u0,
     )
     torch.cuda.synchronize()
 
@@ -450,6 +463,12 @@ def main():
         choices=["stage1", "stage2", "e2e"],
         help="Which tests to run (default: all)",
     )
+    parser.add_argument(
+        "--g1u0",
+        type=dtypes.str2bool,
+        default=False,
+        help="Whether to use g1u0 path (default: false).",
+    )
     parser.add_argument("--atol", type=float, default=1.0)
     parser.add_argument("--rtol", type=float, default=0.05)
     args = parser.parse_args()
@@ -462,6 +481,8 @@ def main():
 
     results = []
 
+    g1u0 = args.g1u0
+    g1u0_str = "g1u0" if g1u0 else "g1u1"
     for token in args.tokens:
         for bm in args.block_m:
             # Stage1 tests
@@ -476,10 +497,11 @@ def main():
                         block_m=bm,
                         atol=args.atol,
                         rtol=args.rtol,
+                        g1u0=g1u0,
                     )
                     results.append(
                         (
-                            f"stage1_a4w4_t{token}_bm{bm}",
+                            f"stage1_a4w4_t{token}_bm{bm}_{g1u0_str}",
                             "PASS" if passed else "FAIL",
                             max_delta,
                             pct,
@@ -489,7 +511,7 @@ def main():
                     import traceback
 
                     traceback.print_exc()
-                    results.append((f"stage1_a4w4_t{token}_bm{bm}", "ERROR", 0, 0))
+                    results.append((f"stage1_a4w4_t{token}_bm{bm}_{g1u0_str}", "ERROR", 0, 0))
 
             # Stage2 tests
             if "stage2" in args.stage:
@@ -505,10 +527,11 @@ def main():
                             mode=mode,
                             atol=args.atol,
                             rtol=args.rtol,
+                            g1u0=g1u0,
                         )
                         results.append(
                             (
-                                f"stage2_a4w4_t{token}_bm{bm}_{mode}",
+                                f"stage2_a4w4_t{token}_bm{bm}_{mode}_{g1u0_str}",
                                 "PASS" if passed else "FAIL",
                                 max_delta,
                                 pct,
@@ -519,7 +542,7 @@ def main():
 
                         traceback.print_exc()
                         results.append(
-                            (f"stage2_a4w4_t{token}_bm{bm}_{mode}", "ERROR", 0, 0)
+                            (f"stage2_a4w4_t{token}_bm{bm}_{mode}_{g1u0_str}", "ERROR", 0, 0)
                         )
 
             # End-to-end tests
@@ -536,10 +559,11 @@ def main():
                             mode=mode,
                             atol=args.atol,
                             rtol=args.rtol,
+                            g1u0=g1u0,
                         )
                         results.append(
                             (
-                                f"e2e_a4w4_t{token}_bm{bm}_{mode}",
+                                f"e2e_a4w4_t{token}_bm{bm}_{mode}_{g1u0_str}",
                                 "PASS" if passed else "FAIL",
                                 max_delta,
                                 pct,
@@ -550,7 +574,7 @@ def main():
 
                         traceback.print_exc()
                         results.append(
-                            (f"e2e_a4w4_t{token}_bm{bm}_{mode}", "ERROR", 0, 0)
+                            (f"e2e_a4w4_t{token}_bm{bm}_{mode}_{g1u0_str}", "ERROR", 0, 0)
                         )
 
     # Summary
