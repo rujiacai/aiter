@@ -220,8 +220,11 @@ def compile_mixed_moe_gemm1(
     use_cshuffle_epilog = bool(use_cshuffle_epilog)
 
     epilog_tag = "cshuffle" if use_cshuffle_epilog else "direct"
+    g1u_tag = "g1u0" if g1u0 else "g1u1"
     module_name = (
-        f"mfma_moe1_a{a_dtype}_w{b_dtype}_{epilog_tag}_abi35_ckstage1".replace("-", "_")
+        f"mfma_moe1_{g1u_tag}_a{a_dtype}_w{b_dtype}_{epilog_tag}_abi35_ckstage1".replace(
+            "-", "_"
+        )
     )
     # -- LDS sizing (pure Python; no MLIR Context needed) ---------------------
     # Reuse the same LDS bytes for both:
@@ -1550,6 +1553,7 @@ def compile_mixed_moe_gemm1(
     # -- Host launcher (flyc.jit + .launch) --------------------------------
     _cache_tag = (
         module_name,
+        g1u_tag,
         a_dtype,
         b_dtype,
         out_dtype,

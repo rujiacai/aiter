@@ -24,6 +24,8 @@ from aiter.fused_moe import (
 from aiter import ck_moe_stage1_fwd, ck_moe_stage2_fwd, dtype2str_dict
 from aiter.ops.shuffle import (
     shuffle_weight,
+    shuffle_weight_a16w4,
+    shuffle_scale_a16w4,
 )
 from aiter.utility.mp_tuner import mp_tuner
 from aiter.int4_utils import (
@@ -350,6 +352,7 @@ class FmoeTuner(TunerCommon):
         blockM,
         q_type,
         act_type,
+        g1u0,
     ):
         act = "swiglu" if act_type == ActivationType.Swiglu else "silu"
         return flydsl_moe_stage1(
@@ -369,6 +372,7 @@ class FmoeTuner(TunerCommon):
             w1_scale=w1_scale_aiter,
             a1_scale=a1_scale,
             sorted_weights=sorted_weights,
+            g1u0=g1u0,
         )
 
     @staticmethod
@@ -835,12 +839,12 @@ class FmoeTuner(TunerCommon):
             )
         elif q_dtype_w == dtypes.fp4x2:
             w1_qt_shffle_ck = shuffle_weight(w1_qt, (16, 16))
-            w2_qt_shffle_ck = shuffle_weight(w2_qt, (16, 16))
+            w2_qt_shffle_ck = shuffle_weight_a16w4(w2_qt, 16, False)
         else:
             w1_qt_shffle_ck = w1_qt_shffle
             w2_qt_shffle_ck = w2_qt_shffle
         w1_scale_aiter = fp4_utils.e8m0_shuffle(w1_scale)
-        w2_scale_aiter = fp4_utils.e8m0_shuffle(w2_scale)
+        w2_scale_aiter = shuffle_scale_a16w4(w2_scale, expert, False)
 
         w1_qt_shffle_flydsl = w1_qt_shffle_ck
         w2_qt_shffle_flydsl = w2_qt_shffle_ck
@@ -1965,7 +1969,7 @@ class FmoeTuner(TunerCommon):
         for blockM in blockMs:
             # per_1x32 fp4 sorting requires block size to be a multiple of 32, so
             # the tile_m=16 FlyDSL candidate is invalid for this tuning path.
-            if blockM not in [32, 64, 128] or not use_g1u1:
+            if blockM not in [32, 64, 128]: # or not use_g1u1:
                 continue
             for kname, kparams in flydsl_s1_kernels.items():
                 if kparams["tile_m"] != blockM:
@@ -1999,6 +2003,7 @@ class FmoeTuner(TunerCommon):
                             blockM,
                             q_type,
                             act_type,
+                            not use_g1u1, # g1u0
                         ),
                         {},
                         FmoeTuner.run_torch_moe_stage1,
@@ -2268,9 +2273,9 @@ class FmoeTuner(TunerCommon):
             if get_gfx() not in ["gfx950"] and q_type == aiter.QuantType.per_1x32:
                 print(f"{q_type} is not supported on {get_gfx()}")
                 return []
-            if not use_g1u1:
-                print("no moe solution(g1u0) can tune for ", line)
-                continue
+            # if not use_g1u1:
+            #     print("no moe solution(g1u0) can tune for ", line)
+            #     continue
             act_type = eval(act_type)
             info = (
                 cu_num,
@@ -2293,11 +2298,11 @@ class FmoeTuner(TunerCommon):
                 if q_type == QuantType.per_1x32
                 else blockMs
             )
-            tasks.extend(self.gen_2stages_asm1_task(info, shape_blockMs))
-            tasks_ck.extend(self.gen_2stages_task(info, shape_blockMs))
+            # tasks.extend(self.gen_2stages_asm1_task(info, shape_blockMs))
+            # tasks_ck.extend(self.gen_2stages_task(info, shape_blockMs))
             tasks_ck.extend(self.gen_flydsl_2stages_task(info, shape_blockMs))
-            tasks_ck.extend(self.gen_cktile_2stages_task(info, shape_blockMs))
-            task_1stage.extend(self.gen_1stage_asm_task(info))
+            # tasks_ck.extend(self.gen_cktile_2stages_task(info, shape_blockMs))
+            # task_1stage.extend(self.gen_1stage_asm_task(info))
             if tasks is None and tasks_ck is None and task_1stage is None:
                 print("no moe solution can tune for ", line)
                 continue

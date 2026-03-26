@@ -638,6 +638,7 @@ def _flydsl_stage1_wrapper(
     w1_scale=None,
     a1_scale=None,
     sorted_weights=None,
+    g1u0=False,
     **_kwargs,
 ):
     parsed = aiter.ops.flydsl.moe_kernels.get_flydsl_kernel_params(kernelName)
@@ -662,6 +663,7 @@ def _flydsl_stage1_wrapper(
         w1_scale=w1_scale,
         a1_scale=a1_scale,
         sorted_weights=sorted_weights,
+        g1u0=g1u0,
     )
 
 
@@ -949,6 +951,7 @@ def get_2stage_cfgs(
                 _flydsl_stage1_wrapper,
                 kernelName=kernelName1,
                 activation=activation,
+                g1u0=(not use_g1u1),
             )
         else:
             stage1_func = functools.partial(
