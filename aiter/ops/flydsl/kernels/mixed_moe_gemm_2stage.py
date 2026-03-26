@@ -306,6 +306,14 @@ def compile_mixed_moe_gemm1(
                 sig = llvm.call_intrinsic(f32, "llvm.amdgcn.rcp.f32", [den], [], [])
                 return x * sig
 
+            def gelu(x):
+                # e^(x*(c1*x*x+c2))
+                t = (x * x * (-0.07135400176048279) - 1.595770001411438) * x * (-1.4426950408889634)
+                emu = llvm.call_intrinsic(f32, "llvm.amdgcn.exp2.f32", [t], [], [])
+                den = 1.0 + emu
+                sig = llvm.call_intrinsic(f32, "llvm.amdgcn.rcp.f32", [den], [], [])
+                return x * sig
+
             _arith_min = getattr(arith, "minimum", None) or getattr(arith, "minimumf")
             _arith_max = getattr(arith, "maximum", None) or getattr(arith, "maximumf")
 
@@ -1350,7 +1358,10 @@ def compile_mixed_moe_gemm1(
                                     if enable_bias:
                                         gate_bias_list = epilogue_pf
                                         vg = vg + gate_bias_list[ni]
-                                    y = silu(vg)
+                                    if act == "gelu":
+                                        y = gelu(vg)
+                                    else:
+                                        y = silu(vg)
                                 else:
                                     vu = vector.extract(
                                         acc_up[acc_idx],
@@ -1364,6 +1375,8 @@ def compile_mixed_moe_gemm1(
 
                                     if act == "swiglu":
                                         y = swiglu(vg, vu)
+                                    elif act == "gelu":
+                                        y = gelu(vg) * vu
                                     else:
                                         y = silu(vg) * vu
 
@@ -1516,7 +1529,10 @@ def compile_mixed_moe_gemm1(
                                     if enable_bias:
                                         gate_bias_list = epilogue_pf
                                         vg = vg + gate_bias_list[ni]
-                                    y = silu(vg)
+                                    if act == "gelu":
+                                        y = gelu(vg)
+                                    else:
+                                        y = silu(vg)
                                 else:
                                     vu = vector.extract(
                                         acc_up[acc_idx],
@@ -1530,6 +1546,8 @@ def compile_mixed_moe_gemm1(
 
                                     if act == "swiglu":
                                         y = swiglu(vg, vu)
+                                    elif act == "gelu":
+                                        y = gelu(vg) * vu
                                     else:
                                         y = silu(vg) * vu
 

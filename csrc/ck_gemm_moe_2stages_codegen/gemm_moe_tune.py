@@ -69,6 +69,17 @@ torch.int4 = getattr(torch, "int4", torch.uint32)
 FLYDSL_FALLBACK_TAG = "flydsl_fallback"
 
 
+def _activation_type_to_flydsl_act(act_type):
+    """Map ActivationType enum to FlyDSL stage1 `act` string."""
+    if act_type == ActivationType.Swiglu:
+        return "swiglu"
+    if act_type == ActivationType.Gelu:
+        return "gelu"
+    if act_type == ActivationType.Silu:
+        return "silu"
+    raise ValueError(f"Unsupported ActivationType for FlyDSL stage1: {act_type}")
+
+
 class FmoeTuner(TunerCommon):
 
     ARG_DEFAULTS = {
@@ -354,7 +365,7 @@ class FmoeTuner(TunerCommon):
         act_type,
         g1u0,
     ):
-        act = "swiglu" if act_type == ActivationType.Swiglu else "silu"
+        act = _activation_type_to_flydsl_act(act_type)
         return flydsl_moe_stage1(
             a=a1_qt,
             w1=w1_qt_shffle_ck,
