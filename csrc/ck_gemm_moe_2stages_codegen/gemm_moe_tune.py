@@ -1980,7 +1980,7 @@ class FmoeTuner(TunerCommon):
         for blockM in blockMs:
             # per_1x32 fp4 sorting requires block size to be a multiple of 32, so
             # the tile_m=16 FlyDSL candidate is invalid for this tuning path.
-            if blockM not in [32, 64, 128]: # or not use_g1u1:
+            if blockM not in [32, 64, 128, 256]: # or not use_g1u1:
                 continue
             for kname, kparams in flydsl_s1_kernels.items():
                 if kparams["tile_m"] != blockM:

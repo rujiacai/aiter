@@ -606,6 +606,9 @@ def nextPow2(n):
 
 def get_padded_M(M):
     padded_m = M
+    # hack for 20480 case
+    if padded_m == 20480:
+        return 20480
     if M < 32768:
         padded_m = nextPow2(padded_m)
     else:

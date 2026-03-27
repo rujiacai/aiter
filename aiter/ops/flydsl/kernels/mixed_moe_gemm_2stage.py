@@ -308,7 +308,7 @@ def compile_mixed_moe_gemm1(
 
             def gelu(x):
                 # e^(x*(c1*x*x+c2))
-                t = (x * x * (-0.07135400176048279) - 1.595770001411438) * x * (-1.4426950408889634)
+                t = (x * x * (-0.07135400176048279) - 1.595770001411438) * x * (1.4426950408889634)
                 emu = llvm.call_intrinsic(f32, "llvm.amdgcn.exp2.f32", [t], [], [])
                 den = 1.0 + emu
                 sig = llvm.call_intrinsic(f32, "llvm.amdgcn.rcp.f32", [den], [], [])
