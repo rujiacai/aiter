@@ -1696,6 +1696,131 @@ def torch_moe_stage2(
     return out.sum(1).to(dtype)
 
 
+def torch_fp4_moe_2stage_with_smooth(
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,  # [E, N, model_dim//2] fp4-packed or [E, N, model_dim] float
+    w2: torch.Tensor,  # [E, model_dim, inter_dim//2] fp4-packed or [E, model_dim, inter_dim] float
+    topk_weight: torch.Tensor,
+    topk_ids: torch.Tensor,
+    *,
+    dtype=dtypes.fp16,
+    activation=ActivationType.Silu,
+    quant_type=QuantType.per_1x32,
+    a1_scale: Optional[torch.Tensor] = None,
+    w1_scale: Optional[torch.Tensor] = None,
+    w2_scale: Optional[torch.Tensor] = None,
+    fc1_smooth_scale: Optional[torch.Tensor] = None,  # [E, 1, model_dim] or [E, model_dim]
+    fc2_smooth_scale: Optional[torch.Tensor] = None,  # [E, 1, inter_dim] or [E, inter_dim]
+    doweight_stage1: bool = False,
+):
+    """Torch 2-stage FP4 MoE with smooth-scale and fp4 quantized stage calls.
+
+    This helper always calls `torch_moe_stage1` and `torch_moe_stage2` with
+    `quant_type=QuantType.per_1x32` to keep the fp4 quantized compute path.
+    When smooth scales are provided, weights are dequantized -> smoothed ->
+    requantized to fp4, then fed into stage1/stage2.
+    """
+    quant_type = quant_remap.get(quant_type, quant_type)
+    if quant_type != QuantType.per_1x32:
+        raise ValueError(
+            f"torch_fp4_moe_2stage_with_smooth only supports QuantType.per_1x32, got {quant_type!r}"
+        )
+
+    ctype = dtypes.fp32
+    quant_fp4 = aiter.get_torch_quant(QuantType.per_1x32)
+    E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
+    token_num = topk_ids.shape[0]
+    topk = topk_ids.shape[1]
+
+    def _dequant_fp4_weight(weight, scale, *, is_w2: bool):
+        if scale is None:
+            raise ValueError("FP4 weight requires corresponding e8m0 scale tensor.")
+        weight_f32 = fp4_utils.mxfp4_to_f32(weight)
+        scale_f32 = fp4_utils.e8m0_to_f32(scale)
+        if is_w2:
+            return (
+                weight_f32.view(E, model_dim, inter_dim // 32, 32)
+                * scale_f32.view(E, model_dim, inter_dim // 32, 1)
+            ).view(E, model_dim, inter_dim)
+        n_dim = weight.shape[1]
+        return (
+            weight_f32.view(E, n_dim, model_dim // 32, 32)
+            * scale_f32.view(E, n_dim, model_dim // 32, 1)
+        ).view(E, n_dim, model_dim)
+
+    def _to_fp4_weight(weight, scale, *, is_w2: bool, smooth_scale):
+        need_requant = smooth_scale is not None or weight.dtype != dtypes.fp4x2 or scale is None
+        if not need_requant:
+            return weight, scale
+
+        if weight.dtype == dtypes.fp4x2:
+            w_f32 = _dequant_fp4_weight(weight, scale, is_w2=is_w2)
+        else:
+            w_f32 = weight.to(ctype)
+
+        if smooth_scale is not None:
+            s = smooth_scale.to(ctype).view(E, -1)
+            w_f32 = w_f32 * s.view(E, 1, w_f32.shape[-1])
+
+        w_q, w_s = quant_fp4(w_f32, quant_dtype=dtypes.fp4x2)
+        if is_w2:
+            w_q = w_q.view(E, model_dim, inter_dim // 2)
+        else:
+            w_q = w_q.view(E, w_f32.shape[1], model_dim // 2)
+        return w_q, w_s
+
+    w1_q, w1_s = _to_fp4_weight(
+        w1, w1_scale, is_w2=False, smooth_scale=fc1_smooth_scale
+    )
+    w2_q, w2_s = _to_fp4_weight(
+        w2, w2_scale, is_w2=True, smooth_scale=fc2_smooth_scale
+    )
+
+    # Stage1 input for fp4 path.
+    if hidden_states.dtype == dtypes.fp4x2:
+        if a1_scale is None:
+            raise ValueError("FP4 hidden_states requires `a1_scale`.")
+        a1_q = hidden_states
+        a1_s = a1_scale
+    else:
+        a1_q, a1_s = quant_fp4(hidden_states.to(ctype), quant_dtype=dtypes.fp4x2)
+        a1_q = a1_q.view(token_num, model_dim // 2)
+
+    stage1_out = torch_moe_stage1(
+        a1_q,
+        w1_q,
+        w2_q,
+        topk_weight,
+        topk_ids,
+        dtype=ctype,
+        activation=activation,
+        quant_type=QuantType.per_1x32,
+        a1_scale=a1_s,
+        w1_scale=w1_s,
+        w1_bias=None,
+        doweight=doweight_stage1,
+    )
+
+    a2_q, a2_s = quant_fp4(
+        stage1_out.view(token_num * topk, inter_dim), quant_dtype=dtypes.fp4x2
+    )
+    a2_q = a2_q.view(token_num, topk, inter_dim // 2)
+
+    return torch_moe_stage2(
+        a2_q,
+        w1_q,
+        w2_q,
+        topk_weight,
+        topk_ids,
+        dtype=dtype,
+        quant_type=QuantType.per_1x32,
+        w2_scale=w2_s,
+        a2_scale=a2_s,
+        w2_bias=None,
+        doweight=not doweight_stage1,
+    )
+
+
 def ck_moe_stage1(
     hidden_states,
     w1,  # [E, inter_dim*2, model_dim]

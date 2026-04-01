@@ -1114,19 +1114,34 @@ def compile_mixed_moe_gemm1(
                             0 if mfma_per_iter == 0 else (mfma_total // mfma_per_iter)
                         )
 
-                        # DS-read preload (CK default is 2); clamp to non-negative.
+                        # Scheduling hints: llvm.amdgcn.sched.group.barrier (see AMDGPUUsage.rst).
+                        # Each call groups the *preceding* N instructions of the masked class;
+                        # sched_barrier(0) below fences the whole region. Match gfx942-tuned
+                        # preshuffle_gemm: split MFMA groups, interleave VMEM when tile_m==16,
+                        # extra DS/MFMA/VMEM for small num_acc_n, stagger DS-write hints.
                         rocdl.sched_dsrd(2)
-                        rocdl.sched_mfma(2)
-                        rocdl.sched_dsrd(1)
                         rocdl.sched_mfma(1)
-                        rocdl.sched_dsrd(1)
+                        if tile_m == 16:
+                            rocdl.sched_vmem(1)
                         rocdl.sched_mfma(1)
+                        if tile_m == 16:
+                            rocdl.sched_vmem(1)
+                        if num_acc_n < 4:
+                            rocdl.sched_dsrd(1)
+                            rocdl.sched_mfma(1)
+                            if tile_m == 16:
+                                rocdl.sched_vmem(1)
+                            rocdl.sched_dsrd(1)
+                            rocdl.sched_mfma(1)
+                            if tile_m == 16:
+                                rocdl.sched_vmem(1)
+                            rocdl.sched_mfma(1)
 
-                        # DS-write hints near the end: match total X LDS-store micro-ops per thread.
                         dswr_tail = num_x_loads
+                        dstr_advance = 2
                         if dswr_tail > sche_iters:
                             dswr_tail = sche_iters
-                        dswr_start = sche_iters - dswr_tail
+                        dswr_start = max(sche_iters - dswr_tail - dstr_advance, 0)
                         for sche_i in range_constexpr(sche_iters):
                             rocdl.sched_vmem(1)
                             rocdl.sched_mfma(mfma_group)
@@ -1192,6 +1207,7 @@ def compile_mixed_moe_gemm1(
                                     prefetch_ab_scale_tile(next_k2 // pack_K // 128)
                                 )
                                 store_x_tile_to_lds(x_regs_pong, lds_base_pong)
+                                hot_loop_scheduler()
                                 gpu.barrier()
                                 a0_prefetch_pong = None
                                 continue
@@ -1209,6 +1225,7 @@ def compile_mixed_moe_gemm1(
                             )
                             a0_prefetch_pong = None
                             store_x_tile_to_lds(x_regs_ping, lds_base_ping)
+                            hot_loop_scheduler()
                             gpu.barrier()
 
                             a0_prefetch_ping = None
@@ -1233,6 +1250,7 @@ def compile_mixed_moe_gemm1(
                             )
                             a0_prefetch_ping = None
                             store_x_tile_to_lds(x_regs_pong, lds_base_pong)
+                            hot_loop_scheduler()
                             gpu.barrier()
 
                             a0_prefetch_pong = None
@@ -1271,6 +1289,7 @@ def compile_mixed_moe_gemm1(
                         )
                         a0_prefetch_pong = None
                         store_x_tile_to_lds(x_regs_ping, lds_base_ping)
+                        hot_loop_scheduler()
                         gpu.barrier()
 
                         a0_prefetch_ping = None
@@ -1660,7 +1679,7 @@ def compile_mixed_moe_gemm2(
     enable_bias: bool = False,
     model_dim_pad: int = 0,
     inter_dim_pad: int = 0,
-    persist_m: int = 4,
+    persist_m: int = 1,
 ):
     """Compile stage2 kernel (`moe_gemm2`) and return the compiled executable.
 
@@ -2659,11 +2678,12 @@ def compile_mixed_moe_gemm2(
                             rocdl.sched_vmem(1)
                         rocdl.sched_mfma(1)
 
-                    # DS-write hints near the end: match total A LDS-store micro-ops per thread.
+                    # DS-write hints: match A LDS-store micro-ops; stagger vs MFMA tail (preshuffle_gemm).
                     dswr_tail = num_x_loads
+                    dstr_advance = 2
                     if dswr_tail > sche_iters:
                         dswr_tail = sche_iters
-                    dswr_start = sche_iters - dswr_tail
+                    dswr_start = max(sche_iters - dswr_tail - dstr_advance, 0)
 
                     for sche_i in range_constexpr(sche_iters):
                         rocdl.sched_vmem(1)
@@ -2743,7 +2763,7 @@ def compile_mixed_moe_gemm2(
                             a0_prefetch=a0_prefetch_pong,
                         )
                         store_x_tile_to_lds(x_regs_ping, lds_base_ping)
-                        # hot_loop_scheduler()
+                        hot_loop_scheduler()
                         gpu.barrier()
 
                         # Cross-tile prefetch for the ping tile we are about to compute.
@@ -2767,7 +2787,7 @@ def compile_mixed_moe_gemm2(
                             a0_prefetch=a0_prefetch_ping,
                         )
                         store_x_tile_to_lds(x_regs_pong, lds_base_pong)
-                        # hot_loop_scheduler()
+                        hot_loop_scheduler()
                         gpu.barrier()
 
                         # Cross-tile prefetch for the next pong tile.
@@ -2806,7 +2826,7 @@ def compile_mixed_moe_gemm2(
                     )
 
                     store_x_tile_to_lds(x_regs_ping, lds_base_ping)
-                    # hot_loop_scheduler()
+                    hot_loop_scheduler()
                     gpu.barrier()
 
                     # Epilogue tile with sw prefetch.
