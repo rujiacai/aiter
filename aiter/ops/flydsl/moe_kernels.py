@@ -94,8 +94,8 @@ def get_flydsl_stage2_kernels(
 
 def _register_all_configs():
     """Pre-populate _KERNEL_PARAMS with all supported configs at import time."""
-    for a in ("fp8", "fp4", "fp16"):
-        for b in ("fp4",):
+    for a in ("fp8","int8", "fp4", "fp16"):
+        for b in ("fp4","fp8","int8"):
             for out in ("bf16", "f16"):
                 _KERNEL_PARAMS.update(get_flydsl_stage1_kernels(a, b, out))
                 _KERNEL_PARAMS.update(get_flydsl_stage2_kernels(a, b, out))
