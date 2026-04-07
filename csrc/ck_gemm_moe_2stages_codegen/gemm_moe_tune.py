@@ -854,8 +854,12 @@ class FmoeTuner(TunerCommon):
         else:
             w1_qt_shffle_ck = w1_qt_shffle
             w2_qt_shffle_ck = w2_qt_shffle
-        w1_scale_aiter = fp4_utils.e8m0_shuffle(w1_scale)
-        w2_scale_aiter = shuffle_scale_a16w4(w2_scale, expert, False)
+        if q_dtype_w == dtypes.fp4x2:
+            w1_scale_aiter = fp4_utils.e8m0_shuffle(w1_scale)
+            w2_scale_aiter = shuffle_scale_a16w4(w2_scale, expert, False)
+        else:
+            w1_scale_aiter = fp4_utils.e8m0_shuffle(w1_scale)
+            w2_scale_aiter = fp4_utils.e8m0_shuffle(w2_scale)
 
         w1_qt_shffle_flydsl = w1_qt_shffle_ck
         w2_qt_shffle_flydsl = w2_qt_shffle_ck
@@ -1957,17 +1961,24 @@ class FmoeTuner(TunerCommon):
             doweight_stage1,
         ) = info
 
-        if q_type != QuantType.per_1x32 or q_dtype_w != dtypes.fp4x2:
-            return tasks_flydsl
+        #if q_type != QuantType.per_1x32 or q_dtype_w != dtypes.fp4x2 or q_dtype_w != dtypes.fp8:
+        #if q_type != QuantType.per_1x32 or q_dtype_w != dtypes.fp4x2 or q_dtype_w != dtypes.fp8::
+        #    return tasks_flydsl
 
         _a_dtype_map = {
             dtypes.fp8: "fp8",
             dtypes.fp4x2: "fp4",
             dtypes.fp16: "fp16",
             dtypes.bf16: "fp16",
+            dtypes.i8: "int8",
+        }
+        _b_dtype_map = {
+            dtypes.i8: "int8",
+            dtypes.fp8: "fp8",
+            dtypes.fp4x2: "fp4",
         }
         a_dtype_str = _a_dtype_map.get(q_dtype_a, "fp8")
-        b_dtype_str = "fp4"
+        b_dtype_str = _b_dtype_map.get(q_dtype_w, "fp4")
         out_dtype_str = "bf16" if dtype == dtypes.bf16 else "f16"
 
         flydsl_s1_kernels = get_flydsl_stage1_kernels(

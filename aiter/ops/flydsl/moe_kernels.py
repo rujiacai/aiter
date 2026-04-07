@@ -39,8 +39,8 @@ def get_flydsl_stage1_kernels(
     """Return {kernelName: params} for all supported stage1 configs."""
     kernels = {}
     is_fp4 = b_dtype == "fp4"
-    tile_ns = [256, 512] if is_fp4 else [128]
-    tile_ks = [256, 512] if is_fp4 else [128]
+    tile_ns = [256, 512] if is_fp4 else [128, 256]
+    tile_ks = [256, 512] if is_fp4 else [128, 256]
     tile_ms = [16, 32, 64, 128, 256]
 
     for tm in tile_ms:
@@ -66,8 +66,8 @@ def get_flydsl_stage2_kernels(
     """Return {kernelName: params} for all supported stage2 configs."""
     kernels = {}
     is_fp4 = b_dtype == "fp4"
-    tile_ns = [128, 256, 512] if is_fp4 else [128]
-    tile_ks = [256, 512] if is_fp4 else [128]
+    tile_ns = [128, 256, 512] if is_fp4 else [128, 256]
+    tile_ks = [256, 512] if is_fp4 else [128, 256]
     tile_ms = [32, 64, 128, 256]
     modes = ["atomic", "reduce"]
 
@@ -152,6 +152,8 @@ def compile_flydsl_moe_stage1(
             doweight_stage1=doweight_stage1,
             in_dtype=a_dtype,
             out_dtype=out_dtype,
+            act=act,
+            g1u0=g1u0,
         )
 
 
@@ -258,9 +260,9 @@ def _get_compiled_stage1(
         token_num: int,
         size_expert_ids_in: int,
     ) -> None:
+        stream = torch.cuda.current_stream()
         if is_fp4:
             empty_bias = torch.empty(0, device=a.device, dtype=torch.float32)
-            stream = torch.cuda.current_stream()
             # fp4/e8m0 dtypes are not supported by dlpack; reinterpret as uint8.
             _a = (
                 a.view(torch.uint8)
@@ -322,6 +324,7 @@ def _get_compiled_stage1(
                 _n_in,
                 _k_in,
                 size_expert_ids_in,
+                stream,
             )
 
     return tensor_api
@@ -386,9 +389,9 @@ def _get_compiled_stage2(
                 dtype=out.dtype,
             )
 
+        stream = torch.cuda.current_stream()
         if is_fp4:
             empty_bias = torch.empty(0, device=a.device, dtype=torch.float32)
-            stream = torch.cuda.current_stream()
             # fp4/e8m0 dtypes are not supported by dlpack; cast to uint8
             _a = (
                 a.view(torch.uint8)
@@ -450,6 +453,7 @@ def _get_compiled_stage2(
                 _n_in,
                 _k_in,
                 blocks,
+                stream,
             )
 
         if not accumulate:
