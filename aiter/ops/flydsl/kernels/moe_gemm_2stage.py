@@ -1370,7 +1370,7 @@ def compile_moe_gemm1(
                         for ni in range_constexpr(num_acc_n):
                             col_i32 = col_i32_list[ni]
                             sw_gate = sw_gate_vals[ni]
-                            sw_up = sw_up_vals[ni] if g1u0 else None
+                            sw_up = sw_up_vals[ni] if not g1u0 else None
 
                             acc_idx = mi * num_acc_n + ni
                             vg = vector.extract(
