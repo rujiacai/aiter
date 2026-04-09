@@ -1652,7 +1652,7 @@ def compile_moe_gemm2(
     module_name = (
         f"mfma_moe2_{in_dtype}_{out_s}_{epilog_tag}"
         f"_t{tile_m}x{tile_n}x{tile_k}"
-        f"_abi2"  # mask sentinel token ids on loads/stores to avoid illegal address faults
+        f"_abi5"  # reduce path: end-to-end 64-bit pointer store in cshuffle epilogue
     ).replace("-", "_")
 
     # -- CShuffle epilogue e_vec (pure Python; must be computed before @flyc.kernel
@@ -2659,17 +2659,22 @@ def compile_moe_gemm2(
                             "FLIR_MOE_STAGE2_CSHUFFLE=1 but lds_out is not allocated/aliased."
                         )
 
-                    # For bf16 global atomics, precompute the output base address once.
-                    # (We still need an inttoptr per atomic unless we can rely on GEPOp; keep the
-                    # stable path here.)
+                    # Precompute output base address as index for pointer-based stores/atomics.
                     out_base_idx = None
-                    if out_is_bf16:
+                    if out_is_bf16 or (not bool(accumulate)):
                         from flydsl._mlir.dialects import fly as _fly
                         _llvm_ptr_ty = ir.Type.parse("!llvm.ptr")
-                        #out_base_idx = _fly.extract_aligned_pointer_as_index(_llvm_ptr_ty, arg_out)
                         out_base_ptr = _fly.extract_aligned_pointer_as_index(_llvm_ptr_ty, arg_out)
                         out_base_i64 = llvm.ptrtoint(T.i64, out_base_ptr)
                         out_base_idx = arith.index_cast(ir.IndexType.get(), out_base_i64)
+
+                    def _idx_to_llvm_ptr(idx_val, addr_space=1):
+                        """Convert an index-typed byte address to !llvm.ptr<addr_space>."""
+                        idx_v = idx_val._value if hasattr(idx_val, "_value") else idx_val
+                        i64_v = arith.index_cast(T.i64, idx_v)
+                        i64_raw = i64_v._value if hasattr(i64_v, "_value") else i64_v
+                        ptr_ty = ir.Type.parse(f"!llvm.ptr<{addr_space}>")
+                        return llvm.inttoptr(ptr_ty, i64_raw)
 
                     def write_row_to_lds(
                         *,
@@ -2756,13 +2761,26 @@ def compile_moe_gemm2(
                         fused = row_ctx
                         t = fused & mask24_i32
                         s = fused >> 24
-                        idx0 = t * model_i32
                         if not bool(accumulate):
-                            ts = t * topk_i32_v + s
-                            idx0 = ts * model_i32
-                        col_i32 = arith.index_cast(i32, col_g0)
-                        idx_elem = idx0 + col_i32
-                        idx_elem_even = idx_elem & mask_even_i32
+                            t_idx = arith.index_cast(T.index, t)
+                            s_idx = arith.index_cast(T.index, s)
+                            n_byte_stride = arith.constant(
+                                model_dim * out_elem_bytes, index=True
+                            )
+                            row_byte_base = (
+                                (t_idx * arith.constant(topk, index=True) + s_idx)
+                                * n_byte_stride
+                            )
+                            byte_off_col = col_g0 * arith.constant(out_elem_bytes, index=True)
+                            ptr_addr_idx = out_base_idx + row_byte_base + byte_off_col
+                            out_ptr_v = _idx_to_llvm_ptr(ptr_addr_idx)
+                            frag_v = frag._value if hasattr(frag, "_value") else frag
+                            llvm.StoreOp(frag_v, out_ptr_v, alignment=4)
+                        else:
+                            idx0 = t * model_i32
+                            col_i32 = arith.index_cast(i32, col_g0)
+                            idx_elem = idx0 + col_i32
+                            idx_elem_even = idx_elem & mask_even_i32
                         if out_is_bf16:
                             if bool(accumulate):
                                 # Use global atomicrmw fadd on <2 x bf16> (CK path).
@@ -2789,15 +2807,10 @@ def compile_moe_gemm2(
                                     syncscope="agent",
                                     alignment=4,
                                 )
-                            else:
-                                # Scatter store (no atomic): store bf16x(e_vec) directly via buffer store.
-                                buffer_ops.buffer_store(frag, out_rsrc, idx_elem_even)
                         else:
-                            byte_off = idx_elem_even * c2_i32
                             if bool(accumulate):
+                                byte_off = idx_elem_even * c2_i32
                                 atomic_add_f16x2(frag, byte_off)
-                            else:
-                                buffer_ops.buffer_store(frag, out_rsrc, idx_elem_even)
 
                     c_shuffle_epilog(
                         arith=arith,
