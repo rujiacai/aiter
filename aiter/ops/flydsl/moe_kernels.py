@@ -128,26 +128,31 @@ def get_flydsl_stage2_kernels(
     tile_ks = [256] if is_fp4 else [128]
     tile_ms = [16, 32, 64, 128] if is_fp4 else [32, 64, 128]
     modes = ["atomic", "reduce"]
+    async_copies = [False, True]
 
     for tm in tile_ms:
         for tn in tile_ns:
             for tk in tile_ks:
                 for mode in modes:
-                    base_name = flydsl_kernel_name(
-                        2, a_dtype, b_dtype, out_dtype, tm, tn, tk, mode
-                    )
-                    base_params = {
-                        "stage": 2,
-                        "a_dtype": a_dtype,
-                        "b_dtype": b_dtype,
-                        "out_dtype": out_dtype,
-                        "tile_m": tm,
-                        "tile_n": tn,
-                        "tile_k": tk,
-                        "mode": mode,
-                        "MPerBlock": tm,
-                    }
-                    kernels[base_name] = base_params
+                    for async_copy in async_copies:
+                        base_name = flydsl_kernel_name(
+                            2, a_dtype, b_dtype, out_dtype, tm, tn, tk, mode
+                        )
+                        if async_copy:
+                            base_name += "_async"
+                        base_params = {
+                            "stage": 2,
+                            "a_dtype": a_dtype,
+                            "b_dtype": b_dtype,
+                            "out_dtype": out_dtype,
+                            "tile_m": tm,
+                            "tile_n": tn,
+                            "tile_k": tk,
+                            "mode": mode,
+                            "MPerBlock": tm,
+                            "use_async_copy": async_copy,
+                        }
+                        kernels[base_name] = base_params
                     # # Persistent variant: round-robin over M tiles, grid_y=cu_num.
                     # kernels[base_name + "_persist"] = {
                     #     **base_params,
@@ -250,6 +255,7 @@ def compile_flydsl_moe_stage2(
     accumulate: bool = True,
     persist_m: int = 1,
     sort_block_m: int = 0,
+    use_async_copy: bool = False,
 ):
     """Compile stage2 kernel (cached via underlying lru_cache)."""
     if b_dtype == "fp4":
@@ -270,6 +276,7 @@ def compile_flydsl_moe_stage2(
             accumulate=accumulate,
             persist_m=persist_m,
             sort_block_m=sort_block_m,
+            use_async_copy=use_async_copy,
         )
     else:
         from .kernels.moe_gemm_2stage import compile_moe_gemm2
@@ -795,6 +802,7 @@ def flydsl_moe_stage2(
     sorted_weights: Optional[torch.Tensor] = None,
     sort_block_m: int = 0,
     persist: Optional[bool] = None,
+    use_async_copy: bool = False,
 ) -> torch.Tensor:
     """Down-projection GEMM (MOE stage2). Supports atomic/reduce modes.
 
@@ -913,6 +921,7 @@ def flydsl_moe_stage2(
         accumulate=accumulate,
         persist_m=_persist_m,
         sort_block_m=sort_block_m,
+        use_async_copy=use_async_copy,
     )
     _run_compiled(exe, args)
 

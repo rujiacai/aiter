@@ -377,6 +377,7 @@ class FmoeTuner(TunerCommon):
             sorted_weights=sorted_weights,
             sort_block_m=sort_block_m,
             persist=persist,
+            use_async_copy=kparams.get("use_async_copy", False),
         )
 
     @staticmethod
