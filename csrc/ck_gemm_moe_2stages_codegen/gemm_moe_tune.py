@@ -356,7 +356,7 @@ class FmoeTuner(TunerCommon):
             moe_buf.zero_()
 
         sort_block_m = kparams.get("sort_block_m", 0)
-        persist = kparams.get("persist", None)
+        persist = kparams.get("persist", False)
         return flydsl_moe_stage2(
             inter_states=a2_qt,
             w2=w2_shuffled_flydsl,
@@ -2017,8 +2017,6 @@ class FmoeTuner(TunerCommon):
                     continue
 
                 is_splitk = kparams.get("k_batch", 1) > 1
-                if is_splitk and not use_g1u1:
-                    continue
                 if kparams.get("gate_only", False) and not use_g1u1:
                     continue
 
@@ -2082,14 +2080,18 @@ class FmoeTuner(TunerCommon):
                     )
 
             for kname, kparams in flydsl_s2_kernels.items():
-                s2_tile_m = kparams["tile_m"]
-                if blockM % s2_tile_m != 0:
+                if kparams["tile_m"] != blockM:
                     continue
-                # Only try matched (tile_m==blockM) and one smaller (blockM/2) to limit candidates
-                if s2_tile_m != blockM and s2_tile_m != blockM // 2:
-                    continue
-                s2_kparams = {**kparams, "sort_block_m": blockM}
-                s2_kname = kname if s2_tile_m == blockM else f"{kname}_sbm{blockM}"
+                s2_kname = kname
+                s2_kparams = {**kparams}
+                # s2_tile_m = kparams["tile_m"]
+                # if blockM % s2_tile_m != 0:
+                #     continue
+                # # Only try matched (tile_m==blockM) and one smaller (blockM/2) to limit candidates
+                # if s2_tile_m != blockM and s2_tile_m != blockM // 2:
+                #     continue
+                # s2_kparams = {**kparams, "sort_block_m": blockM}
+                # s2_kname = kname if s2_tile_m == blockM else f"{kname}_sbm{blockM}"
                 tasks_flydsl.append(
                     (
                         (info, "stage2", s2_kname, blockM),

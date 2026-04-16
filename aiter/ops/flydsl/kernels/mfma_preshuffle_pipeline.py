@@ -9,17 +9,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from flydsl._mlir import ir
 from flydsl.expr.typing import T
-from flydsl.expr import arith as _arith
 import flydsl.expr as fx
 
-
-def crd2idx(crd, layout):
-    """crd2idx returning an index-type scalar (unwraps fly.int_tuple)."""
-    result = fx.crd2idx(crd, layout)
-    scalar = fx.get_scalar(result)
-    if isinstance(scalar, ir.Value) and not isinstance(scalar.type, ir.IndexType):
-        scalar = _arith.IndexCastOp(T.index, scalar).result
-    return scalar
+from .layout_utils import crd2idx, idx2crd, get as layout_get
 
 
 def swizzle_xor16(row, col, k_blocks16):
@@ -112,18 +104,17 @@ def make_preshuffle_scale_layout(
 
     c16 = arith.constant(16, index=True)
     c4 = arith.constant(4, index=True)
-    arith.constant(mn_pack, index=True)
-    arith.constant(k_pack, index=True)
-    c_k_scale = _div_pow2(c_k, scale_block_size)
+    c_mn_pack = arith.constant(mn_pack, index=True)
+    c_k_pack = arith.constant(k_pack, index=True)
+    c_k_scale = c_k / scale_block_size
 
-    c_mn1 = _div_pow2(_div_pow2(c_mn, 16), mn_pack)
-    c_k1 = _div_pow2(_div_pow2(c_k_scale, 4), k_pack)
+    c_mn1 = c_mn / c16 / c_mn_pack
+    c_k1 = c_k_scale / c4 / c_k_pack
     if elem_bytes != mn_pack * k_pack:
         raise ValueError(
             f"elem_bytes of scale must be {mn_pack} * {k_pack}, got {elem_bytes!r}"
         )
 
-    arith.constant(1, index=True)
     stride_klane = c16
     stride_k0 = c4 * stride_klane
     stride_n0 = c_k1 * stride_k0
@@ -177,15 +168,17 @@ def make_preshuffle_b_layout(
     c16 = arith.constant(16, index=True)
     c_kpack = arith.constant(kpack_bytes, index=True)
 
-    from .layout_utils import _div_pow2
-
     if elem_bytes not in (1, 2):
         raise ValueError(f"elem_bytes must be 1 or 2, got {elem_bytes!r}")
     c_k_bytes = c_k * arith.constant(int(elem_bytes), index=True)
-    c_k0 = _div_pow2(c_k_bytes, 64)
-    n0 = _div_pow2(c_n, 16)
+    c_k0 = c_k_bytes // arith.constant(64, index=True)
+    n0 = c_n // arith.constant(16, index=True)
 
-    c_kpack_elems = c_kpack if elem_bytes == 1 else _div_pow2(c_kpack, int(elem_bytes))
+    c_kpack_elems = (
+        c_kpack
+        if elem_bytes == 1
+        else (c_kpack // arith.constant(int(elem_bytes), index=True))
+    )
 
     stride_nlane = c_kpack_elems
 
@@ -458,9 +451,9 @@ def tile_chunk_coord_i32(
         raise ValueError(f"chunk_i32 must be one of (1,2,4), got {chunk_i32!r}")
     chunk_off_i32 = arith.constant(i * total_threads * chunk_i32, index=True)
     tile_idx_i32 = tx_i32_base + chunk_off_i32
-    coord_local = fx.idx2crd(tile_idx_i32, layout_tile_div4)
-    row_local = fx.get(coord_local, 0)
-    col_local_i32 = fx.get(coord_local, 1)
+    coord_local = idx2crd(tile_idx_i32, layout_tile_div4)
+    row_local = layout_get(coord_local, 0)
+    col_local_i32 = layout_get(coord_local, 1)
     return row_local, col_local_i32
 
 
