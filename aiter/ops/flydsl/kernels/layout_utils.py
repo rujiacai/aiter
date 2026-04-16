@@ -28,6 +28,40 @@ def _wrap(v):
     return v
 
 
+def _unwrap_ir_value(v):
+    """Best-effort unwrap of FlyDSL wrapper objects to raw ir.Value."""
+    if isinstance(v, ir.Value):
+        return v
+    if isinstance(v, ArithValue):
+        return v.ir_value() if hasattr(v, "ir_value") else v
+    if hasattr(v, "ir_value"):
+        maybe = v.ir_value() if callable(v.ir_value) else v.ir_value
+        if isinstance(maybe, ir.Value):
+            return maybe
+    if hasattr(v, "_value") and isinstance(v._value, ir.Value):
+        return v._value
+    if hasattr(v, "value") and isinstance(v.value, ir.Value):
+        return v.value
+    return v
+
+
+def _to_i32_coord(v):
+    """Convert one coordinate operand to i32/i64 acceptable by fly.make_coord."""
+    vv = _unwrap_ir_value(v)
+    if isinstance(vv, int):
+        return arith.constant(vv, type=T.i32)
+
+    # Some wrappers are not ir.Value but still have index type.
+    if not isinstance(vv, ir.Value) and hasattr(vv, "type") and str(vv.type) == "index":
+        vv = arith.index_cast(T.i32, vv)
+        vv = _unwrap_ir_value(vv)
+
+    if isinstance(vv, ir.Value) and isinstance(vv.type, ir.IndexType):
+        vv = arith.index_cast(T.i32, vv)
+        vv = _unwrap_ir_value(vv)
+    return vv
+
+
 def _is_pow2(n):
     """Return True when *n* is a positive power of two."""
     return n > 0 and (n & (n - 1)) == 0
@@ -137,12 +171,7 @@ def crd2idx(crd, layout):
         # fly.make_coord requires i32/i64, not index
         crd_i32 = []
         for c in crd:
-            cv = c
-            if isinstance(cv, ArithValue):
-                cv = cv.ir_value() if hasattr(cv, "ir_value") else cv
-            if isinstance(cv, ir.Value) and isinstance(cv.type, ir.IndexType):
-                cv = arith.index_cast(T.i32, cv)
-            crd_i32.append(cv)
+            crd_i32.append(_to_i32_coord(c))
         coord_val = fx.make_coord(*crd_i32)
         result = fx.crd2idx(coord_val, layout)
         scalar = fx.get_scalar(result)

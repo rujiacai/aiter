@@ -66,25 +66,30 @@ def get_flydsl_stage1_kernels(
     kernels = {}
     is_fp4 = b_dtype == "fp4"
 
-    tile_ns = [32, 64, 128] if is_fp4 else [128]
-    tile_ks = [256]
+    tile_ns = [32, 64, 128, 256] if is_fp4 else [128, 256]
+    tile_ks = [256] if is_fp4 else [128, 256]
     tile_ms = [16, 32, 64, 128]
-    waves_per_eus = [1, 2, 3, 4]
-    k_batches = [1, 2, 4, 8, 16]
-    b_nts = [0, 2]
-    async_copies = [False, True]
+    waves_per_eus = [1, 2, 3, 4] if is_fp4 else [1]
+    k_batches = [1, 2, 4, 8, 16] if is_fp4 else [1]
+    b_nts = [0, 2] if is_fp4 else [2]
+    async_copies = [False, True] if is_fp4 else [False]
 
     for tm in tile_ms:
-        if tm in [16, 32]:
-            tile_ns = [32, 64, 128]
-        else:
-            tile_ns = [64, 128]
+        if is_fp4:
+            if tm in [16, 32]:
+                tile_ns = [32, 64, 128]
+            else:
+                tile_ns = [64, 128, 256]
         for tn in tile_ns:
             for tk in tile_ks:
                 for async_copy in async_copies:
                     for wpe in waves_per_eus:
                         for kb in k_batches if wpe == 3 else [1]:
-                            gate_onlys = [False, True] if kb > 1 else [False]
+                            if kb > 1 and tn > 128:
+                                continue
+                            if tn // 32 * 64 > 256:
+                                continue
+                            gate_onlys = [False, True] if kb > 1 and is_fp4 else [False]
                             for bnt in b_nts:
                                 for go in gate_onlys:
                                     name = flydsl_kernel_name(
@@ -124,8 +129,8 @@ def get_flydsl_stage2_kernels(
     """Return {kernelName: params} for all supported stage2 configs."""
     kernels = {}
     is_fp4 = b_dtype == "fp4"
-    tile_ns = [128, 256] if is_fp4 else [128]
-    tile_ks = [256] if is_fp4 else [128]
+    tile_ns = [128, 256] if is_fp4 else [128, 256]
+    tile_ks = [256] if is_fp4 else [128, 256]
     tile_ms = [16, 32, 64, 128] if is_fp4 else [32, 64, 128]
     modes = ["atomic", "reduce"]
     async_copies = [False, True]
@@ -237,6 +242,8 @@ def compile_flydsl_moe_stage1(
             doweight_stage1=doweight_stage1,
             in_dtype=a_dtype,
             out_dtype=out_dtype,
+            act=act,
+            use_g1u1=use_g1u1,
         )
 
 
