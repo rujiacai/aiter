@@ -2028,9 +2028,11 @@ class FmoeTuner(TunerCommon):
                     continue
 
                 s1_variants = [(kname, kparams, False)]
+                # split-K + fuse_fp4_quant is only implemented for g1u1 (see moe_kernels moe_1stage).
                 if b_dtype_str == "fp4" and ((not is_splitk) or (act_type != ActivationType.Gelu)):
-                    fq_params = {**kparams, "fuse_fp4_quant": True}
-                    s1_variants.append((kname + "_fq", fq_params, True))
+                    if (not is_splitk) or use_g1u1:
+                        fq_params = {**kparams, "fuse_fp4_quant": True}
+                        s1_variants.append((kname + "_fq", fq_params, True))
 
                 for s1_name, s1_params, is_fq in s1_variants:
                     ref_args_extra = (
