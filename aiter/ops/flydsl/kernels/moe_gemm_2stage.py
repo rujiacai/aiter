@@ -1980,7 +1980,7 @@ def compile_moe_gemm2(
     module_name = (
         f"mfma_moe2_{in_dtype}_{out_s}_{epilog_tag}"
         f"_t{tile_m}x{tile_n}x{tile_k}{_async_tag2}{_wpe_tag2}{_bnt_tag2}"
-        f"_abi4"  # keep CShuffle block-size mapping aligned with dynamic thread count
+        f"_abi5_i64reduce"  # keep reduce-mode temp-buffer addressing in index/i64 space
     ).replace("-", "_")
 
     # ── CShuffle epilogue e_vec (pure Python; must be computed before @flyc.kernel
@@ -3166,16 +3166,25 @@ def compile_moe_gemm2(
                             "FLYDSL_MOE_STAGE2_CSHUFFLE=1 but lds_out is not allocated/aliased."
                         )
 
-                    # For bf16 global atomics (gfx942 only), precompute the output base address.
-                    # gfx950+ has buffer_atomic_pk_add_bf16, so bf16 uses buffer atomics there.
+                    # Precompute the output base address when an i32 buffer offset is not enough.
+                    # accumulate=False writes a temporary [tokens, topk, model_dim] buffer, which
+                    # can exceed 4 GiB for large token counts.
                     out_base_idx = None
-                    if _needs_global_atomic_bf16:
+                    if (not bool(accumulate)) or _needs_global_atomic_bf16:
                         from flydsl._mlir.dialects import fly as _fly
                         _llvm_ptr_ty = ir.Type.parse("!llvm.ptr")
-                        #out_base_idx = _fly.extract_aligned_pointer_as_index(_llvm_ptr_ty, arg_out)
-                        out_base_ptr = _fly.extract_aligned_pointer_as_index(_llvm_ptr_ty, arg_out)
+                        out_base_ptr = _fly.extract_aligned_pointer_as_index(
+                            _llvm_ptr_ty, arg_out
+                        )
                         out_base_i64 = llvm.ptrtoint(T.i64, out_base_ptr)
                         out_base_idx = arith.index_cast(ir.IndexType.get(), out_base_i64)
+
+                    def _idx_to_llvm_ptr(idx_val, addr_space=1):
+                        idx_v = idx_val._value if hasattr(idx_val, "_value") else idx_val
+                        i64_v = arith.index_cast(T.i64, idx_v)
+                        i64_raw = i64_v._value if hasattr(i64_v, "_value") else i64_v
+                        ptr_ty = ir.Type.parse(f"!llvm.ptr<{addr_space}>")
+                        return llvm.inttoptr(ptr_ty, i64_raw)
 
                     def write_row_to_lds(
                         *,
@@ -3248,33 +3257,38 @@ def compile_moe_gemm2(
                         t_ok = arith.cmpi(arith.CmpIPredicate.ult, t, tokens_i32)
                         s_ok = arith.cmpi(arith.CmpIPredicate.ult, s, topk_i32_v)
                         row_valid = row_valid0 & t_ok & s_ok
+                        if out_base_idx is not None:
+                            t_idx = arith.index_cast(T.index, t)
+                            s_idx = arith.index_cast(T.index, s)
+                            ts_idx = t_idx * fx.Index(topk) + s_idx
+                            if bool(accumulate):
+                                row_byte_base = out_base_idx + t_idx * fx.Index(
+                                    model_dim * out_elem_bytes
+                                )
+                            else:
+                                row_byte_base = out_base_idx + ts_idx * fx.Index(
+                                    model_dim * out_elem_bytes
+                                )
+                            return ((fused2, row_byte_base), row_valid)
                         return (fused2, row_valid)
 
                     def store_pair(*, row_local, row, row_ctx, col_pair0, col_g0, frag):
-                        fused = row_ctx
+                        if out_base_idx is not None:
+                            fused, row_byte_base = row_ctx
+                        else:
+                            fused = row_ctx
+                            row_byte_base = None
                         t = fused & mask24_i32
                         s = fused >> 24
                         idx0 = t * model_i32
-                        if not bool(accumulate):
-                            ts = t * topk_i32_v + s
-                            idx0 = ts * model_i32
                         col_i32 = arith.index_cast(T.i32, col_g0)
                         idx_elem = idx0 + col_i32
                         idx_elem_even = idx_elem & mask_even_i32
                         if _needs_global_atomic_bf16:
                             # gfx942: no buffer_atomic_pk_add_bf16, use global atomicrmw fadd
                             if bool(accumulate):
-                                byte_off = idx_elem_even * c2_i32
-                                byte_off_idx = arith.index_cast(T.index, byte_off)
-                                ptr_addr_idx = out_base_idx + byte_off_idx
-                                out_ptr = buffer_ops.create_llvm_ptr(
-                                    ptr_addr_idx, address_space=1
-                                )
-                                out_ptr_v = (
-                                    out_ptr._value
-                                    if hasattr(out_ptr, "_value")
-                                    else out_ptr
-                                )
+                                ptr_addr_idx = row_byte_base + col_g0 * fx.Index(2)
+                                out_ptr_v = _idx_to_llvm_ptr(ptr_addr_idx)
                                 frag_v = (
                                     frag._value if hasattr(frag, "_value") else frag
                                 )
@@ -3287,9 +3301,15 @@ def compile_moe_gemm2(
                                     alignment=4,
                                 )
                             else:
-                                buffer_ops.buffer_store(
-                                    frag, out_rsrc, idx_elem_even,
-                                    cache_modifier=_store_nt,
+                                ptr_addr_idx = row_byte_base + col_g0 * fx.Index(2)
+                                frag_v = (
+                                    frag._value if hasattr(frag, "_value") else frag
+                                )
+                                llvm.StoreOp(
+                                    frag_v,
+                                    _idx_to_llvm_ptr(ptr_addr_idx),
+                                    alignment=_e_vec * out_elem_bytes,
+                                    nontemporal=_store_nt is not None,
                                 )
                         else:
                             # f16, or bf16 on gfx950+ (has buffer_atomic_pk_add_bf16)
@@ -3297,9 +3317,15 @@ def compile_moe_gemm2(
                             if bool(accumulate):
                                 atomic_add_f16x2(frag, byte_off)
                             else:
-                                buffer_ops.buffer_store(
-                                    frag, out_rsrc, idx_elem_even,
-                                    cache_modifier=_store_nt,
+                                ptr_addr_idx = row_byte_base + col_g0 * fx.Index(2)
+                                frag_v = (
+                                    frag._value if hasattr(frag, "_value") else frag
+                                )
+                                llvm.StoreOp(
+                                    frag_v,
+                                    _idx_to_llvm_ptr(ptr_addr_idx),
+                                    alignment=_e_vec * out_elem_bytes,
+                                    nontemporal=_store_nt is not None,
                                 )
 
                     c_shuffle_epilog(
@@ -3443,18 +3469,35 @@ def compile_moe_reduction(
             c_topk = fx.Index(topk)
             c_model_dim = fx.Index(model_dim)
             c_elem_bytes = arith.index(4 if dtype_str == "f32" else 2)
-            x_nbytes_idx = m_tokens * c_topk * c_model_dim * c_elem_bytes
             y_nbytes_idx = m_tokens * c_model_dim * c_elem_bytes
             mask_nbytes_idx = m_tokens * c_topk
-            x_rsrc = buffer_ops.create_buffer_resource(
-                X, max_size=False, num_records_bytes=x_nbytes_idx
-            )
             y_rsrc = buffer_ops.create_buffer_resource(
                 Y, max_size=False, num_records_bytes=y_nbytes_idx
             )
             mask_rsrc = buffer_ops.create_buffer_resource(
                 valid_mask, max_size=False, num_records_bytes=mask_nbytes_idx
             )
+            from flydsl._mlir.dialects import fly as _fly
+
+            _llvm_ptr_ty = ir.Type.parse("!llvm.ptr")
+            x_base_ptr = _fly.extract_aligned_pointer_as_index(_llvm_ptr_ty, X)
+            x_base_i64 = llvm.ptrtoint(T.i64, x_base_ptr)
+            x_base_idx = arith.index_cast(T.index, x_base_i64)
+
+            def _idx_to_llvm_ptr(idx_val, addr_space=1):
+                idx_v = idx_val._value if hasattr(idx_val, "_value") else idx_val
+                i64_v = arith.index_cast(T.i64, idx_v)
+                i64_raw = i64_v._value if hasattr(i64_v, "_value") else i64_v
+                ptr_ty = ir.Type.parse(f"!llvm.ptr<{addr_space}>")
+                return llvm.inttoptr(ptr_ty, i64_raw)
+
+            def load_x(byte_off):
+                load_op = llvm.LoadOp(
+                    elem_type(),
+                    _idx_to_llvm_ptr(x_base_idx + byte_off),
+                    alignment=4 if dtype_str == "f32" else 2,
+                )
+                return load_op.res
 
             token_idx = gpu.block_id("x")
             tile_idx = gpu.block_id("y")
@@ -3496,7 +3539,7 @@ def compile_moe_reduction(
                             for k in range_constexpr(topk):
                                 k_idx = fx.Index(k)
                                 x_idx = (token_base + k_idx) * c_model_dim + col
-                                x_idx_i32 = arith.index_cast(i32_type(), x_idx)
+                                x_byte_off = x_idx * c_elem_bytes
                                 if use_mask:
                                     m_idx = token_base + k_idx
                                     m_idx_i32 = arith.index_cast(i32_type(), m_idx)
@@ -3511,21 +3554,11 @@ def compile_moe_reduction(
                                     )
                                     v = arith.select(
                                         mv_ok,
-                                        buffer_ops.buffer_load(
-                                            x_rsrc,
-                                            x_idx_i32,
-                                            vec_width=1,
-                                            dtype=elem_type(),
-                                        ),
+                                        load_x(x_byte_off),
                                         arith.constant(0.0, type=elem_type()),
                                     )
                                 else:
-                                    v = buffer_ops.buffer_load(
-                                        x_rsrc,
-                                        x_idx_i32,
-                                        vec_width=1,
-                                        dtype=elem_type(),
-                                    )
+                                    v = load_x(x_byte_off)
                                 if dtype_str in ("f16", "bf16"):
                                     v = arith.extf(compute_type(), v)
                                 a = a + v
@@ -3553,7 +3586,7 @@ def compile_moe_reduction(
                                 for k in range_constexpr(topk):
                                     k_idx = fx.Index(k)
                                     x_idx = (token_base + k_idx) * c_model_dim + col
-                                    x_idx_i32 = arith.index_cast(i32_type(), x_idx)
+                                    x_byte_off = x_idx * c_elem_bytes
                                     if use_mask:
                                         m_idx = token_base + k_idx
                                         m_idx_i32 = arith.index_cast(i32_type(), m_idx)
@@ -3568,21 +3601,11 @@ def compile_moe_reduction(
                                         )
                                         v = arith.select(
                                             mv_ok,
-                                            buffer_ops.buffer_load(
-                                                x_rsrc,
-                                                x_idx_i32,
-                                                vec_width=1,
-                                                dtype=elem_type(),
-                                            ),
+                                            load_x(x_byte_off),
                                             arith.constant(0.0, type=elem_type()),
                                         )
                                     else:
-                                        v = buffer_ops.buffer_load(
-                                            x_rsrc,
-                                            x_idx_i32,
-                                            vec_width=1,
-                                            dtype=elem_type(),
-                                        )
+                                        v = load_x(x_byte_off)
                                     if dtype_str in ("f16", "bf16"):
                                         v = arith.extf(compute_type(), v)
                                     a = a + v
