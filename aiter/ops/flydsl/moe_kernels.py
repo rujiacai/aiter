@@ -914,7 +914,17 @@ def flydsl_moe_stage1(
     _need_quant = fuse_fp4_quant or _splitk_fq
     _need_sort = _need_quant and (fuse_sort_scale or _splitk_fq)
 
-    _sort_block_m = max(32, tile_m)
+    # `_sort_block_m` MUST equal the `block_size` that moe_sorting was called
+    # with. The kernel's grid_y is derived from `_dense_blks`, and one WG
+    # handles exactly one sort-block of `block_size` rows. If we pick a value
+    # > block_size, the floor-division in `_dense_blks` undercounts the actual
+    # valid blocks, the kernel skips the trailing blocks, and their output
+    # rows in stage1_out stay UNINITIALIZED (random garbage from the caching
+    # allocator). This used to be hardcoded to max(32, tile_m) which silently
+    # over-allocates the scale buffer below but BREAKS correctness whenever
+    # tile_m < 32 (e.g. tile_m=16) because in production / tuner the contract
+    # is moe_sorting.block_size == tile_m.
+    _sort_block_m = tile_m
     _all_blks = sorted_expert_ids.shape[0]
     _dense_blks = (
         min(token_num * topk * _sort_block_m, sorted_token_ids.shape[0])
