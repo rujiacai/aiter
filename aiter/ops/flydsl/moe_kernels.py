@@ -226,9 +226,12 @@ def _lds_within_limit(
     lds_total_bytes = max(lds_x_bytes, lds_out_bytes) + lds_tid_bytes
     if waves_per_eu >= 1:
         # Match compile_moe_gemm{1,2}: waves_per_eu reserves minimum LDS to
-        # influence occupancy. With 160KB total LDS, waves_per_eu=1 raises
-        # allocation to ~82KB.
-        min_lds = (160 * 1024) // (waves_per_eu + 1) + 1
+        # influence occupancy. The reservation budget is per-CU LDS / arch,
+        # i.e. 64 KB on gfx942 and 160 KB on gfx950 -- using a hard-coded
+        # 160 KB here would over-filter on gfx942 (rejecting candidates that
+        # actually fit) AND mis-match the compile-time padding in
+        # `kernels/moe_gemm_2stage.py::compile_moe_gemm{1,2}`.
+        min_lds = lds_limit_bytes // (waves_per_eu + 1) + 1
         lds_total_bytes = max(lds_total_bytes, min_lds)
     return lds_total_bytes <= lds_limit_bytes
 

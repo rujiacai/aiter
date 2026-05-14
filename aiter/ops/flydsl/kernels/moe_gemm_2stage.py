@@ -56,6 +56,7 @@ from .mfma_preshuffle_pipeline import (
     crd2idx,
 )
 from .mfma_epilogues import c_shuffle_epilog, default_epilog, mfma_epilog
+from .kernels_common import per_cu_lds_bytes
 
 
 def _barrier(vmcnt=63, lgkmcnt=63):
@@ -193,8 +194,11 @@ def compile_moe_gemm1(
 
     waves_per_eu:
       Controls LDS-based occupancy. When >= 1, the allocator is padded so that
-      each workgroup claims at least ``160KB // (waves_per_eu + 1) + 1`` bytes
-      of LDS, limiting the number of concurrent workgroups per CU.
+      each workgroup claims at least ``per_cu_lds_bytes() // (waves_per_eu+1) + 1``
+      bytes of LDS, limiting the number of concurrent workgroups per CU.
+      ``per_cu_lds_bytes()`` resolves to 64 KB on gfx942 (MI300X) and 160 KB on
+      gfx950 (MI355X); without this per-arch lookup the gfx950 budget would
+      collapse gfx942 to 1 workgroup per CU even at small `waves_per_eu`.
       0 means no padding (default).
 
     b_nt:
@@ -353,7 +357,7 @@ def compile_moe_gemm1(
     _lds_tid_byte_off = max(lds_x_bytes, lds_out_bytes)
 
     if waves_per_eu >= 1:
-        _total_cu_lds = 160 * 1024
+        _total_cu_lds = per_cu_lds_bytes()
         _min_lds = _total_cu_lds // (waves_per_eu + 1) + 1
         _cur_lds = allocator._align(allocator.ptr, 128)
         if _cur_lds < _min_lds:
@@ -2013,7 +2017,7 @@ def compile_moe_gemm2(
     _lds_tid_byte_off2 = max(lds_x_bytes, lds_out_bytes)
 
     if waves_per_eu >= 1:
-        _total_cu_lds = 160 * 1024
+        _total_cu_lds = per_cu_lds_bytes()
         _min_lds = _total_cu_lds // (waves_per_eu + 1) + 1
         _cur_lds = allocator._align(allocator.ptr, 128)
         if _cur_lds < _min_lds:
