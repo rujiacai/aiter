@@ -247,9 +247,9 @@ def get_flydsl_stage1_kernels(
     kernels = {}
     is_fp4 = b_dtype == "fp4"
 
-    tile_ns = [32, 64, 128, 256] if is_fp4 else [64, 128, 256]
+    tile_ns = [32, 64, 128, 256] if is_fp4 else [32, 64, 128, 256]
     tile_ks = [256] if is_fp4 else [128, 256]
-    tile_ms = [16, 32, 64, 128] if is_fp4 else [32, 64, 128]
+    tile_ms = [16, 32, 64, 128] if is_fp4 else [16, 32, 64, 128]
     waves_per_eus = [1, 2, 3, 4] if is_fp4 else [0, 1, 2, 3, 4]
     k_batches = [1, 2, 4, 8, 16] if is_fp4 else [1]
     b_nts = [0, 2] if is_fp4 else [0, 2]
@@ -351,9 +351,9 @@ def get_flydsl_stage2_kernels(
     """Return {kernelName: params} for all supported stage2 configs."""
     kernels = {}
     is_fp4 = b_dtype == "fp4"
-    tile_ns = [128, 256] if is_fp4 else [128, 256]
+    tile_ns = [128, 256] if is_fp4 else [64, 128, 256]
     tile_ks = [128, 256] if is_fp4 else [64, 128, 256]
-    tile_ms = [16, 32, 64, 128] if is_fp4 else [32, 64, 128]
+    tile_ms = [16, 32, 64, 128] if is_fp4 else [16, 32, 64, 128]
     modes = ["atomic", "reduce"]
     waves_per_eus = [0] if is_fp4 else [0, 1, 2, 3, 4]
     b_nts = [0] if is_fp4 else [0, 2]
