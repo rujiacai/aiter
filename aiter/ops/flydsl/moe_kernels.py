@@ -192,9 +192,13 @@ def _parse_flydsl_kernel_name(name: str) -> Optional[Dict]:
         "b_nt": 2,
     }
     if stage == 1:
-        params.update({"k_batch": 1, "gate_only": False})
+        # n_per_wave defaults to 32 (legacy behavior); see compile_moe_gemm1.
+        params.update({"k_batch": 1, "gate_only": False, "n_per_wave": 32})
     else:
-        params.update({"mode": "atomic", "sort_block_m": 0, "persist": False})
+        # Stage2 also supports n_per_wave (default 32 = legacy); see compile_moe_gemm2.
+        params.update(
+            {"mode": "atomic", "sort_block_m": 0, "persist": False, "n_per_wave": 32}
+        )
 
     for token in (match.group("rest") or "").split("_"):
         if not token:
@@ -221,6 +225,11 @@ def _parse_flydsl_kernel_name(name: str) -> Optional[Dict]:
             params["sort_block_m"] = int(token[3:])
         elif token == "fq":
             params["fuse_fp4_quant"] = True
+        elif token.startswith("n") and token[1:].isdigit():
+            # _n<N> overrides N-cols-per-wave for both stages (codegen knob,
+            # see compile_moe_gemm{1,2}.n_per_wave). Default 32 (legacy); 16
+            # doubles `num_waves` and halves `num_acc_n` -- helps small tile_m.
+            params["n_per_wave"] = int(token[1:])
         else:
             return None
     return params
@@ -251,10 +260,19 @@ def _x_load_supported(
     tile_n: int,
     tile_k: int,
     use_async_copy: bool,
+    n_per_wave: int = 32,
 ) -> bool:
-    """Mirror X-load compile-time constraints before creating tune tasks."""
+    """Mirror X-load compile-time constraints before creating tune tasks.
+
+    Halving ``n_per_wave`` doubles ``num_waves`` (=tile_n/n_per_wave) and thus
+    ``total_threads``, which halves ``bytes_per_thread_x``. The dword (4-byte)
+    indexed load mapping in compile_moe_gemm{1,2} requires
+    ``bytes_per_thread_x % 4 == 0`` — a constraint that bites earliest for fp8
+    with small tile_k. Bake the actual ``n_per_wave`` into this filter so the
+    enumerator never produces candidates that can't compile.
+    """
     elem_bytes = 2 if a_dtype in ("fp16", "bf16", "int4_bf16") else 1
-    total_threads = (tile_n // 32) * 64
+    total_threads = (tile_n // n_per_wave) * 64
     bytes_x_per_tile = tile_m * tile_k * elem_bytes
     if bytes_x_per_tile % total_threads != 0:
         return False
@@ -387,37 +405,56 @@ def get_flydsl_stage1_kernels(
                             gate_onlys = [False, True] if kb > 1 and is_fp4 else [False]
                             for bnt in b_nts:
                                 for go in gate_onlys:
-                                    name = flydsl_kernel_name(
-                                        1, a_dtype, b_dtype, out_dtype, tm, tn, tk
-                                    )
-                                    if async_copy:
-                                        name += "_async"
-                                    if is_fp4 and wpe != 1:
-                                        name += f"_w{wpe}"
-                                    elif not is_fp4 and wpe > 0:
-                                        name += f"_w{wpe}"
-                                    if kb != 1:
-                                        name += f"_kb{kb}"
-                                    if bnt != 2:
-                                        name += f"_bnt{bnt}"
-                                    if go:
-                                        name += "_go"
-                                    kernels[name] = {
-                                        "stage": 1,
-                                        "a_dtype": a_dtype,
-                                        "b_dtype": b_dtype,
-                                        "out_dtype": out_dtype,
-                                        "tile_m": tm,
-                                        "tile_n": tn,
-                                        "tile_k": tk,
-                                        "MPerBlock": tm,
-                                        "use_cshuffle_epilog": use_cshuffle_epilog,
-                                        "use_async_copy": async_copy,
-                                        "waves_per_eu": wpe,
-                                        "k_batch": kb,
-                                        "b_nt": bnt,
-                                        "gate_only": go,
-                                    }
+                                    npw_candidates = [32]
+                                    if (
+                                        not is_fp4
+                                        and tm <= 16
+                                        and tn % 16 == 0
+                                        and (tn // 16) * 64 <= 1024
+                                        and _x_load_supported(
+                                            a_dtype, tm, tn, tk, async_copy,
+                                            n_per_wave=16,
+                                        )
+                                    ):
+                                        npw_candidates.append(16)
+                                    for npw in npw_candidates:
+                                        if tn % npw != 0:
+                                            continue
+                                        name = flydsl_kernel_name(
+                                            1, a_dtype, b_dtype, out_dtype, tm, tn, tk
+                                        )
+                                        if async_copy:
+                                            name += "_async"
+                                        if is_fp4 and wpe != 1:
+                                            name += f"_w{wpe}"
+                                        elif not is_fp4 and wpe > 0:
+                                            name += f"_w{wpe}"
+                                        if kb != 1:
+                                            name += f"_kb{kb}"
+                                        if bnt != 2:
+                                            name += f"_bnt{bnt}"
+                                        if go:
+                                            name += "_go"
+                                        if npw != 32:
+                                            name += f"_n{npw}"
+                                        kernels[name] = {
+                                            "stage": 1,
+                                            "a_dtype": a_dtype,
+                                            "b_dtype": b_dtype,
+                                            "out_dtype": out_dtype,
+                                            "tile_m": tm,
+                                            "tile_n": tn,
+                                            "tile_k": tk,
+                                            "MPerBlock": tm,
+                                            "use_cshuffle_epilog": use_cshuffle_epilog,
+                                            "use_async_copy": async_copy,
+                                            "waves_per_eu": wpe,
+                                            "k_batch": kb,
+                                            "b_nt": bnt,
+                                            "gate_only": go,
+                                            "n_per_wave": npw,
+                                        }
+
     if (
         a_dtype == "fp8"
         and b_dtype == "fp8"
@@ -508,43 +545,61 @@ def get_flydsl_stage2_kernels(
                             ):
                                 continue
                             for bnt in b_nts:
-                                base_name = flydsl_kernel_name(
-                                    2,
-                                    a_dtype,
-                                    b_dtype,
-                                    out_dtype,
-                                    tm,
-                                    tn,
-                                    tk,
-                                    mode,
-                                )
-                                if async_copy:
-                                    base_name += "_async"
-                                if mfma_variant_tag:
-                                    base_name += f"_{mfma_variant_tag}"
-                                if is_fp4 and wpe != 1:
-                                    base_name += f"_w{wpe}"
-                                elif not is_fp4 and wpe > 0:
-                                    base_name += f"_w{wpe}"
-                                if bnt != 2:
-                                    base_name += f"_bnt{bnt}"
-                                base_params = {
-                                    "stage": 2,
-                                    "a_dtype": a_dtype,
-                                    "b_dtype": b_dtype,
-                                    "out_dtype": out_dtype,
-                                    "tile_m": tm,
-                                    "tile_n": tn,
-                                    "tile_k": tk,
-                                    "mode": mode,
-                                    "MPerBlock": tm,
-                                    "use_async_copy": async_copy,
-                                    "waves_per_eu": wpe,
-                                    "b_nt": bnt,
-                                }
-                                if mfma_variant_tag:
-                                    base_params["mfma_variant"] = mfma_variant_tag
-                                kernels[base_name] = base_params
+                                npw_candidates = [32]
+                                if (
+                                    not is_fp4
+                                    and tm <= 16
+                                    and tn % 16 == 0
+                                    and (tn // 16) * 64 <= 1024
+                                    and _x_load_supported(
+                                        a_dtype, tm, tn, tk, async_copy,
+                                        n_per_wave=16,
+                                    )
+                                ):
+                                    npw_candidates.append(16)
+                                for npw in npw_candidates:
+                                    if tn % npw != 0:
+                                        continue
+                                    base_name = flydsl_kernel_name(
+                                        2,
+                                        a_dtype,
+                                        b_dtype,
+                                        out_dtype,
+                                        tm,
+                                        tn,
+                                        tk,
+                                        mode,
+                                    )
+                                    if async_copy:
+                                        base_name += "_async"
+                                    if mfma_variant_tag:
+                                        base_name += f"_{mfma_variant_tag}"
+                                    if is_fp4 and wpe != 1:
+                                        base_name += f"_w{wpe}"
+                                    elif not is_fp4 and wpe > 0:
+                                        base_name += f"_w{wpe}"
+                                    if bnt != 2:
+                                        base_name += f"_bnt{bnt}"
+                                    if npw != 32:
+                                        base_name += f"_n{npw}"
+                                    base_params = {
+                                        "stage": 2,
+                                        "a_dtype": a_dtype,
+                                        "b_dtype": b_dtype,
+                                        "out_dtype": out_dtype,
+                                        "tile_m": tm,
+                                        "tile_n": tn,
+                                        "tile_k": tk,
+                                        "mode": mode,
+                                        "MPerBlock": tm,
+                                        "use_async_copy": async_copy,
+                                        "waves_per_eu": wpe,
+                                        "b_nt": bnt,
+                                        "n_per_wave": npw,
+                                    }
+                                    if mfma_variant_tag:
+                                        base_params["mfma_variant"] = mfma_variant_tag
+                                    kernels[base_name] = base_params
     if (
         a_dtype == "fp8"
         and b_dtype == "fp8"
@@ -621,9 +676,20 @@ def compile_flydsl_moe_stage1(
     waves_per_eu: int = 3,
     b_nt: int = 2,
     gate_only: bool = False,
+    n_per_wave: int = 32,
 ):
     """Compile stage1 kernel (cached via underlying lru_cache)."""
     if b_dtype == "fp4":
+        # NOTE: n_per_wave knob is only wired into the bf16/fp8/int8 codegen
+        # (kernels/moe_gemm_2stage.py). The mixed_moe_gemm_2stage (fp4) path
+        # still uses the legacy `num_waves = tile_n // 32` derivation; reject
+        # non-default values rather than silently ignore them.
+        if n_per_wave != 32:
+            raise ValueError(
+                "compile_flydsl_moe_stage1: n_per_wave override is only "
+                f"supported for non-fp4 b_dtype, got b_dtype={b_dtype!r} "
+                f"with n_per_wave={n_per_wave}"
+            )
         from .kernels.mixed_moe_gemm_2stage import compile_mixed_moe_gemm1
 
         return compile_mixed_moe_gemm1(
@@ -669,6 +735,7 @@ def compile_flydsl_moe_stage1(
             use_async_copy=use_async_copy,
             waves_per_eu=waves_per_eu,
             b_nt=b_nt,
+            n_per_wave=n_per_wave,
         )
 
 
@@ -695,6 +762,7 @@ def compile_flydsl_moe_stage2(
     a_scale_scalar: bool = False,
     w_scale_per_expert: bool = False,
     split_reduce: bool = False,
+    n_per_wave: int = 32,
 ):
     """Compile stage2 kernel (cached via underlying lru_cache)."""
     if direct:
@@ -717,6 +785,16 @@ def compile_flydsl_moe_stage2(
             split_reduce=split_reduce,
         )
     if b_dtype == "fp4":
+        # NOTE: n_per_wave knob is only wired into the bf16/fp8/int8 codegen
+        # (kernels/moe_gemm_2stage.py). The mixed_moe_gemm_2stage (fp4) path
+        # still uses the legacy `num_waves = tile_n // 32` derivation; reject
+        # non-default values rather than silently ignore them.
+        if n_per_wave != 32:
+            raise ValueError(
+                "compile_flydsl_moe_stage2: n_per_wave override is only "
+                f"supported for non-fp4 b_dtype, got b_dtype={b_dtype!r} "
+                f"with n_per_wave={n_per_wave}"
+            )
         from .kernels.mixed_moe_gemm_2stage import compile_mixed_moe_gemm2
 
         return compile_mixed_moe_gemm2(
@@ -755,6 +833,7 @@ def compile_flydsl_moe_stage2(
             use_async_copy=use_async_copy,
             waves_per_eu=waves_per_eu,
             b_nt=b_nt,
+            n_per_wave=n_per_wave,
         )
 
 
@@ -1043,6 +1122,7 @@ def flydsl_moe_stage1(
     waves_per_eu: int = 3,
     b_nt: int = 2,
     gate_only: bool = False,
+    n_per_wave: int = 32,
 ):
     """Fused MOE stage1 GEMM.
 
@@ -1276,6 +1356,7 @@ def flydsl_moe_stage1(
         waves_per_eu=waves_per_eu,
         b_nt=b_nt,
         gate_only=gate_only,
+        n_per_wave=n_per_wave,
     )
     _run_compiled(exe, args)
 
@@ -1354,6 +1435,7 @@ def flydsl_moe_stage2(
     waves_per_eu: int = 3,
     b_nt: int = 2,
     mfma_variant: Optional[str] = None,
+    n_per_wave: int = 32,
 ) -> torch.Tensor:
     """Down-projection GEMM (MOE stage2). Supports atomic/reduce modes.
 
@@ -1477,6 +1559,7 @@ def flydsl_moe_stage2(
         waves_per_eu=waves_per_eu,
         b_nt=b_nt,
         mfma_variant=mfma_variant,
+        n_per_wave=n_per_wave,
     )
     _run_compiled(exe, args)
 

@@ -178,8 +178,19 @@ def compile_moe_gemm1(
     use_async_copy: bool = False,
     waves_per_eu: int = 3,
     b_nt: int = 2,
+    n_per_wave: int = 32,
 ):
     """Compile stage1 kernel (`moe_gemm1`) and return the compiled executable.
+
+    n_per_wave:
+      Number of N-columns each wave covers. Default 32 reproduces the legacy
+      layout where each wave handles 2 MFMA16x16 N-tiles per K group
+      (`num_acc_n = n_per_wave // 16 = 2`). Setting `n_per_wave = 16` halves
+      the per-wave MFMA chain length (`num_acc_n = 1`) and DOUBLES the wave
+      count (`num_waves = tile_n // n_per_wave`), trading more lanes for less
+      per-wave latency. Useful for small `tile_m` (16) where there is no M
+      repeat to hide the longer accumulator chain. Must divide `tile_n` and
+      itself be a multiple of 16. Currently restricted to {16, 32}.
 
     in_dtype:
       - "fp8": X/W are fp8
@@ -285,8 +296,23 @@ def compile_moe_gemm1(
                 "(or `rocdl.mfma_f32_16x16x16_bf16_1k`)."
             )
 
-    num_waves = tile_n // 32
+    if n_per_wave not in (16, 32):
+        raise ValueError(
+            f"n_per_wave must be 16 or 32, got {n_per_wave}. "
+            f"(MFMA tile is 16-cols, num_acc_n=n_per_wave//16, layout/store "
+            f"loops only validated for those two values.)"
+        )
+    if int(tile_n) % int(n_per_wave) != 0:
+        raise ValueError(
+            f"tile_n ({tile_n}) must be divisible by n_per_wave ({n_per_wave})"
+        )
+    num_waves = tile_n // n_per_wave
     total_threads = num_waves * 64
+    if total_threads > 1024:
+        raise ValueError(
+            f"workgroup too large: total_threads={total_threads} (max 1024). "
+            f"Try a larger n_per_wave or smaller tile_n."
+        )
     bytes_x_per_tile = int(tile_m) * int(tile_k) * int(elem_bytes)
     if bytes_x_per_tile % total_threads != 0:
         raise ValueError(
@@ -331,9 +357,10 @@ def compile_moe_gemm1(
     _async_tag = "_async" if use_async_copy else ""
     _wpe_tag = f"_wpe{waves_per_eu}" if waves_per_eu >= 1 else ""
     _bnt_tag = f"_bnt{b_nt}" if b_nt != 2 else ""
+    _npw_tag = f"_n{n_per_wave}" if n_per_wave != 32 else ""
     module_name = (
         f"mfma_moe1_{g1u_tag}_{in_dtype}_{out_dtype}_{epilog_tag}"
-        f"_t{tile_m}x{tile_n}x{tile_k}{_async_tag}{_wpe_tag}{_bnt_tag}"
+        f"_t{tile_m}x{tile_n}x{tile_k}{_async_tag}{_wpe_tag}{_bnt_tag}{_npw_tag}"
         f"_abi5_csh16"  # keep MFMA16 CShuffle isolated from MFMA32 epilogue scheduling
     ).replace("-", "_")
 
@@ -1814,6 +1841,7 @@ def compile_moe_gemm2(
     use_async_copy: bool = False,
     waves_per_eu: int = 3,
     b_nt: int = 2,
+    n_per_wave: int = 32,
 ):
     """Compile stage2 kernel (`moe_gemm2`) and return the compiled executable.
 
@@ -1838,6 +1866,17 @@ def compile_moe_gemm2(
     b_nt:
       Non-temporal cache modifier for B (weight) buffer loads.
       0 = normal caching, 2 = non-temporal (GLC+SLC).
+
+    n_per_wave:
+      Number of N-columns each wave covers. Default 32 reproduces the legacy
+      stage2 layout where each wave handles 2 MFMA16x16 N-tiles
+      (`num_acc_n = n_per_wave // 16 = 2`). Setting `n_per_wave = 16` halves
+      the per-wave MFMA chain length (`num_acc_n = 1`) and DOUBLES the wave
+      count (`num_waves = tile_n // n_per_wave`), trading more lanes for less
+      per-wave latency. Useful for small `tile_m` (16) where there is no M
+      repeat to hide the longer accumulator chain. Must divide `tile_n` and
+      itself be a multiple of 16. Currently restricted to {16, 32}. See the
+      stage1 docstring for the same knob.
     """
     gpu_arch = get_hip_arch()
     allocator = SmemAllocator(None, arch=gpu_arch)
@@ -1900,8 +1939,23 @@ def compile_moe_gemm2(
                 "(or `rocdl.mfma_f32_16x16x16_bf16_1k`)."
             )
 
-    num_waves = tile_n // 32
+    if n_per_wave not in (16, 32):
+        raise ValueError(
+            f"n_per_wave must be 16 or 32, got {n_per_wave}. "
+            f"(MFMA tile is 16-cols, num_acc_n=n_per_wave//16, layout/store "
+            f"loops only validated for those two values.)"
+        )
+    if int(tile_n) % int(n_per_wave) != 0:
+        raise ValueError(
+            f"tile_n ({tile_n}) must be divisible by n_per_wave ({n_per_wave})"
+        )
+    num_waves = tile_n // n_per_wave
     total_threads = num_waves * 64
+    if total_threads > 1024:
+        raise ValueError(
+            f"workgroup too large: total_threads={total_threads} (max 1024). "
+            f"Try a larger n_per_wave or smaller tile_n."
+        )
     tile_k_bytes = int(tile_k) * int(elem_bytes)
     _use_k128_mfma_fp8 = (
         _is_gfx950 and not is_int8 and not is_f16_or_bf16
@@ -1981,9 +2035,10 @@ def compile_moe_gemm2(
     _async_tag2 = "_async" if use_async_copy else ""
     _wpe_tag2 = f"_wpe{waves_per_eu}" if waves_per_eu >= 1 else ""
     _bnt_tag2 = f"_bnt{b_nt}" if b_nt != 2 else ""
+    _npw_tag2 = f"_n{n_per_wave}" if n_per_wave != 32 else ""
     module_name = (
         f"mfma_moe2_{in_dtype}_{out_s}_{epilog_tag}"
-        f"_t{tile_m}x{tile_n}x{tile_k}{_async_tag2}{_wpe_tag2}{_bnt_tag2}"
+        f"_t{tile_m}x{tile_n}x{tile_k}{_async_tag2}{_wpe_tag2}{_bnt_tag2}{_npw_tag2}"
         f"_abi5_i64reduce"  # keep reduce-mode temp-buffer addressing in index/i64 space
     ).replace("-", "_")
 
@@ -3778,6 +3833,7 @@ def compile_moe_gemm2_ex(
     mode: str = MoeGemm2Mode.ATOMIC,
     valid_mask=None,
     zero_intermediate: bool = True,
+    n_per_wave: int = 32,
 ):
     """Compile MoE GEMM2 kernel with optional reduction.
 
@@ -3814,6 +3870,7 @@ def compile_moe_gemm2_ex(
             out_dtype=out_dtype,
             use_cshuffle_epilog=use_cshuffle_epilog,
             accumulate=False,
+            n_per_wave=n_per_wave,
         )
         # Compile reduction kernel with masking support
         out_s = str(out_dtype).strip().lower()
@@ -3854,4 +3911,5 @@ def compile_moe_gemm2_ex(
             out_dtype=out_dtype,
             use_cshuffle_epilog=use_cshuffle_epilog,
             accumulate=True,
+            n_per_wave=n_per_wave,
         )
