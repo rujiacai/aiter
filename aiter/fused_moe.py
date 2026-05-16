@@ -1061,6 +1061,7 @@ def _flydsl_stage1_wrapper(
         b_nt=parsed.get("b_nt", 2),
         gate_only=parsed.get("gate_only", False),
         n_per_wave=parsed.get("n_per_wave", 32),
+        splitk_mode=parsed.get("splitk_mode", "atomic"),
     )
 
 
@@ -1132,6 +1133,7 @@ def _flydsl_stage2_wrapper(
         # For migrated old kernels (non `_persist` names), force legacy non-persistent path.
         persist=parsed.get("persist", False),
         n_per_wave=parsed.get("n_per_wave", 32),
+        k_batch=parsed.get("k_batch", 1),
     )
 
 

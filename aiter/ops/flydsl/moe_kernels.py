@@ -193,11 +193,23 @@ def _parse_flydsl_kernel_name(name: str) -> Optional[Dict]:
     }
     if stage == 1:
         # n_per_wave defaults to 32 (legacy behavior); see compile_moe_gemm1.
-        params.update({"k_batch": 1, "gate_only": False, "n_per_wave": 32})
-    else:
-        # Stage2 also supports n_per_wave (default 32 = legacy); see compile_moe_gemm2.
+        # splitk_mode defaults to "atomic" (legacy); only honored when k_batch>1
+        # and only relevant for non-fp4. Parser sets it whenever the "_red"
+        # suffix is present (regardless of stage) so name<->params round-trips.
         params.update(
-            {"mode": "atomic", "sort_block_m": 0, "persist": False, "n_per_wave": 32}
+            {"k_batch": 1, "gate_only": False, "n_per_wave": 32, "splitk_mode": "atomic"}
+        )
+    else:
+        # Stage2 also supports n_per_wave (default 32 = legacy) and k_batch
+        # (split-K, default 1 = no split); see compile_moe_gemm2.
+        params.update(
+            {
+                "mode": "atomic",
+                "sort_block_m": 0,
+                "persist": False,
+                "n_per_wave": 32,
+                "k_batch": 1,
+            }
         )
 
     for token in (match.group("rest") or "").split("_"):
@@ -213,8 +225,15 @@ def _parse_flydsl_kernel_name(name: str) -> Optional[Dict]:
             params["waves_per_eu"] = int(token[1:])
         elif token.startswith("bnt") and token[3:].isdigit():
             params["b_nt"] = int(token[3:])
-        elif stage == 1 and token.startswith("kb") and token[2:].isdigit():
+        elif token.startswith("kb") and token[2:].isdigit():
+            # Split-K factor; valid for stage1 (already wired) and stage2
+            # (newly wired via compile_moe_gemm2.k_batch).
             params["k_batch"] = int(token[2:])
+        elif stage == 1 and token == "red":
+            # Stage1 split-K reduce-mode tag: per-WG kb-slice plain-stores
+            # + host-side kb-axis sum.  Default ("atomic") keeps the legacy
+            # single-buffer atomic-fadd path.  See compile_moe_gemm1.splitk_mode.
+            params["splitk_mode"] = "reduce"
         elif stage == 1 and token == "go":
             params["gate_only"] = True
         elif stage == 1 and token == "fq":
@@ -334,14 +353,68 @@ def _lds_within_limit(
     return lds_total_bytes <= lds_limit_bytes
 
 
+def stage1_kb_candidates_for_m(M: int) -> list[int]:
+    """Recommended split-K (`k_batch`) candidates for stage1 at a given M.
+
+    Empirical plateau analysis from rocprofv3 sweeps under Hunyuan-V3 shape
+    `model_dim=4096, inter_dim=192, topk=9, fp8 per-Tensor`; tile
+    `t16x64x256_n16`.  Authoritative source: the WARMUP=5 ITERS=30 sweep
+    at `lm_eval_logs/moe_splitk_reduce_compare_stage1/COMPARE.txt` (per-cell
+    SE ~0.1-0.3 us, 2sigma-significance-filtered verdicts).  An earlier
+    WARMUP=2 ITERS=3 sweep produced numbers that were ~15 % uniformly biased
+    by JIT warmup / GPU thermal state; ignore those if you find them.
+
+    Best per M, clean v3 numbers (atomic-mode unless noted):
+
+        M=1   ->  kb=8  (7.91 us  vs 18.89 us kb=1   -> 2.39x)
+        M=2   ->  kb=8  (13.61 us vs 19.59 us kb=1   -> 1.44x)
+        M=4   ->  kb=8  (21.84 us vs 24.56 us kb=1   -> 1.12x)
+        M=8   ->  kb=8  (36.16 us vs 37.83 us kb=1   -> 1.05x; reduce/atomic tied)
+        M=16  ->  kb=1  (38.39 us; no split-K variant beats baseline)
+        M=32  ->  kb=1  (58.99 us; no split-K variant beats baseline)
+        M=64  ->  kb=1  (70.62 us; reduce-mode kb=2 is 2nd at 76.53 us,
+                         the one cell where reduce beats atomic by >2sigma)
+
+    Atomic vs reduce split-K mode is a 2-significant-cells-out-of-21
+    decision (M=64 kb=2 favors reduce, M=64 kb=8 favors atomic); for every
+    other (M, kb) the two modes are tied within noise.  The autotuner still
+    enumerates both modes (see `get_flydsl_stage1_kernels`) so per-shape
+    differences are picked up automatically.
+
+    Implication: keep a wide kb range only for M <= 8 where split-K really
+    helps; for M >= 16 the autotuner just wastes time on kb>1 candidates,
+    so we narrow to [1].
+    """
+    if M <= 1:
+        return [1, 2, 4, 8]
+    if M <= 2:
+        return [1, 2, 4, 8]
+    if M <= 4:
+        return [1, 2, 4, 8]
+    if M <= 8:
+        return [1, 2, 4, 8]
+    # M >= 16: every split-K variant was strictly worse than kb=1 in the
+    # clean v3 sweep (best kb>1 was within +1.05x of kb=1 only at M=64
+    # with reduce-mode kb=2 = 76.53 us vs kb=1 = 70.62 us, i.e. an 8%
+    # regression).  No point asking the autotuner to try them.
+    return [1]
+
+
 def get_flydsl_stage1_kernels(
     a_dtype: str,
     b_dtype: str,
     out_dtype: str,
     model_dim: Optional[int] = None,
     n_dim: Optional[int] = None,
+    m_for_kb_filter: Optional[int] = None,
 ) -> Dict[str, Dict]:
-    """Return {kernelName: params} for all supported stage1 configs."""
+    """Return {kernelName: params} for all supported stage1 configs.
+
+    When ``m_for_kb_filter`` is provided, restrict the enumerated split-K
+    candidates to ``stage1_kb_candidates_for_m(m_for_kb_filter)``.  This
+    lets the tuner avoid generating obviously-bad ``_kb*`` variants at
+    large M (autotune scales down significantly).
+    """
     kernels = {}
     is_fp4 = b_dtype == "fp4"
 
@@ -349,7 +422,18 @@ def get_flydsl_stage1_kernels(
     tile_ks = [256] if is_fp4 else [128, 256]
     tile_ms = [16, 32, 64, 128] if is_fp4 else [16, 32, 64]
     waves_per_eus = [1, 2, 3, 4] if is_fp4 else [0, 1, 2, 3, 4]
-    k_batches = [1, 2, 4, 8, 16] if is_fp4 else [1]
+    # Non-fp4 split-K (the new compile_moe_gemm1 codegen path) requires an
+    # EVEN number of K tiles per WG and at least 2, so the largest useful
+    # k_batch is bounded by model_dim/(tile_k*2).  For Hunyuan-V3
+    # (model_dim=4096, tile_k in {128, 256}) k_batch up to 8 stays valid.
+    # The fp4 path keeps its existing wider sweep.
+    k_batches = [1, 2, 4, 8, 16] if is_fp4 else [1, 2, 4, 8]
+    if m_for_kb_filter is not None and not is_fp4:
+        # Cap split-K candidates to the empirical plateau at this M.  Always
+        # keep kb=1 in the candidate list so the no-split baseline survives.
+        _allowed_kb = set(stage1_kb_candidates_for_m(int(m_for_kb_filter)))
+        _allowed_kb.add(1)
+        k_batches = [k for k in k_batches if k in _allowed_kb]
     b_nts = [0, 2] if is_fp4 else [0, 2]
     async_copies = _async_copy_candidates()
     for tm in tile_ms:
@@ -395,14 +479,36 @@ def get_flydsl_stage1_kernels(
                             # Split-K stage1 requires:
                             #   model_dim % k_batch == 0 and
                             #   (model_dim // k_batch) % tile_k == 0
-                            # When model_dim is provided by the tuner, skip
-                            # kernels that can never compile for that shape.
+                            # The non-fp4 codegen path additionally requires
+                            #   tiles_per_batch = (model_dim/k_batch)/tile_k
+                            #   to be EVEN and >= 2 (the kernel main loop
+                            #   assumes a fixed 2-tile tail).  When model_dim
+                            #   is provided by the tuner, skip combinations
+                            #   that can never compile for that shape.
                             if model_dim is not None and kb > 1:
                                 if model_dim % kb != 0:
                                     continue
                                 if (model_dim // kb) % tk != 0:
                                     continue
+                                if not is_fp4:
+                                    _tiles_per_batch = (model_dim // kb) // tk
+                                    if (
+                                        _tiles_per_batch < 2
+                                        or _tiles_per_batch % 2 != 0
+                                    ):
+                                        continue
                             gate_onlys = [False, True] if kb > 1 and is_fp4 else [False]
+                            # Stage1 split-K mode: atomic (legacy) for kb>=1,
+                            # plus a reduce-mode variant for kb>1 on the non-fp4
+                            # codegen path. The reduce variant uses identical
+                            # tile/wpe/bnt/npw settings but a per-WG kb-slice
+                            # plain-store + host kb-axis sum, eliminating the
+                            # atomic-fadd contention at the cost of kb x more
+                            # tmp memory. See compile_moe_gemm1.splitk_mode.
+                            if kb > 1 and not is_fp4:
+                                splitk_modes = ["atomic", "reduce"]
+                            else:
+                                splitk_modes = ["atomic"]
                             for bnt in b_nts:
                                 for go in gate_onlys:
                                     npw_candidates = [32]
@@ -420,40 +526,44 @@ def get_flydsl_stage1_kernels(
                                     for npw in npw_candidates:
                                         if tn % npw != 0:
                                             continue
-                                        name = flydsl_kernel_name(
-                                            1, a_dtype, b_dtype, out_dtype, tm, tn, tk
-                                        )
-                                        if async_copy:
-                                            name += "_async"
-                                        if is_fp4 and wpe != 1:
-                                            name += f"_w{wpe}"
-                                        elif not is_fp4 and wpe > 0:
-                                            name += f"_w{wpe}"
-                                        if kb != 1:
-                                            name += f"_kb{kb}"
-                                        if bnt != 2:
-                                            name += f"_bnt{bnt}"
-                                        if go:
-                                            name += "_go"
-                                        if npw != 32:
-                                            name += f"_n{npw}"
-                                        kernels[name] = {
-                                            "stage": 1,
-                                            "a_dtype": a_dtype,
-                                            "b_dtype": b_dtype,
-                                            "out_dtype": out_dtype,
-                                            "tile_m": tm,
-                                            "tile_n": tn,
-                                            "tile_k": tk,
-                                            "MPerBlock": tm,
-                                            "use_cshuffle_epilog": use_cshuffle_epilog,
-                                            "use_async_copy": async_copy,
-                                            "waves_per_eu": wpe,
-                                            "k_batch": kb,
-                                            "b_nt": bnt,
-                                            "gate_only": go,
-                                            "n_per_wave": npw,
-                                        }
+                                        for skmode in splitk_modes:
+                                            name = flydsl_kernel_name(
+                                                1, a_dtype, b_dtype, out_dtype, tm, tn, tk
+                                            )
+                                            if async_copy:
+                                                name += "_async"
+                                            if is_fp4 and wpe != 1:
+                                                name += f"_w{wpe}"
+                                            elif not is_fp4 and wpe > 0:
+                                                name += f"_w{wpe}"
+                                            if kb != 1:
+                                                name += f"_kb{kb}"
+                                            if bnt != 2:
+                                                name += f"_bnt{bnt}"
+                                            if go:
+                                                name += "_go"
+                                            if npw != 32:
+                                                name += f"_n{npw}"
+                                            if skmode == "reduce":
+                                                name += "_red"
+                                            kernels[name] = {
+                                                "stage": 1,
+                                                "a_dtype": a_dtype,
+                                                "b_dtype": b_dtype,
+                                                "out_dtype": out_dtype,
+                                                "tile_m": tm,
+                                                "tile_n": tn,
+                                                "tile_k": tk,
+                                                "MPerBlock": tm,
+                                                "use_cshuffle_epilog": use_cshuffle_epilog,
+                                                "use_async_copy": async_copy,
+                                                "waves_per_eu": wpe,
+                                                "k_batch": kb,
+                                                "b_nt": bnt,
+                                                "gate_only": go,
+                                                "n_per_wave": npw,
+                                                "splitk_mode": skmode,
+                                            }
 
     if (
         a_dtype == "fp8"
@@ -560,46 +670,59 @@ def get_flydsl_stage2_kernels(
                                 for npw in npw_candidates:
                                     if tn % npw != 0:
                                         continue
-                                    base_name = flydsl_kernel_name(
-                                        2,
-                                        a_dtype,
-                                        b_dtype,
-                                        out_dtype,
-                                        tm,
-                                        tn,
-                                        tk,
-                                        mode,
-                                    )
-                                    if async_copy:
-                                        base_name += "_async"
-                                    if mfma_variant_tag:
-                                        base_name += f"_{mfma_variant_tag}"
-                                    if is_fp4 and wpe != 1:
-                                        base_name += f"_w{wpe}"
-                                    elif not is_fp4 and wpe > 0:
-                                        base_name += f"_w{wpe}"
-                                    if bnt != 2:
-                                        base_name += f"_bnt{bnt}"
-                                    if npw != 32:
-                                        base_name += f"_n{npw}"
-                                    base_params = {
-                                        "stage": 2,
-                                        "a_dtype": a_dtype,
-                                        "b_dtype": b_dtype,
-                                        "out_dtype": out_dtype,
-                                        "tile_m": tm,
-                                        "tile_n": tn,
-                                        "tile_k": tk,
-                                        "mode": mode,
-                                        "MPerBlock": tm,
-                                        "use_async_copy": async_copy,
-                                        "waves_per_eu": wpe,
-                                        "b_nt": bnt,
-                                        "n_per_wave": npw,
-                                    }
-                                    if mfma_variant_tag:
-                                        base_params["mfma_variant"] = mfma_variant_tag
-                                    kernels[base_name] = base_params
+                                    if not is_fp4 and mode == "atomic":
+                                        kb_candidates = [1, 2, 3, 4, 6, 8]
+                                    else:
+                                        kb_candidates = [1]
+                                    for kb in kb_candidates:
+                                        if kb > 1 and k_dim is not None:
+                                            if k_dim % kb != 0:
+                                                continue
+                                            if (k_dim // kb) % tk != 0:
+                                                continue
+                                        base_name = flydsl_kernel_name(
+                                            2,
+                                            a_dtype,
+                                            b_dtype,
+                                            out_dtype,
+                                            tm,
+                                            tn,
+                                            tk,
+                                            mode,
+                                        )
+                                        if async_copy:
+                                            base_name += "_async"
+                                        if mfma_variant_tag:
+                                            base_name += f"_{mfma_variant_tag}"
+                                        if is_fp4 and wpe != 1:
+                                            base_name += f"_w{wpe}"
+                                        elif not is_fp4 and wpe > 0:
+                                            base_name += f"_w{wpe}"
+                                        if bnt != 2:
+                                            base_name += f"_bnt{bnt}"
+                                        if npw != 32:
+                                            base_name += f"_n{npw}"
+                                        if kb != 1:
+                                            base_name += f"_kb{kb}"
+                                        base_params = {
+                                            "stage": 2,
+                                            "a_dtype": a_dtype,
+                                            "b_dtype": b_dtype,
+                                            "out_dtype": out_dtype,
+                                            "tile_m": tm,
+                                            "tile_n": tn,
+                                            "tile_k": tk,
+                                            "mode": mode,
+                                            "MPerBlock": tm,
+                                            "use_async_copy": async_copy,
+                                            "waves_per_eu": wpe,
+                                            "b_nt": bnt,
+                                            "n_per_wave": npw,
+                                            "k_batch": kb,
+                                        }
+                                        if mfma_variant_tag:
+                                            base_params["mfma_variant"] = mfma_variant_tag
+                                        kernels[base_name] = base_params
     if (
         a_dtype == "fp8"
         and b_dtype == "fp8"
@@ -677,8 +800,16 @@ def compile_flydsl_moe_stage1(
     b_nt: int = 2,
     gate_only: bool = False,
     n_per_wave: int = 32,
+    splitk_mode: str = "atomic",
 ):
-    """Compile stage1 kernel (cached via underlying lru_cache)."""
+    """Compile stage1 kernel (cached via underlying lru_cache).
+
+    ``splitk_mode`` (``"atomic"`` | ``"reduce"``) selects how the K-axis
+    partials are merged when ``k_batch > 1``; ignored otherwise.  See
+    ``compile_moe_gemm1`` (kernels/moe_gemm_2stage.py) for the codegen
+    semantics and ``flydsl_moe_stage1`` for the matching tmp-buffer layout
+    + post-pass that the reduce mode requires.
+    """
     if b_dtype == "fp4":
         # NOTE: n_per_wave knob is only wired into the bf16/fp8/int8 codegen
         # (kernels/moe_gemm_2stage.py). The mixed_moe_gemm_2stage (fp4) path
@@ -689,6 +820,12 @@ def compile_flydsl_moe_stage1(
                 "compile_flydsl_moe_stage1: n_per_wave override is only "
                 f"supported for non-fp4 b_dtype, got b_dtype={b_dtype!r} "
                 f"with n_per_wave={n_per_wave}"
+            )
+        if str(splitk_mode) != "atomic":
+            raise ValueError(
+                "compile_flydsl_moe_stage1: splitk_mode override is only "
+                f"supported for non-fp4 b_dtype, got b_dtype={b_dtype!r} "
+                f"with splitk_mode={splitk_mode!r}"
             )
         from .kernels.mixed_moe_gemm_2stage import compile_mixed_moe_gemm1
 
@@ -736,6 +873,8 @@ def compile_flydsl_moe_stage1(
             waves_per_eu=waves_per_eu,
             b_nt=b_nt,
             n_per_wave=n_per_wave,
+            k_batch=k_batch,
+            splitk_mode=splitk_mode,
         )
 
 
@@ -763,6 +902,7 @@ def compile_flydsl_moe_stage2(
     w_scale_per_expert: bool = False,
     split_reduce: bool = False,
     n_per_wave: int = 32,
+    k_batch: int = 1,
 ):
     """Compile stage2 kernel (cached via underlying lru_cache)."""
     if direct:
@@ -785,15 +925,22 @@ def compile_flydsl_moe_stage2(
             split_reduce=split_reduce,
         )
     if b_dtype == "fp4":
-        # NOTE: n_per_wave knob is only wired into the bf16/fp8/int8 codegen
-        # (kernels/moe_gemm_2stage.py). The mixed_moe_gemm_2stage (fp4) path
-        # still uses the legacy `num_waves = tile_n // 32` derivation; reject
-        # non-default values rather than silently ignore them.
+        # NOTE: n_per_wave / k_batch knobs are only wired into the bf16/fp8/int8
+        # codegen (kernels/moe_gemm_2stage.py). The mixed_moe_gemm_2stage (fp4)
+        # path still uses the legacy `num_waves = tile_n // 32` derivation and a
+        # single Z-grid block; reject non-default values rather than silently
+        # ignore them.
         if n_per_wave != 32:
             raise ValueError(
                 "compile_flydsl_moe_stage2: n_per_wave override is only "
                 f"supported for non-fp4 b_dtype, got b_dtype={b_dtype!r} "
                 f"with n_per_wave={n_per_wave}"
+            )
+        if int(k_batch) != 1:
+            raise ValueError(
+                "compile_flydsl_moe_stage2: k_batch (split-K) override is only "
+                f"supported for non-fp4 b_dtype, got b_dtype={b_dtype!r} "
+                f"with k_batch={k_batch}"
             )
         from .kernels.mixed_moe_gemm_2stage import compile_mixed_moe_gemm2
 
@@ -834,6 +981,7 @@ def compile_flydsl_moe_stage2(
             waves_per_eu=waves_per_eu,
             b_nt=b_nt,
             n_per_wave=n_per_wave,
+            k_batch=k_batch,
         )
 
 
@@ -1123,6 +1271,7 @@ def flydsl_moe_stage1(
     b_nt: int = 2,
     gate_only: bool = False,
     n_per_wave: int = 32,
+    splitk_mode: str = "atomic",
 ):
     """Fused MOE stage1 GEMM.
 
@@ -1202,6 +1351,18 @@ def flydsl_moe_stage1(
         else dtypes.bf16 if out_dtype == "bf16" else dtypes.fp16
     )
     _is_splitk = k_batch > 1
+    # Non-fp4 stage1 split-K (the codegen path added in compile_moe_gemm1) writes
+    # f32 partials atomically into a (M*topk, 2*inter_dim) tmp buffer; the host
+    # post-pass converts back to the requested out dtype via PyTorch silu+mul.
+    _is_splitk_std = _is_splitk and (b_dtype != "fp4")
+    if str(splitk_mode) not in ("atomic", "reduce"):
+        raise ValueError(
+            f"flydsl_moe_stage1: splitk_mode must be 'atomic' or 'reduce', "
+            f"got {splitk_mode!r}"
+        )
+    # Reduce only makes sense for the non-fp4 split-K codegen path; for fp4 or
+    # kb==1 we silently fall back to the legacy single-buffer layout.
+    _splitk_std_reduce = _is_splitk_std and str(splitk_mode) == "reduce"
 
     dev = a.device
     _splitk_fq = _is_splitk and fuse_fp4_quant
@@ -1211,6 +1372,22 @@ def flydsl_moe_stage1(
         raise ValueError("split-K fused fp4 quant currently requires use_g1u1=True")
     if _splitk_fq and act not in ("silu", "swiglu"):
         raise ValueError("split-K fused fp4 quant only supports silu/swiglu stage1")
+    if _is_splitk_std:
+        if not use_g1u1:
+            raise ValueError(
+                "non-fp4 stage1 split-K (k_batch>1) currently requires use_g1u1=True "
+                "(the codegen path stores gate/up as separate halves of the tmp buffer)"
+            )
+        if act not in ("silu",):
+            raise ValueError(
+                f"non-fp4 stage1 split-K only supports act='silu' for now, got {act!r}"
+            )
+        if sorted_weights is not None:
+            raise ValueError(
+                "non-fp4 stage1 split-K is incompatible with doweight_stage1 "
+                "(per-token weight must be applied AFTER the K reduction; the "
+                "silu_and_mul post-pass does not multiply by tw)"
+            )
 
     if out is None:
         if fuse_fp4_quant:
@@ -1222,7 +1399,28 @@ def flydsl_moe_stage1(
                 (token_num, topk, inter_dim), dtype=torch_out_dtype, device=dev
             )
 
-    if _is_splitk:
+    if _is_splitk_std:
+        # f32 partials.  Atomic mode: single (M*topk, 2*inter_dim) buffer that
+        # every WG atomic-fadd's into.  Reduce mode: (k_batch, M*topk, 2*inter)
+        # so each WG plain-stores into its own kb-slice; the host post-pass
+        # then sums across the leading kb axis.  Both layouts put gate at
+        # columns [0, inter_dim) and up at [inter_dim, 2*inter_dim) within
+        # each row so the silu_and_mul fold is identical.
+        # zeros() is required for both modes: atomic mode needs a zeroed
+        # accumulator, reduce mode needs zeros for any (kb, valid-token) slice
+        # the GEMM skipped (e.g. invalid blocks) so the kb-axis sum stays
+        # correct.
+        if _splitk_std_reduce:
+            tmp_out = torch.zeros(
+                (k_batch, token_num, topk, 2 * inter_dim),
+                dtype=torch.float32, device=dev,
+            )
+        else:
+            tmp_out = torch.zeros(
+                (token_num, topk, 2 * inter_dim),
+                dtype=torch.float32, device=dev,
+            )
+    elif _is_splitk:
         torch_tmp_out_dtype = dtypes.bf16 if out_dtype == "bf16" else dtypes.fp16
         tmp_out = torch.zeros(
             (token_num, topk, _splitk_out_cols), dtype=torch_tmp_out_dtype, device=dev
@@ -1357,6 +1555,7 @@ def flydsl_moe_stage1(
         b_nt=b_nt,
         gate_only=gate_only,
         n_per_wave=n_per_wave,
+        splitk_mode=splitk_mode,
     )
     _run_compiled(exe, args)
 
@@ -1376,6 +1575,32 @@ def flydsl_moe_stage1(
                 torch.cuda.current_stream(),
             ),
         )
+    elif _is_splitk_std:
+        # Non-fp4 split-K codegen path: tmp_out is f32.
+        #   atomic mode: tmp_out shape (M, topk, 2*inter_dim) already reduced
+        #                across kb in-place by the GEMM atomic-fadds.
+        #   reduce mode: tmp_out shape (kb, M, topk, 2*inter_dim); sum across
+        #                kb first so the gate/up slicing fed to silu_and_mul
+        #                stays byte-identical to the atomic path.
+        # The reduced (M*topk, 2*inter_dim) f32 buffer is then fed to the
+        # fused `silu_and_mul` aiter kernel which takes f32 in / bf16|fp16
+        # out in a single dispatch (silu(gate)*up + cast). This is the same
+        # kernel the legacy non-_std split-K path below uses; the previous
+        # PyTorch `(silu(gate) * up).to(out.dtype)` fallback launched 2-3
+        # elementwise kernels per stage1 call instead of 1 fused one.
+        # ``_is_splitk_std`` is already constrained to act=='silu'
+        # (see compile_flydsl_moe_stage1); guard anyway in case that
+        # constraint is relaxed to gelu in the future.
+        from aiter.ops.activation import silu_and_mul
+
+        if _splitk_std_reduce:
+            reduced = tmp_out.sum(dim=0)
+        else:
+            reduced = tmp_out
+        silu_and_mul(
+            out.view(-1, inter_dim),
+            reduced.view(-1, 2 * inter_dim),
+        )
     elif _is_splitk:
         if use_g1u1:
             if act == "gelu":
@@ -1387,16 +1612,28 @@ def flydsl_moe_stage1(
 
                 silu_and_mul(out.view(-1, inter_dim), tmp_out.view(-1, inter_dim * 2))
         else:
-            tmp_view = tmp_out.view(-1, inter_dim).to(torch.float32)
+            # g1u0 split-K (fp4 path only): single-stream activation, no mul.
+            # We deliberately do NOT use aiter's silu_and_mul / gelu_and_mul
+            # here because those kernels require paired `[..., 2*d]` input
+            # (gate||up) and there is no plain `silu(input)` / `gelu_tanh(input)`
+            # host function exposed in aiter today (the internal
+            # aiter::silu_kernel<T> + activation_kernel_vec template exist but
+            # are only wrapped as `gelu_fast`, which uses a Pade approximation
+            # that diverges from torch.nn.functional.gelu(approximate='tanh')).
+            # Adding the missing bindings is a follow-up; for now use torch
+            # directly on the native bf16/fp16 tmp_out -- torch.{silu,gelu}
+            # compute internally in f32 anyway and return the same dtype, so
+            # the explicit `.to(float32)` round-trip the legacy code did is
+            # pure overhead (2 extra cast kernels per call).
+            tmp_view = tmp_out.view(-1, inter_dim)
             if act == "gelu":
                 out.copy_(
                     torch.nn.functional.gelu(tmp_view, approximate="tanh")
-                    .to(out.dtype)
                     .view_as(out)
                 )
             else:
                 out.copy_(
-                    torch.nn.functional.silu(tmp_view).to(out.dtype).view_as(out)
+                    torch.nn.functional.silu(tmp_view).view_as(out)
                 )
 
     if fuse_fp4_quant:
@@ -1436,6 +1673,7 @@ def flydsl_moe_stage2(
     b_nt: int = 2,
     mfma_variant: Optional[str] = None,
     n_per_wave: int = 32,
+    k_batch: int = 1,
 ) -> torch.Tensor:
     """Down-projection GEMM (MOE stage2). Supports atomic/reduce modes.
 
@@ -1447,6 +1685,13 @@ def flydsl_moe_stage2(
         from sorting/stage1.
     persist: if True, use persistent round-robin mode (grid_y=cu_num);
         if False, use legacy persist_m mode; if None, auto-select.
+
+    k_batch: split-K factor along inter_dim (only honored in atomic mode and
+        for non-fp4 b_dtype).  Default 1 = no split.  When k_batch>1, the
+        kernel launches with a grid Z = k_batch and each WG processes only
+        ``inter_dim/k_batch`` of the K reduction; partials are merged via the
+        SAME atomic-add already used for topk accumulation.  Valid choices
+        depend on tile_k and inter_dim divisibility.
     """
 
     token_num = inter_states.shape[0]
@@ -1560,6 +1805,7 @@ def flydsl_moe_stage2(
         b_nt=b_nt,
         mfma_variant=mfma_variant,
         n_per_wave=n_per_wave,
+        k_batch=k_batch,
     )
     _run_compiled(exe, args)
 
