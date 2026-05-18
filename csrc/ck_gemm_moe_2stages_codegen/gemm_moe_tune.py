@@ -481,6 +481,8 @@ class FmoeTuner(TunerCommon):
             waves_per_eu=kparams.get("waves_per_eu", 3),
             b_nt=kparams.get("b_nt", 2),
             gate_only=kparams.get("gate_only", False),
+            n_per_wave=kparams.get("n_per_wave", 32),
+            splitk_mode=kparams.get("splitk_mode", "atomic"),
             fuse_fp4_quant=fuse_fq,
             fuse_sort_scale=fuse_fq,
         )
@@ -558,6 +560,8 @@ class FmoeTuner(TunerCommon):
             waves_per_eu=kparams.get("waves_per_eu", 3),
             b_nt=kparams.get("b_nt", 2),
             mfma_variant=kparams.get("mfma_variant", None),
+            n_per_wave=kparams.get("n_per_wave", 32),
+            k_batch=kparams.get("k_batch", 1),
         )
 
     @staticmethod
