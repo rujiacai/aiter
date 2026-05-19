@@ -15,10 +15,21 @@ import flydsl.compiler as flyc
 import torch
 
 _KERNEL_PARAMS: Dict[str, Dict] = {}
+_DIRECT_STAGE2_LAST_WORKSPACE: Optional[torch.Tensor] = None
 
 _SUFFIX_RE = re.compile(r"(?P<fq>_fq)?(?:_sbm(?P<sbm>\d+))?$")
 _KERNEL_NAME_RE = re.compile(
     r"^flydsl_moe(?P<stage>[12])_a(?P<a>.+?)_w(?P<b>.+?)_"
+    r"(?P<out>bf16|f16)_t(?P<tm>\d+)x(?P<tn>\d+)x(?P<tk>\d+)"
+    r"(?:_(?P<rest>.*))?$"
+)
+_DIRECT_KERNEL_NAME_RE = re.compile(
+    r"^flydsl_moe2_direct_a(?P<a>.+?)_w(?P<b>.+?)_"
+    r"(?P<out>bf16|f16)_t(?P<tm>\d+)x(?P<tn>\d+)x(?P<tk>\d+)"
+    r"(?:_(?P<rest>.*))?$"
+)
+_DIRECT_STAGE1_KERNEL_NAME_RE = re.compile(
+    r"^flydsl_moe1_direct_a(?P<a>.+?)_w(?P<b>.+?)_"
     r"(?P<out>bf16|f16)_t(?P<tm>\d+)x(?P<tn>\d+)x(?P<tk>\d+)"
     r"(?:_(?P<rest>.*))?$"
 )
@@ -91,6 +102,75 @@ def flydsl_kernel_name(
 
 
 def _parse_flydsl_kernel_name(name: str) -> Optional[Dict]:
+    direct_stage1_match = _DIRECT_STAGE1_KERNEL_NAME_RE.match(name)
+    if direct_stage1_match is not None:
+        params: Dict = {
+            "stage": 1,
+            "direct": True,
+            "a_dtype": direct_stage1_match.group("a"),
+            "b_dtype": direct_stage1_match.group("b"),
+            "out_dtype": direct_stage1_match.group("out"),
+            "tile_m": int(direct_stage1_match.group("tm")),
+            "tile_n": int(direct_stage1_match.group("tn")),
+            "tile_k": int(direct_stage1_match.group("tk")),
+            "MPerBlock": int(direct_stage1_match.group("tm")),
+            "use_async_copy": False,
+            "waves_per_eu": 0,
+            "b_nt": 2,
+            "k_batch": 1,
+            "gate_only": False,
+            "fuse_fp4_quant": False,
+            "routes_per_block": 1,
+            "num_waves": 0,
+        }
+        for token in (direct_stage1_match.group("rest") or "").split("_"):
+            if not token:
+                continue
+            if token.startswith("w") and token[1:].isdigit():
+                params["waves_per_eu"] = int(token[1:])
+            elif token.startswith("bnt") and token[3:].isdigit():
+                params["b_nt"] = int(token[3:])
+            elif token.startswith("rpb") and token[3:].isdigit():
+                params["routes_per_block"] = int(token[3:])
+            elif token.startswith("nw") and token[2:].isdigit():
+                params["num_waves"] = int(token[2:])
+            else:
+                return None
+        return params
+
+    direct_match = _DIRECT_KERNEL_NAME_RE.match(name)
+    if direct_match is not None:
+        params: Dict = {
+            "stage": 2,
+            "direct": True,
+            "a_dtype": direct_match.group("a"),
+            "b_dtype": direct_match.group("b"),
+            "out_dtype": direct_match.group("out"),
+            "tile_m": int(direct_match.group("tm")),
+            "tile_n": int(direct_match.group("tn")),
+            "tile_k": int(direct_match.group("tk")),
+            "MPerBlock": int(direct_match.group("tm")),
+            "mode": "direct",
+            "use_async_copy": False,
+            "waves_per_eu": 0,
+            "b_nt": 2,
+            "split_reduce": False,
+            "sort_block_m": 0,
+            "persist": False,
+        }
+        for token in (direct_match.group("rest") or "").split("_"):
+            if not token:
+                continue
+            if token.startswith("w") and token[1:].isdigit():
+                params["waves_per_eu"] = int(token[1:])
+            elif token.startswith("bnt") and token[3:].isdigit():
+                params["b_nt"] = int(token[3:])
+            elif token in ("sr", "splitreduce"):
+                params["split_reduce"] = True
+            else:
+                return None
+        return params
+
     match = _KERNEL_NAME_RE.match(name)
     if match is None:
         return None
@@ -338,6 +418,49 @@ def get_flydsl_stage1_kernels(
                                         "b_nt": bnt,
                                         "gate_only": go,
                                     }
+    if (
+        a_dtype == "fp8"
+        and b_dtype == "fp8"
+        and out_dtype == "bf16"
+        and model_dim is not None
+        and n_dim is not None
+        and model_dim % 64 == 0
+    ):
+        for tn in (16, 32, 64, 96, 192):
+            if n_dim % tn != 0:
+                continue
+            for tk in (64, 128, 256, 512):
+                if model_dim % tk != 0:
+                    continue
+                num_waves_candidates = [0]
+                if tn in (32, 64):
+                    num_waves_candidates.append(2)
+                elif tn == 96:
+                    num_waves_candidates.extend([2, 3])
+                elif tn == 192:
+                    num_waves_candidates.append(3)
+                for num_waves in num_waves_candidates:
+                    name = f"flydsl_moe1_direct_a{a_dtype}_w{b_dtype}_{out_dtype}_t16x{tn}x{tk}"
+                    if num_waves:
+                        name += f"_nw{num_waves}"
+                    kernels[name] = {
+                        "stage": 1,
+                        "direct": True,
+                        "a_dtype": a_dtype,
+                        "b_dtype": b_dtype,
+                        "out_dtype": out_dtype,
+                        "tile_m": 16,
+                        "tile_n": tn,
+                        "tile_k": tk,
+                        "MPerBlock": 16,
+                        "use_async_copy": False,
+                        "waves_per_eu": 0,
+                        "k_batch": 1,
+                        "b_nt": 2,
+                        "gate_only": False,
+                        "routes_per_block": 1,
+                        "num_waves": num_waves,
+                    }
     return kernels
 
 
@@ -422,6 +545,39 @@ def get_flydsl_stage2_kernels(
                                 if mfma_variant_tag:
                                     base_params["mfma_variant"] = mfma_variant_tag
                                 kernels[base_name] = base_params
+    if (
+        a_dtype == "fp8"
+        and b_dtype == "fp8"
+        and out_dtype == "bf16"
+        and k_dim is not None
+        and n_dim is not None
+        and k_dim % 64 == 0
+    ):
+        for tn in (32, 64, 128, 256):
+            if n_dim % tn != 0:
+                continue
+            for split_reduce in (False, True):
+                name = f"flydsl_moe2_direct_a{a_dtype}_w{b_dtype}_{out_dtype}_t16x{tn}x64"
+                if split_reduce:
+                    name += "_sr"
+                kernels[name] = {
+                    "stage": 2,
+                    "direct": True,
+                    "a_dtype": a_dtype,
+                    "b_dtype": b_dtype,
+                    "out_dtype": out_dtype,
+                    "tile_m": 16,
+                    "tile_n": tn,
+                    "tile_k": 64,
+                    "MPerBlock": 16,
+                    "mode": "direct",
+                    "split_reduce": split_reduce,
+                    "use_async_copy": False,
+                    "waves_per_eu": 0,
+                    "b_nt": 2,
+                    "sort_block_m": 0,
+                    "persist": False,
+                }
     return kernels
 
 
@@ -535,8 +691,31 @@ def compile_flydsl_moe_stage2(
     waves_per_eu: int = 3,
     b_nt: int = 2,
     mfma_variant: Optional[str] = None,
+    direct: bool = False,
+    a_scale_scalar: bool = False,
+    w_scale_per_expert: bool = False,
+    split_reduce: bool = False,
 ):
     """Compile stage2 kernel (cached via underlying lru_cache)."""
+    if direct:
+        if a_dtype != "fp8" or b_dtype != "fp8":
+            raise ValueError("direct small-M stage2 currently supports only fp8/fp8")
+        from .kernels.moe_gemm_2stage_direct import compile_moe_gemm2_direct_smallm
+
+        return compile_moe_gemm2_direct_smallm(
+            model_dim=model_dim,
+            inter_dim=inter_dim,
+            experts=experts,
+            topk=topk,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            tile_k=tile_k,
+            in_dtype=a_dtype,
+            out_dtype=out_dtype,
+            a_scale_scalar=a_scale_scalar,
+            w_scale_per_expert=w_scale_per_expert,
+            split_reduce=split_reduce,
+        )
     if b_dtype == "fp4":
         from .kernels.mixed_moe_gemm_2stage import compile_mixed_moe_gemm2
 
@@ -732,6 +911,78 @@ def _s2_args_std(
         blocks,
         torch.cuda.current_stream(),
     )
+
+
+def _s2_direct_args_std(
+    out,
+    a,
+    w,
+    a_scale,
+    w_scale,
+    topk_ids,
+    topk_weights,
+    token_num,
+    n_in,
+    k_in,
+):
+    return (
+        _view_safe(out),
+        _view_safe(a),
+        _view_safe(w),
+        _view_safe(a_scale),
+        _view_safe(w_scale),
+        topk_ids,
+        topk_weights,
+        token_num,
+        n_in,
+        k_in,
+        torch.cuda.current_stream(),
+    )
+
+
+def _s1_direct_args_std(
+    out,
+    a,
+    w,
+    a_scale,
+    w_scale,
+    topk_ids,
+    token_num,
+    n_in,
+    k_in,
+):
+    return (
+        _view_safe(out),
+        _view_safe(a),
+        _view_safe(w),
+        _view_safe(a_scale),
+        _view_safe(w_scale),
+        topk_ids,
+        token_num,
+        n_in,
+        k_in,
+        torch.cuda.current_stream(),
+    )
+
+
+def _direct_stage2_workspace(
+    out: torch.Tensor,
+    token_num: int,
+    topk: int,
+    model_dim: int,
+) -> torch.Tensor:
+    global _DIRECT_STAGE2_LAST_WORKSPACE
+    shape = (int(token_num) * int(topk), int(model_dim))
+    workspace = _DIRECT_STAGE2_LAST_WORKSPACE
+    if (
+        workspace is None
+        or workspace.shape != shape
+        or workspace.dtype != out.dtype
+        or workspace.device != out.device
+    ):
+        workspace = torch.empty(shape, dtype=out.dtype, device=out.device)
+        _DIRECT_STAGE2_LAST_WORKSPACE = workspace
+    return workspace
 
 
 def _run_compiled(exe, args):
@@ -1232,4 +1483,222 @@ def flydsl_moe_stage2(
     if not accumulate:
         torch.sum(target.view(token_num, topk, model_dim), dim=1, out=out)
 
+    return out
+
+
+def flydsl_moe_stage2_direct(
+    inter_states: torch.Tensor,
+    w2: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+    topk: int = 1,
+    *,
+    tile_m: int = 16,
+    tile_n: int = 64,
+    tile_k: int = 64,
+    a_dtype: str = "fp8",
+    b_dtype: str = "fp8",
+    out_dtype: str = "bf16",
+    w2_scale: Optional[torch.Tensor] = None,
+    a2_scale: Optional[torch.Tensor] = None,
+    split_reduce: bool = False,
+) -> torch.Tensor:
+    """Small-M direct down-projection.
+
+    Computes one token/N-tile per workgroup and reduces topk in-kernel:
+    out[token, n] = sum_k A2[token, k, :] @ W2[topk_ids[token, k], n, :]
+                    * a2_scale[token, k] * w2_scale[expert, n] * topk_weight[token, k]
+    """
+
+    if a_dtype != "fp8" or b_dtype != "fp8":
+        raise ValueError("flydsl_moe_stage2_direct currently supports only fp8/fp8")
+    if out_dtype != "bf16":
+        raise ValueError("flydsl_moe_stage2_direct currently supports only bf16 output")
+
+    token_num = inter_states.shape[0]
+    E = w2.shape[0]
+    model_dim = w2.shape[1]
+    inter_dim = inter_states.shape[2]
+    torch_out_dtype = torch.bfloat16
+    if out is None:
+        out = torch.empty(
+            (token_num, model_dim), dtype=torch_out_dtype, device=inter_states.device
+        )
+    target = (
+        _direct_stage2_workspace(out, token_num, topk, model_dim) if split_reduce else out
+    )
+
+    flat_a2_scale = a2_scale.view(-1) if a2_scale is not None else None
+    a_scale_scalar = flat_a2_scale is not None and flat_a2_scale.numel() == 1
+    flat_a_scale = (
+        flat_a2_scale
+        if a_scale_scalar
+        else _expand_per_tensor_scale(a2_scale, token_num * topk, 1)
+    )
+    if flat_a_scale is None:
+        raise ValueError("direct fp8 stage2 requires a2_scale")
+    flat_w2_scale = w2_scale.view(-1) if w2_scale is not None else None
+    w_scale_per_expert = flat_w2_scale is not None and flat_w2_scale.numel() == E
+    flat_w_scale = (
+        flat_w2_scale
+        if w_scale_per_expert
+        else _expand_per_tensor_scale(w2_scale, E * model_dim, model_dim)
+    )
+    if flat_w_scale is None:
+        raise ValueError("direct fp8 stage2 requires w2_scale")
+
+    stream = torch.cuda.current_stream()
+    if split_reduce:
+        from .kernels.moe_gemm_2stage_direct import compile_moe_gemm2_direct_smallm
+
+        exe = compile_moe_gemm2_direct_smallm(
+            model_dim=model_dim,
+            inter_dim=inter_dim,
+            experts=E,
+            topk=topk,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            tile_k=tile_k,
+            in_dtype=a_dtype,
+            out_dtype=out_dtype,
+            a_scale_scalar=a_scale_scalar,
+            w_scale_per_expert=w_scale_per_expert,
+            split_reduce=True,
+        )
+    else:
+        exe = compile_flydsl_moe_stage2(
+            model_dim=model_dim,
+            inter_dim=inter_dim,
+            experts=E,
+            topk=topk,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            tile_k=tile_k,
+            doweight_stage2=True,
+            a_dtype=a_dtype,
+            b_dtype=b_dtype,
+            out_dtype=out_dtype,
+            direct=True,
+            a_scale_scalar=a_scale_scalar,
+            w_scale_per_expert=w_scale_per_expert,
+            split_reduce=False,
+        )
+    if split_reduce:
+        args = (
+            _view_safe(out),
+            _view_safe(target),
+            _view_safe(inter_states),
+            _view_safe(w2),
+            _view_safe(flat_a_scale),
+            _view_safe(flat_w_scale),
+            topk_ids,
+            topk_weights,
+            token_num,
+            model_dim,
+            inter_dim,
+            stream,
+        )
+    else:
+        args = _s2_direct_args_std(
+            target,
+            inter_states,
+            w2,
+            flat_a_scale,
+            flat_w_scale,
+            topk_ids,
+            topk_weights,
+            token_num,
+            model_dim,
+            inter_dim,
+        )
+    _run_compiled(exe, args)
+    return out
+
+
+def flydsl_moe_stage1_direct(
+    a: torch.Tensor,
+    w1: torch.Tensor,
+    topk_ids: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+    topk: int = 1,
+    *,
+    tile_m: int = 16,
+    tile_n: int = 64,
+    tile_k: int = 64,
+    a_dtype: str = "fp8",
+    b_dtype: str = "fp8",
+    out_dtype: str = "bf16",
+    w1_scale: Optional[torch.Tensor] = None,
+    a1_scale: Optional[torch.Tensor] = None,
+    routes_per_block: int = 1,
+    num_waves: int = 0,
+) -> torch.Tensor:
+    """Small-M direct stage1 for fp8/fp8 silu(gate)*up."""
+
+    if a_dtype != "fp8" or b_dtype != "fp8":
+        raise ValueError("flydsl_moe_stage1_direct currently supports only fp8/fp8")
+    if out_dtype != "bf16":
+        raise ValueError("flydsl_moe_stage1_direct currently supports only bf16 output")
+
+    token_num = a.shape[0]
+    model_dim = a.shape[1]
+    E = w1.shape[0]
+    if w1.shape[1] % 2 != 0:
+        raise ValueError("direct stage1 expects g1u1 W1 with shape[1] == 2*inter_dim")
+    inter_dim = w1.shape[1] // 2
+    if out is None:
+        out = torch.empty(
+            (token_num, topk, inter_dim), dtype=torch.bfloat16, device=a.device
+        )
+
+    flat_a1_scale = a1_scale.view(-1) if a1_scale is not None else None
+    a_scale_scalar = flat_a1_scale is not None and flat_a1_scale.numel() == 1
+    flat_a_scale = (
+        flat_a1_scale
+        if a_scale_scalar
+        else _expand_per_tensor_scale(a1_scale, token_num, 1)
+    )
+    if flat_a_scale is None:
+        raise ValueError("direct fp8 stage1 requires a1_scale")
+
+    flat_w1_scale = w1_scale.view(-1) if w1_scale is not None else None
+    w_scale_per_expert = flat_w1_scale is not None and flat_w1_scale.numel() == E
+    flat_w_scale = (
+        flat_w1_scale
+        if w_scale_per_expert
+        else _expand_per_tensor_scale(w1_scale, E * 2 * inter_dim, 2 * inter_dim)
+    )
+    if flat_w_scale is None:
+        raise ValueError("direct fp8 stage1 requires w1_scale")
+
+    from .kernels.moe_gemm_2stage_direct import compile_moe_gemm1_direct_smallm
+
+    exe = compile_moe_gemm1_direct_smallm(
+        model_dim=model_dim,
+        inter_dim=inter_dim,
+        experts=E,
+        topk=topk,
+        tile_m=tile_m,
+        tile_n=tile_n,
+        tile_k=tile_k,
+        in_dtype=a_dtype,
+        out_dtype=out_dtype,
+        a_scale_scalar=a_scale_scalar,
+        w_scale_per_expert=w_scale_per_expert,
+        routes_per_block=routes_per_block,
+        num_waves_override=num_waves,
+    )
+    args = _s1_direct_args_std(
+        out,
+        a,
+        w1,
+        flat_a_scale,
+        flat_w_scale,
+        topk_ids,
+        token_num,
+        inter_dim,
+        model_dim,
+    )
+    _run_compiled(exe, args)
     return out
