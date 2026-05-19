@@ -1033,6 +1033,8 @@ def _flydsl_stage1_wrapper(
             a1_scale=a1_scale,
             routes_per_block=parsed.get("routes_per_block", 1),
             num_waves=parsed.get("num_waves", 0),
+            k_batch=parsed.get("k_batch", 1),
+            splitk_mode=parsed.get("splitk_mode", "atomic"),
         )
     return aiter.ops.flydsl.flydsl_moe_stage1(
         a=hidden_states,

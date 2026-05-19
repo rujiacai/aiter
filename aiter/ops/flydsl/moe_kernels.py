@@ -188,6 +188,9 @@ def _parse_flydsl_kernel_name(name: str) -> Optional[Dict]:
             "fuse_fp4_quant": False,
             "routes_per_block": 1,
             "num_waves": 0,
+            # Default split-K mode: "atomic" (legacy single-buffer atomic-fadd).
+            # Only honored when k_batch>1.  See compile_moe_gemm1_direct_smallm.
+            "splitk_mode": "atomic",
         }
         for token in (direct_stage1_match.group("rest") or "").split("_"):
             if not token:
@@ -200,6 +203,14 @@ def _parse_flydsl_kernel_name(name: str) -> Optional[Dict]:
                 params["routes_per_block"] = int(token[3:])
             elif token.startswith("nw") and token[2:].isdigit():
                 params["num_waves"] = int(token[2:])
+            elif token.startswith("kb") and token[2:].isdigit():
+                # Split-K factor along model_dim; see compile_moe_gemm1_direct_smallm.
+                params["k_batch"] = int(token[2:])
+            elif token == "red":
+                # Split-K reduce-mode tag: per-WG kb-slice plain-stores + host
+                # kb-axis sum.  Default ("atomic") keeps the legacy
+                # single-buffer atomic-fadd path.
+                params["splitk_mode"] = "reduce"
             else:
                 return None
         return params
@@ -639,6 +650,18 @@ def get_flydsl_stage1_kernels(
         and n_dim is not None
         and model_dim % 64 == 0
     ):
+        # Direct stage1 supports the SAME split-K codegen path as the standard
+        # kernel (compile_moe_gemm1_direct_smallm.k_batch / splitk_mode).
+        # Apply the same kb shortlist and the same m-based filter so the tuner
+        # doesn't queue obviously-bad kb>1 variants at large M.  Direct kernel
+        # uses a simple per-tile K loop without 2-tile tail unrolling, so the
+        # standard kernel's "EVEN tile count per WG" restriction does NOT
+        # apply here -- any K-tile count >= 1 is fine.
+        _direct_kb_pool = [1, 2, 4, 8]
+        if m_for_kb_filter is not None:
+            _allowed_kb = set(stage1_kb_candidates_for_m(int(m_for_kb_filter)))
+            _allowed_kb.add(1)
+            _direct_kb_pool = [k for k in _direct_kb_pool if k in _allowed_kb]
         for tn in (16, 32, 64, 96, 192):
             if n_dim % tn != 0:
                 continue
@@ -653,27 +676,52 @@ def get_flydsl_stage1_kernels(
                 elif tn == 192:
                     num_waves_candidates.append(3)
                 for num_waves in num_waves_candidates:
-                    name = f"flydsl_moe1_direct_a{a_dtype}_w{b_dtype}_{out_dtype}_t16x{tn}x{tk}"
-                    if num_waves:
-                        name += f"_nw{num_waves}"
-                    kernels[name] = {
-                        "stage": 1,
-                        "direct": True,
-                        "a_dtype": a_dtype,
-                        "b_dtype": b_dtype,
-                        "out_dtype": out_dtype,
-                        "tile_m": 16,
-                        "tile_n": tn,
-                        "tile_k": tk,
-                        "MPerBlock": 16,
-                        "use_async_copy": False,
-                        "waves_per_eu": 0,
-                        "k_batch": 1,
-                        "b_nt": 2,
-                        "gate_only": False,
-                        "routes_per_block": 1,
-                        "num_waves": num_waves,
-                    }
+                    for kb in _direct_kb_pool:
+                        if kb > 1:
+                            if model_dim % kb != 0:
+                                continue
+                            _k_per_batch = model_dim // kb
+                            if _k_per_batch % tk != 0:
+                                continue
+                            if (_k_per_batch // tk) < 1:
+                                continue
+                        # Reduce mode only meaningful with kb>1; atomic
+                        # covers both kb==1 (degenerate, no atomics issued)
+                        # and kb>1 (legacy single-buffer atomic-fadd).
+                        splitk_modes = ["atomic", "reduce"] if kb > 1 else ["atomic"]
+                        for skmode in splitk_modes:
+                            name = (
+                                f"flydsl_moe1_direct_a{a_dtype}_w{b_dtype}"
+                                f"_{out_dtype}_t16x{tn}x{tk}"
+                            )
+                            if num_waves:
+                                name += f"_nw{num_waves}"
+                            if kb != 1:
+                                name += f"_kb{kb}"
+                            # IMPORTANT: keep "_red" at the very end so the
+                            # parser picks it up as a standalone token
+                            # regardless of which other knobs are present.
+                            if skmode == "reduce":
+                                name += "_red"
+                            kernels[name] = {
+                                "stage": 1,
+                                "direct": True,
+                                "a_dtype": a_dtype,
+                                "b_dtype": b_dtype,
+                                "out_dtype": out_dtype,
+                                "tile_m": 16,
+                                "tile_n": tn,
+                                "tile_k": tk,
+                                "MPerBlock": 16,
+                                "use_async_copy": False,
+                                "waves_per_eu": 0,
+                                "k_batch": kb,
+                                "b_nt": 2,
+                                "gate_only": False,
+                                "routes_per_block": 1,
+                                "num_waves": num_waves,
+                                "splitk_mode": skmode,
+                            }
     return kernels
 
 
@@ -2149,13 +2197,33 @@ def flydsl_moe_stage1_direct(
     a1_scale: Optional[torch.Tensor] = None,
     routes_per_block: int = 1,
     num_waves: int = 0,
+    k_batch: int = 1,
+    splitk_mode: str = "atomic",
 ) -> torch.Tensor:
-    """Small-M direct stage1 for fp8/fp8 silu(gate)*up."""
+    """Small-M direct stage1 for fp8/fp8 silu(gate)*up.
+
+    ``k_batch`` enables split-K along the model_dim axis (mirrors the standard
+    ``compile_flydsl_moe_stage1`` split-K codegen path).  When ``k_batch > 1``:
+      * The kernel writes f32 pre-activation gate/up partials into a tmp
+        buffer instead of the final bf16 silu(gate)*up.  Buffer layout:
+          ``atomic`` -> (token_num, topk, 2*inter_dim) f32, atomic-fadd merged
+          ``reduce`` -> (k_batch, token_num, topk, 2*inter_dim) f32, plain
+                        stores per WG and host-side kb-axis sum.
+      * The host post-pass runs aiter's fused ``silu_and_mul`` to fold the
+        2-stream f32 buffer into the requested bf16 ``out`` in one dispatch.
+      * ``k_batch == 1`` retains the legacy single-shot path with bf16 store
+        and in-kernel silu(gate)*up.
+    """
 
     if a_dtype != "fp8" or b_dtype != "fp8":
         raise ValueError("flydsl_moe_stage1_direct currently supports only fp8/fp8")
     if out_dtype != "bf16":
         raise ValueError("flydsl_moe_stage1_direct currently supports only bf16 output")
+    if str(splitk_mode) not in ("atomic", "reduce"):
+        raise ValueError(
+            f"flydsl_moe_stage1_direct: splitk_mode must be 'atomic' or "
+            f"'reduce', got {splitk_mode!r}"
+        )
 
     token_num = a.shape[0]
     model_dim = a.shape[1]
@@ -2204,7 +2272,55 @@ def flydsl_moe_stage1_direct(
         w_scale_per_expert=w_scale_per_expert,
         routes_per_block=routes_per_block,
         num_waves_override=num_waves,
+        k_batch=int(k_batch),
+        splitk_mode=str(splitk_mode),
     )
+
+    _is_splitk = int(k_batch) > 1
+    _splitk_reduce = _is_splitk and str(splitk_mode) == "reduce"
+    if _is_splitk:
+        # f32 partial-sum tmp buffer.  zeros() is REQUIRED for both modes:
+        #   atomic : the kernel atomic-fadd's into this buffer; needs a
+        #            zero initial value so the kb-way reduction is correct.
+        #   reduce : invalid (skipped) WGs leave their kb-slice untouched;
+        #            the host sum across kb must see zeros for those.
+        if _splitk_reduce:
+            tmp_out = torch.zeros(
+                (int(k_batch), token_num, topk, 2 * inter_dim),
+                dtype=torch.float32,
+                device=a.device,
+            )
+        else:
+            tmp_out = torch.zeros(
+                (token_num, topk, 2 * inter_dim),
+                dtype=torch.float32,
+                device=a.device,
+            )
+        args = _s1_direct_args_std(
+            tmp_out,
+            a,
+            w1,
+            flat_a_scale,
+            flat_w_scale,
+            topk_ids,
+            token_num,
+            inter_dim,
+            model_dim,
+        )
+        _run_compiled(exe, args)
+
+        from aiter.ops.activation import silu_and_mul
+
+        # Reduce mode: collapse kb axis first so silu_and_mul sees the same
+        # (M*topk, 2*inter) layout as atomic mode.  Atomic mode already has
+        # that shape after the in-kernel atomic-fadd.
+        reduced = tmp_out.sum(dim=0) if _splitk_reduce else tmp_out
+        silu_and_mul(
+            out.view(-1, inter_dim),
+            reduced.view(-1, 2 * inter_dim),
+        )
+        return out
+
     args = _s1_direct_args_std(
         out,
         a,

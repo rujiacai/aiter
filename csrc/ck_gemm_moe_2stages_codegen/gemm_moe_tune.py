@@ -456,6 +456,8 @@ class FmoeTuner(TunerCommon):
                 a1_scale=a1_scale,
                 routes_per_block=kparams.get("routes_per_block", 1),
                 num_waves=kparams.get("num_waves", 0),
+                k_batch=kparams.get("k_batch", 1),
+                splitk_mode=kparams.get("splitk_mode", "atomic"),
             )
         result = flydsl_moe_stage1(
             a=a1_qt,
@@ -2315,6 +2317,12 @@ class FmoeTuner(TunerCommon):
             and use_g1u1
             and not doweight_stage1
         ):
+            # Direct stage1 split-K candidates (compile_moe_gemm1_direct_smallm
+            # supports the same k_batch + splitk_mode knobs as the standard
+            # kernel via patch 0002's codegen path).  Mirror the standard
+            # stage1 kb pool [1, 2, 4, 8]; reduce-mode only enumerated when
+            # kb > 1.  Divisibility checks are inlined below so the tuner
+            # never queues impossible variants.
             for tn in (16, 32, 64, 96, 192):
                 if inter_dim % tn != 0:
                     continue
@@ -2329,15 +2337,32 @@ class FmoeTuner(TunerCommon):
                     if model_dim % tk != 0:
                         continue
                     for num_waves in num_waves_candidates:
-                        kname = (
-                            f"flydsl_moe1_direct_a{a_dtype_s1}_w{b_dtype_s1}_"
-                            f"{out_dtype_str}_t16x{tn}x{tk}"
-                        )
-                        if num_waves:
-                            kname += f"_nw{num_waves}"
-                        kparams = get_flydsl_kernel_params(kname)
-                        if kparams is not None:
-                            flydsl_s1_kernels[kname] = kparams
+                        for kb in (1, 2, 4, 8):
+                            if kb > 1:
+                                if model_dim % kb != 0:
+                                    continue
+                                _kpb = model_dim // kb
+                                if _kpb % tk != 0:
+                                    continue
+                                if (_kpb // tk) < 1:
+                                    continue
+                            splitk_modes = (
+                                ("atomic", "reduce") if kb > 1 else ("atomic",)
+                            )
+                            for skmode in splitk_modes:
+                                kname = (
+                                    f"flydsl_moe1_direct_a{a_dtype_s1}_w{b_dtype_s1}_"
+                                    f"{out_dtype_str}_t16x{tn}x{tk}"
+                                )
+                                if num_waves:
+                                    kname += f"_nw{num_waves}"
+                                if kb != 1:
+                                    kname += f"_kb{kb}"
+                                if skmode == "reduce":
+                                    kname += "_red"
+                                kparams = get_flydsl_kernel_params(kname)
+                                if kparams is not None:
+                                    flydsl_s1_kernels[kname] = kparams
         flydsl_s2_kernels = get_flydsl_stage2_kernels(
             a_dtype_s2,
             b_dtype_s2,
