@@ -47,7 +47,15 @@ def _current_gfx() -> str:
 
 
 def _expand_per_tensor_scale(scale: Optional[torch.Tensor], rows: int, cols: int):
-    """Expand compact per-tensor/per-expert scales to FlyDSL row-scale layout."""
+    """Expand compact per-tensor/per-expert scales to FlyDSL row-scale layout.
+
+    Used only by the legacy (non-fused-init) fallback paths now.  In the fused
+    init path the broadcast is folded into the init kernel and this function
+    is bypassed.  We intentionally do not cache the expanded result: the old
+    ``id(tensor)``-keyed cache made correctness depend on caller-side object
+    reuse and tangled with weakref finalizers, and once both stages run
+    through fused init the cache covers almost no GPU work anyway.
+    """
     if scale is None:
         return None
     flat = scale.view(-1)
@@ -58,6 +66,64 @@ def _expand_per_tensor_scale(scale: Optional[torch.Tensor], rows: int, cols: int
     if cols > 1 and flat.numel() * cols == rows:
         return flat.view(-1, 1).expand(-1, cols).contiguous().view(-1)
     return flat
+
+
+def _resolve_a_scale_for_fused_init(
+    a_scale: Optional[torch.Tensor], rows: int, dev: torch.device
+):
+    """Resolve a_scale into ``(flat_a, needs_fused_expand)`` for fused init.
+
+    For per-tensor a_scale (numel==1) we allocate a fresh ``(rows,)`` f32
+    buffer and signal that the fused kernel must populate it via scalar
+    broadcast. For already-flat (numel==rows) we return the source as-is.
+    For unusual layouts we fall back to the legacy expand so the GEMM sees
+    the same flat buffer it always has.
+    """
+    if a_scale is None:
+        return torch.empty(0, device=dev), False
+    flat = a_scale.view(-1)
+    n = flat.numel()
+    if n == 1:
+        # Fused init will write `a_scale[0]` into all `rows` slots.
+        return (
+            torch.empty(rows, dtype=flat.dtype, device=flat.device),
+            True,
+        )
+    if n == rows:
+        return flat, False
+    # Unusual layout (e.g. per-1x32). Legacy path handles it; no fusion.
+    fallback = _expand_per_tensor_scale(a_scale, rows, 1)
+    if fallback is None:
+        fallback = torch.empty(0, device=dev)
+    return fallback, False
+
+
+def _resolve_w_scale_for_fused_init(
+    w_scale: Optional[torch.Tensor], rows: int, cols: int, dev: torch.device
+):
+    """Resolve w_scale into ``(flat_w, needs_fused_expand)`` for fused init.
+
+    Always allocates a fresh buffer on the per-expert broadcast path and
+    asks the fused init kernel to do the broadcast.  No host-side cache:
+    the broadcast write is folded into the kernel that has to launch for
+    the zero-fill anyway, so reusing a pre-expanded buffer across calls
+    saves no measurable GPU time and the ``id()``-keyed cache it required
+    was a correctness hazard.
+    """
+    if w_scale is None:
+        return torch.empty(0, device=dev), False
+    flat = w_scale.view(-1)
+    n = flat.numel()
+    if n == rows:
+        return flat, False
+    if n == 1:
+        # Rare: per-tensor weight scale.  Reuse legacy scalar-broadcast path
+        # rather than wiring a third broadcast variant into the fused kernel.
+        return flat.expand(rows).contiguous(), False
+    if cols > 1 and n * cols == rows:
+        return torch.empty(rows, dtype=flat.dtype, device=flat.device), True
+    # Unknown layout - keep flat (matches legacy fallback behavior).
+    return flat, False
 
 
 def _stage2_mfma_variant_tag(tile_k: int, a_dtype: str, b_dtype: str) -> str:
@@ -1399,6 +1465,20 @@ def flydsl_moe_stage1(
                 (token_num, topk, inter_dim), dtype=torch_out_dtype, device=dev
             )
 
+    # ------------------------------------------------------------------
+    # Stage1 init: tmp_out zero + flat_a_scale broadcast + flat_w_scale
+    # broadcast. The non-fp4 split-K path fuses these three helpers into a
+    # single Triton launch (see aiter.ops.flydsl._fused_post). When the fused
+    # path is disabled (env or fp4 codegen path) we fall back to torch.zeros
+    # + two separate _expand_per_tensor_scale launches.
+    # ------------------------------------------------------------------
+    from aiter.ops.flydsl._fused_post import (
+        fused_init as _fused_init,
+        is_init_disabled as _fused_init_disabled,
+    )
+
+    _use_fused_init = _is_splitk_std and not _fused_init_disabled()
+
     if _is_splitk_std:
         # f32 partials.  Atomic mode: single (M*topk, 2*inter_dim) buffer that
         # every WG atomic-fadd's into.  Reduce mode: (k_batch, M*topk, 2*inter)
@@ -1406,20 +1486,18 @@ def flydsl_moe_stage1(
         # then sums across the leading kb axis.  Both layouts put gate at
         # columns [0, inter_dim) and up at [inter_dim, 2*inter_dim) within
         # each row so the silu_and_mul fold is identical.
-        # zeros() is required for both modes: atomic mode needs a zeroed
-        # accumulator, reduce mode needs zeros for any (kb, valid-token) slice
-        # the GEMM skipped (e.g. invalid blocks) so the kb-axis sum stays
-        # correct.
+        # zeros() (or the fused init kernel below) is required for both modes:
+        # atomic mode needs a zeroed accumulator, reduce mode needs zeros for
+        # any (kb, valid-token) slice the GEMM skipped (e.g. invalid blocks)
+        # so the kb-axis sum stays correct.
         if _splitk_std_reduce:
-            tmp_out = torch.zeros(
-                (k_batch, token_num, topk, 2 * inter_dim),
-                dtype=torch.float32, device=dev,
-            )
+            _tmp_out_shape = (k_batch, token_num, topk, 2 * inter_dim)
         else:
-            tmp_out = torch.zeros(
-                (token_num, topk, 2 * inter_dim),
-                dtype=torch.float32, device=dev,
-            )
+            _tmp_out_shape = (token_num, topk, 2 * inter_dim)
+        if _use_fused_init:
+            tmp_out = torch.empty(_tmp_out_shape, dtype=torch.float32, device=dev)
+        else:
+            tmp_out = torch.zeros(_tmp_out_shape, dtype=torch.float32, device=dev)
     elif _is_splitk:
         torch_tmp_out_dtype = dtypes.bf16 if out_dtype == "bf16" else dtypes.fp16
         tmp_out = torch.zeros(
@@ -1428,12 +1506,35 @@ def flydsl_moe_stage1(
     else:
         tmp_out = None
 
-    flat_a_scale = _expand_per_tensor_scale(a1_scale, token_num, 1)
-    if flat_a_scale is None:
-        flat_a_scale = torch.empty(0, device=dev)
-    flat_w_scale = _expand_per_tensor_scale(w1_scale, E * w1.shape[1], w1.shape[1])
-    if flat_w_scale is None:
-        flat_w_scale = torch.empty(0, device=dev)
+    if _use_fused_init:
+        # Single fused launch covering all three helpers (zero tmp_out +
+        # scalar a_scale broadcast + per-expert w_scale broadcast). The
+        # resolve helpers always allocate a fresh broadcast buffer for the
+        # per-expert path and signal the kernel to fill it; the host-side
+        # cache that used to short-circuit w-expand is gone.
+        flat_a_scale, _need_a = _resolve_a_scale_for_fused_init(
+            a1_scale, token_num, dev
+        )
+        flat_w_scale, _need_w = _resolve_w_scale_for_fused_init(
+            w1_scale, E * w1.shape[1], w1.shape[1], dev
+        )
+        _fused_init(
+            tmp_out=tmp_out,
+            flat_a=flat_a_scale if _need_a else None,
+            a_src=a1_scale if _need_a else None,
+            flat_w=flat_w_scale if _need_w else None,
+            w_src=w1_scale if _need_w else None,
+            w_cols=w1.shape[1] if _need_w else 1,
+        )
+    else:
+        flat_a_scale = _expand_per_tensor_scale(a1_scale, token_num, 1)
+        if flat_a_scale is None:
+            flat_a_scale = torch.empty(0, device=dev)
+        flat_w_scale = _expand_per_tensor_scale(
+            w1_scale, E * w1.shape[1], w1.shape[1]
+        )
+        if flat_w_scale is None:
+            flat_w_scale = torch.empty(0, device=dev)
     sw = (
         sorted_weights
         if sorted_weights is not None
@@ -1591,16 +1692,42 @@ def flydsl_moe_stage1(
         # ``_is_splitk_std`` is already constrained to act=='silu'
         # (see compile_flydsl_moe_stage1); guard anyway in case that
         # constraint is relaxed to gelu in the future.
-        from aiter.ops.activation import silu_and_mul
+        from aiter.ops.flydsl._fused_post import (
+            fused_kb_sum_silu_and_mul,
+            is_disabled as _fused_post_disabled,
+        )
 
         if _splitk_std_reduce:
-            reduced = tmp_out.sum(dim=0)
+            if _fused_post_disabled():
+                # Fallback: explicit sum + aiter silu_and_mul (2 kernels).
+                from aiter.ops.activation import silu_and_mul
+
+                reduced = tmp_out.sum(dim=0)
+                silu_and_mul(
+                    out.view(-1, inter_dim),
+                    reduced.view(-1, 2 * inter_dim),
+                )
+            else:
+                # Fused triton: kb-sum + silu_and_mul in a single kernel,
+                # no f32 reduced-buffer round-trip through HBM.
+                # tmp_out is (kb, M, topk, 2*inter_dim) f32 contiguous; collapse
+                # the (M, topk) axes so the kernel sees (kb, rows, 2*inter_dim).
+                fused_kb_sum_silu_and_mul(
+                    out.view(-1, inter_dim),
+                    tmp_out.view(k_batch, -1, 2 * inter_dim),
+                    inter_dim=inter_dim,
+                )
         else:
-            reduced = tmp_out
-        silu_and_mul(
-            out.view(-1, inter_dim),
-            reduced.view(-1, 2 * inter_dim),
-        )
+            # Atomic mode: GEMM already reduced across kb in-place via
+            # atomic-fadd, so tmp_out shape is (M, topk, 2*inter_dim) and we
+            # just need silu_and_mul. The aiter HIP kernel is already a single
+            # well-tuned launch; no win from re-implementing it in Triton here.
+            from aiter.ops.activation import silu_and_mul
+
+            silu_and_mul(
+                out.view(-1, inter_dim),
+                tmp_out.view(-1, 2 * inter_dim),
+            )
     elif _is_splitk:
         if use_g1u1:
             if act == "gelu":
@@ -1705,19 +1832,59 @@ def flydsl_moe_stage2(
         inter_dim = inter_dim * 2
 
     torch_out_dtype = torch.bfloat16 if out_dtype == "bf16" else torch.float16
-    if out is None:
-        alloc_fn = torch.zeros if accumulate else torch.empty
-        out = alloc_fn(
-            (token_num, model_dim), dtype=torch_out_dtype, device=inter_states.device
-        )
-
     dev = inter_states.device
-    flat_a_scale = _expand_per_tensor_scale(a2_scale, token_num * topk, 1)
-    if flat_a_scale is None:
-        flat_a_scale = torch.empty(0, device=dev)
-    flat_w_scale = _expand_per_tensor_scale(w2_scale, E * model_dim, model_dim)
-    if flat_w_scale is None:
-        flat_w_scale = torch.empty(0, device=dev)
+
+    # ------------------------------------------------------------------
+    # Stage2 init: out zero-fill (atomic mode only, see flydsl_moe_stage2
+    # contract) + flat_a_scale broadcast + flat_w_scale broadcast.  We fuse
+    # all three into the same Triton kernel that stage1 uses.  When the
+    # caller hands us an ``out`` we never touch it (their contract); when
+    # the env kill switch is set we fall back to torch.zeros + two separate
+    # _expand_per_tensor_scale launches like the historical path.
+    # ------------------------------------------------------------------
+    from aiter.ops.flydsl._fused_post import (
+        fused_init as _fused_init,
+        is_init_disabled as _fused_init_disabled,
+    )
+
+    _use_fused_init = not _fused_init_disabled()
+    _alloc_out = out is None
+
+    if _use_fused_init:
+        if _alloc_out:
+            out = torch.empty(
+                (token_num, model_dim), dtype=torch_out_dtype, device=dev
+            )
+        flat_a_scale, _need_a = _resolve_a_scale_for_fused_init(
+            a2_scale, token_num * topk, dev
+        )
+        flat_w_scale, _need_w = _resolve_w_scale_for_fused_init(
+            w2_scale, E * model_dim, model_dim, dev
+        )
+        # Only zero `out` when we both allocated it AND the kernel needs a
+        # zeroed accumulator (atomic mode).  Reduce mode writes its result
+        # directly so an empty out is fine.
+        _zero_out = _alloc_out and accumulate
+        _fused_init(
+            tmp_out=out if _zero_out else None,
+            flat_a=flat_a_scale if _need_a else None,
+            a_src=a2_scale if _need_a else None,
+            flat_w=flat_w_scale if _need_w else None,
+            w_src=w2_scale if _need_w else None,
+            w_cols=model_dim if _need_w else 1,
+        )
+    else:
+        if _alloc_out:
+            alloc_fn = torch.zeros if accumulate else torch.empty
+            out = alloc_fn(
+                (token_num, model_dim), dtype=torch_out_dtype, device=dev
+            )
+        flat_a_scale = _expand_per_tensor_scale(a2_scale, token_num * topk, 1)
+        if flat_a_scale is None:
+            flat_a_scale = torch.empty(0, device=dev)
+        flat_w_scale = _expand_per_tensor_scale(w2_scale, E * model_dim, model_dim)
+        if flat_w_scale is None:
+            flat_w_scale = torch.empty(0, device=dev)
     sw = (
         sorted_weights
         if sorted_weights is not None
@@ -1810,7 +1977,27 @@ def flydsl_moe_stage2(
     _run_compiled(exe, args)
 
     if not accumulate:
-        torch.sum(target.view(token_num, topk, model_dim), dim=1, out=out)
+        # Stage2 reduce mode: collapse topk axis. The fused Triton kernel
+        # shaves the separate torch.sum dispatch (~2us at small M) and uses
+        # the shared reduce autotune grid so large-M / large-model_dim
+        # workloads also benefit (probes show ~11% over the prior heuristic
+        # at int8 large M).  Kill-switch ``AITER_FLYDSL_FUSED_TOPK_OFF=1``
+        # falls back to torch.sum.
+        from aiter.ops.flydsl._fused_post import (
+            fused_topk_sum as _fused_topk_sum,
+            is_topk_sum_disabled as _fused_topk_disabled,
+        )
+
+        if _fused_topk_disabled():
+            torch.sum(target.view(token_num, topk, model_dim), dim=1, out=out)
+        else:
+            _fused_topk_sum(
+                out,
+                target,
+                token_num=token_num,
+                topk=topk,
+                model_dim=model_dim,
+            )
 
     return out
 
