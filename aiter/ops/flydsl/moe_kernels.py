@@ -2284,6 +2284,16 @@ def flydsl_moe_stage1_direct(
         #            zero initial value so the kb-way reduction is correct.
         #   reduce : invalid (skipped) WGs leave their kb-slice untouched;
         #            the host sum across kb must see zeros for those.
+        # We intentionally stay on ``torch.zeros`` here: micro-benchmarks
+        # (HY3_BKC/scripts/_bench_direct_fused_init.py) show torch's HIP
+        # zero-fill kernel runs at ~7us across the 6-860KB direct-stage1
+        # shape range, while the Triton ``fused_init`` path costs ~19us
+        # (~12us pure Python/dispatch overhead).  Patch 0004's fused_init
+        # wins on the standard kernel only because it amortises three
+        # helpers (zero + a-broadcast + w-broadcast) into one launch; the
+        # direct kernel reads scalar a-scale and per-expert w-scale via
+        # buffer_load, so there is no broadcast to fuse and the lone
+        # zero-fill is faster as a stock torch op.
         if _splitk_reduce:
             tmp_out = torch.zeros(
                 (int(k_batch), token_num, topk, 2 * inter_dim),
@@ -2296,6 +2306,7 @@ def flydsl_moe_stage1_direct(
                 dtype=torch.float32,
                 device=a.device,
             )
+
         args = _s1_direct_args_std(
             tmp_out,
             a,
@@ -2309,16 +2320,36 @@ def flydsl_moe_stage1_direct(
         )
         _run_compiled(exe, args)
 
-        from aiter.ops.activation import silu_and_mul
-
-        # Reduce mode: collapse kb axis first so silu_and_mul sees the same
-        # (M*topk, 2*inter) layout as atomic mode.  Atomic mode already has
-        # that shape after the in-kernel atomic-fadd.
-        reduced = tmp_out.sum(dim=0) if _splitk_reduce else tmp_out
-        silu_and_mul(
-            out.view(-1, inter_dim),
-            reduced.view(-1, 2 * inter_dim),
+        # Reduce mode post-pass: kb-axis sum + silu_and_mul.  The fused Triton
+        # kernel collapses these two launches into one and skips the f32
+        # ``reduced`` materialisation through HBM (saves ~5-8us at small M
+        # vs the legacy ``tmp_out.sum(dim=0) + silu_and_mul`` two-kernel
+        # path; see aiter.ops.flydsl._fused_post for the calibration data).
+        # Atomic mode already merged kb in-kernel via atomic-fadd, so it
+        # only needs the single-launch aiter silu_and_mul.
+        # Env kill-switch ``AITER_FLYDSL_FUSED_SILU_OFF=1`` falls back.
+        from aiter.ops.flydsl._fused_post import (
+            fused_kb_sum_silu_and_mul as _fused_kb_silu,
+            is_disabled as _fused_post_disabled,
         )
+
+        if _splitk_reduce and not _fused_post_disabled():
+            _fused_kb_silu(
+                out.view(-1, inter_dim),
+                tmp_out.view(int(k_batch), -1, 2 * inter_dim),
+                inter_dim=inter_dim,
+            )
+        else:
+            from aiter.ops.activation import silu_and_mul
+
+            # Reduce-mode fallback: explicit sum + silu_and_mul (2 kernels).
+            # Atomic mode: tmp_out is already (M, topk, 2*inter) f32 after
+            # in-kernel atomic-fadd; just silu_and_mul.
+            reduced = tmp_out.sum(dim=0) if _splitk_reduce else tmp_out
+            silu_and_mul(
+                out.view(-1, inter_dim),
+                reduced.view(-1, 2 * inter_dim),
+            )
         return out
 
     args = _s1_direct_args_std(
