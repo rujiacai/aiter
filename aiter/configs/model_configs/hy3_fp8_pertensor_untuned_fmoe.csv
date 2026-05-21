@@ -17,3 +17,11 @@ token,model_dim,inter_dim,expert,topk,act_type,dtype,q_dtype_a,q_dtype_w,q_type,
 32768,4096,192,193,9,ActivationType.Silu,torch.bfloat16,torch.float8_e4m3fnuz,torch.float8_e4m3fnuz,QuantType.per_Tensor,1,0,torch.float8_e4m3fnuz,torch.float8_e4m3fnuz,QuantType.per_Tensor
 65536,4096,192,193,9,ActivationType.Silu,torch.bfloat16,torch.float8_e4m3fnuz,torch.float8_e4m3fnuz,QuantType.per_Tensor,1,0,torch.float8_e4m3fnuz,torch.float8_e4m3fnuz,QuantType.per_Tensor
 131072,4096,192,193,9,ActivationType.Silu,torch.bfloat16,torch.float8_e4m3fnuz,torch.float8_e4m3fnuz,QuantType.per_Tensor,1,0,torch.float8_e4m3fnuz,torch.float8_e4m3fnuz,QuantType.per_Tensor
+2,4096,1536,12,8,ActivationType.Silu,torch.bfloat16,torch.float8_e4m3fnuz,torch.float8_e4m3fnuz,QuantType.per_Tensor,1,0,torch.float8_e4m3fnuz,torch.float8_e4m3fnuz,QuantType.per_Tensor
+4,4096,1536,12,8,ActivationType.Silu,torch.bfloat16,torch.float8_e4m3fnuz,torch.float8_e4m3fnuz,QuantType.per_Tensor,1,0,torch.float8_e4m3fnuz,torch.float8_e4m3fnuz,QuantType.per_Tensor
+8,4096,1536,12,8,ActivationType.Silu,torch.bfloat16,torch.float8_e4m3fnuz,torch.float8_e4m3fnuz,QuantType.per_Tensor,1,0,torch.float8_e4m3fnuz,torch.float8_e4m3fnuz,QuantType.per_Tensor
+16,4096,1536,12,8,ActivationType.Silu,torch.bfloat16,torch.float8_e4m3fnuz,torch.float8_e4m3fnuz,QuantType.per_Tensor,1,0,torch.float8_e4m3fnuz,torch.float8_e4m3fnuz,QuantType.per_Tensor
+2,4096,1536,13,9,ActivationType.Silu,torch.bfloat16,torch.float8_e4m3fnuz,torch.float8_e4m3fnuz,QuantType.per_Tensor,1,0,torch.float8_e4m3fnuz,torch.float8_e4m3fnuz,QuantType.per_Tensor
+4,4096,1536,13,9,ActivationType.Silu,torch.bfloat16,torch.float8_e4m3fnuz,torch.float8_e4m3fnuz,QuantType.per_Tensor,1,0,torch.float8_e4m3fnuz,torch.float8_e4m3fnuz,QuantType.per_Tensor
+8,4096,1536,13,9,ActivationType.Silu,torch.bfloat16,torch.float8_e4m3fnuz,torch.float8_e4m3fnuz,QuantType.per_Tensor,1,0,torch.float8_e4m3fnuz,torch.float8_e4m3fnuz,QuantType.per_Tensor
+16,4096,1536,13,9,ActivationType.Silu,torch.bfloat16,torch.float8_e4m3fnuz,torch.float8_e4m3fnuz,QuantType.per_Tensor,1,0,torch.float8_e4m3fnuz,torch.float8_e4m3fnuz,QuantType.per_Tensor
