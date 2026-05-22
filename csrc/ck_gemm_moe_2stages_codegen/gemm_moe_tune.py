@@ -21,6 +21,8 @@ from aiter.fused_moe import (
     torch_moe_stage2,
     torch_moe,
 )
+from aiter.fused_moe_asmjit_aot import fused_moe_asmjit_aot
+from aiter.fused_moe_asmjit_aot import get_tune_space
 from aiter import ck_moe_stage1_fwd, ck_moe_stage2_fwd, dtype2str_dict
 from aiter.ops.shuffle import (
     shuffle_weight,
@@ -2011,6 +2013,274 @@ class FmoeTuner(TunerCommon):
 
         return tasks_flydsl
 
+    def run_config(self, args, target_fused_moe=None, try_extra_ref=False):
+        from aiter.fused_moe import fused_moe, fused_topk
+        from aiter.test_common import run_perftest, checkAllclose
+
+        if target_fused_moe is None:
+            target_fused_moe = fused_moe
+        untunedf = self.untunedf
+        results = []
+        for i in range(len(untunedf)):
+            row = untunedf.iloc[i]
+            token = int(row["token"])
+            model_dim = int(row["model_dim"])
+            inter_dim = int(row["inter_dim"])
+            expert = int(row["expert"])
+            topk = int(row["topk"])
+            act_type = eval(row["act_type"])
+            dtype = eval(row["dtype"])
+            q_dtype_a = eval(row["q_dtype_a"])
+            q_dtype_w = eval(row["q_dtype_w"])
+            q_type = eval(row["q_type"])
+            q_type = QuantType.per_1x128 if q_type == QuantType.per_128x128 else q_type
+            use_g1u1 = bool(row["use_g1u1"])
+            doweight_stage1 = bool(row["doweight_stage1"])
+            shape_str = (
+                f"({token}, {model_dim}, {inter_dim}, E={expert}, topk={topk}, "
+                f"{row['act_type']}, {row['dtype']}, {row['q_dtype_a']}, "
+                f"{row['q_dtype_w']}, {row['q_type']}, g1u1={use_g1u1}, "
+                f"dw_s1={doweight_stage1})"
+            )
+            kernel_us = None
+            if "us" in row and pd.notna(row["us"]):
+                try:
+                    kernel_us = float(row["us"])
+                except (TypeError, ValueError):
+                    kernel_us = None
+            try:
+                torch.manual_seed(0)
+                hidden = (
+                    torch.randn((token, model_dim), dtype=dtype, device="cuda") / 10
+                )
+                if use_g1u1:
+                    w1 = (
+                        torch.randn(
+                            (expert, inter_dim * 2, model_dim),
+                            dtype=dtype,
+                            device="cuda",
+                        )
+                        / 10
+                    )
+                else:
+                    w1 = (
+                        torch.randn(
+                            (expert, inter_dim, model_dim), dtype=dtype, device="cuda"
+                        )
+                        / 10
+                    )
+                w2 = torch.randn(
+                    (expert, model_dim, inter_dim), dtype=dtype, device="cuda"
+                )
+                w1_qt, w1_scale = self.weight_quant(w1, q_type, quant_dtype=q_dtype_w)
+                w2_qt, w2_scale = self.weight_quant(w2, q_type, quant_dtype=q_dtype_w)
+                if q_dtype_w is not dtypes.fp4x2:
+                    w1_qt = w1_qt.view(w1.shape)
+                    w2_qt = w2_qt.view(w2.shape)
+                else:
+                    w1_qt = w1_qt.view(w1.shape[0], w1.shape[1], w1.shape[2] // 2)
+                    w2_qt = w2_qt.view(w2.shape[0], w2.shape[1], w2.shape[2] // 2)
+
+                # Match the production/test path used by op_tests/test_moe_2stage.py.
+                w1_qt_fmoe = w1_qt
+                w2_qt_fmoe = w2_qt
+                w1_scale_fmoe = w1_scale
+                w2_scale_fmoe = w2_scale
+                if q_type == torch.int4:
+                    w1_qt_fmoe = rearrange_4bit_elements(
+                        convert_int8_to_uint32_int4(
+                            shuffle_weight(w1_qt_fmoe, (16, 16), use_int4=True)
+                        )
+                    )
+                    w2_qt_fmoe = rearrange_4bit_elements(
+                        convert_int8_to_uint32_int4(
+                            shuffle_weight(w2_qt_fmoe, (16, 16), use_int4=True)
+                        )
+                    )
+                    w1_scale_fmoe = (
+                        fp4_utils.e8m0_shuffle(w1_scale)
+                        if w1_scale is not None
+                        else None
+                    )
+                    w2_scale_fmoe = (
+                        fp4_utils.e8m0_shuffle(w2_scale)
+                        if w2_scale is not None
+                        else None
+                    )
+                elif (
+                    q_type == QuantType.per_1x32
+                    and q_dtype_a in [dtypes.bf16, dtypes.fp16, dtypes.fp8]
+                    and q_dtype_w == dtypes.fp4x2
+                ):
+                    w1_qt_fmoe = shuffle_weight_a16w4(w1_qt_fmoe, 16, True)
+                    w1_scale_fmoe = shuffle_scale_a16w4(w1_scale, expert, True)
+                    w2_qt_fmoe = shuffle_weight_a16w4(w2_qt_fmoe, 16, False)
+                    w2_scale_fmoe = shuffle_scale_a16w4(w2_scale, expert, False)
+                elif q_dtype_w != dtypes.fp4x2:
+                    w1_qt_fmoe = shuffle_weight(w1_qt_fmoe, (16, 16))
+                    w2_qt_fmoe = shuffle_weight(w2_qt_fmoe, (16, 16))
+                    w1_scale_fmoe = (
+                        fp4_utils.e8m0_shuffle(w1_scale)
+                        if w1_scale is not None
+                        else None
+                    )
+                    w2_scale_fmoe = (
+                        fp4_utils.e8m0_shuffle(w2_scale)
+                        if w2_scale is not None
+                        else None
+                    )
+                else:
+                    w1_scale_fmoe = (
+                        fp4_utils.e8m0_shuffle(w1_scale)
+                        if w1_scale is not None
+                        else None
+                    )
+                    w2_scale_fmoe = (
+                        fp4_utils.e8m0_shuffle(w2_scale)
+                        if w2_scale is not None
+                        else None
+                    )
+
+                w1_qt_fmoe.is_shuffled = True
+                w2_qt_fmoe.is_shuffled = True
+
+                score = torch.randn((token, expert), dtype=dtype, device="cuda")
+                topk_weights, topk_ids = fused_topk(hidden, score, topk, True)
+                if q_type == QuantType.per_1x128:
+                    a1_qt, a1_scale = aiter.pertoken_quant(
+                        hidden.view(token, -1, 128), quant_dtype=q_dtype_a
+                    )
+                    a1_qt = a1_qt.view(token, model_dim)
+                    a1_scale = a1_scale.squeeze(-1)
+                elif (
+                    q_type == QuantType.per_1x32
+                    and q_dtype_a in [dtypes.bf16, dtypes.fp16]
+                    and q_dtype_w == dtypes.fp4x2
+                ):
+                    a1_qt = hidden.to(dtype)
+                    a1_scale = None
+                else:
+                    torch_quant = aiter.get_torch_quant(q_type)
+                    a1_qt, a1_scale = torch_quant(hidden, quant_dtype=q_dtype_a)
+
+                out, us = run_perftest(
+                    target_fused_moe,
+                    hidden,
+                    w1_qt_fmoe,
+                    w2_qt_fmoe,
+                    topk_weights,
+                    topk_ids,
+                    activation=act_type,
+                    quant_type=q_type,
+                    doweight_stage1=doweight_stage1,
+                    w1_scale=w1_scale_fmoe,
+                    w2_scale=w2_scale_fmoe,
+                    dtype=dtype,
+                    num_warmup=args.warmup,
+                    num_iters=args.iters,
+                )
+                ref = self.torch_moe_2stages(
+                    a1_qt,
+                    w1_qt,
+                    w2_qt,
+                    topk_weights,
+                    topk_ids,
+                    a1_scale=a1_scale,
+                    w1_scale=w1_scale,
+                    w2_scale=w2_scale,
+                    dtype=dtype,
+                    activation=act_type,
+                    quant_type=q_type,
+                    doweight_stage1=doweight_stage1,
+                )
+                if out.count_nonzero() == 0 and ref.count_nonzero() > 0:
+                    status = "error:output is all zeros (kernel produced no output)"
+                    err_ratio = 1.0
+                else:
+                    err_ratio = checkAllclose(out, ref, msg=f"run_config {shape_str}")
+                    if try_extra_ref:
+                        # try compare with extra references (due to different implementations)
+                        try:
+                            # use weight-decompression only algorithm as second reference
+                            w1_deq = w1_qt.to(dtype=hidden.dtype) * w1_scale.view(
+                                w1_scale.shape[0], -1, 1
+                            ).to(dtype=hidden.dtype)
+                            w2_deq = w2_qt.to(dtype=hidden.dtype) * w2_scale.view(
+                                w2_scale.shape[0], -1, 1
+                            ).to(dtype=hidden.dtype)
+
+                            ref2 = self.torch_moe_2stages(
+                                hidden,
+                                w1_deq,
+                                w2_deq,
+                                topk_weights,
+                                topk_ids,
+                                dtype=dtype,
+                                activation=act_type,
+                                quant_type=QuantType.No,
+                                doweight_stage1=doweight_stage1,
+                            )
+                            err_ratio2 = checkAllclose(
+                                out, ref2, msg=f"run_config {shape_str}"
+                            )
+                            err_ratio = min(err_ratio, err_ratio2)
+                        except Exception:
+                            pass
+
+                        if q_type == QuantType.per_Tensor:
+                            try:
+                                # inputs are quantized per-Token while weights are quantized per-Tensor
+                                a1_qt, a1_scale = aiter.get_torch_quant(
+                                    QuantType.per_Token
+                                )(hidden, quant_dtype=q_dtype_a)
+                                ref2 = self.torch_moe_2stages(
+                                    a1_qt,
+                                    w1_qt,
+                                    w2_qt,
+                                    topk_weights,
+                                    topk_ids,
+                                    a1_scale=a1_scale,
+                                    w1_scale=w1_scale,
+                                    w2_scale=w2_scale,
+                                    dtype=dtype,
+                                    activation=act_type,
+                                    quant_type=QuantType.per_Token,
+                                    doweight_stage1=doweight_stage1,
+                                )
+                                err_ratio2 = checkAllclose(
+                                    out, ref2, msg=f"run_config {shape_str}"
+                                )
+                                err_ratio = min(err_ratio, err_ratio2)
+                            except Exception:
+                                pass
+
+                    if err_ratio <= args.errRatio:
+                        status = "ok"
+                    else:
+                        status = f"mismatch:err_ratio={err_ratio:.4f}(>{args.errRatio})"
+                results.append(
+                    {
+                        "shape": shape_str,
+                        "e2e_us": us,
+                        "kernel_us": kernel_us,
+                        "status": status,
+                        "err_ratio": err_ratio,
+                    }
+                )
+            except Exception as e:
+                results.append(
+                    {
+                        "shape": shape_str,
+                        "e2e_us": -1,
+                        "kernel_us": kernel_us,
+                        "status": f"error:{e}",
+                        "err_ratio": 1,
+                    }
+                )
+            finally:
+                torch.cuda.empty_cache()
+        return results
+
     def tune(
         self,
         untunedf,
@@ -2523,6 +2793,178 @@ class FmoeTuner(TunerCommon):
                 )
                 self.untunedf = self.untunedf[~mask]
 
+    def e2e_tune(self, args):
+        """
+        choosing best kernels based on (stage1_us + stage2_us) or (single_stage_us)
+        may overlook some overheads between stages, and this e2e tune is a complement.
+        """
+        results_base = self.run_config(args, target_fused_moe=None, try_extra_ref=True)
+        better_kernels = {}
+        cu_num = self.get_cu_num()
+
+        for i in range(len(self.untunedf)):
+            e2e_us = results_base[i]["e2e_us"]
+            err_ratio = results_base[i]["err_ratio"]
+            row = self.untunedf.iloc[i]
+            cu_num = int(row["cu_num"])
+            token = int(row["token"])
+            model_dim = int(row["model_dim"])
+            inter_dim = int(row["inter_dim"])
+            expert = int(row["expert"])
+            topk = int(row["topk"])
+            act_type = eval(row["act_type"])
+            dtype = eval(row["dtype"])
+            q_dtype_a = eval(row["q_dtype_a"])
+            q_dtype_w = eval(row["q_dtype_w"])
+            q_type = eval(row["q_type"])
+            q_type = QuantType.per_1x128 if q_type == QuantType.per_128x128 else q_type
+            use_g1u1 = bool(row["use_g1u1"])
+            doweight_stage1 = bool(row["doweight_stage1"])
+            key = (
+                cu_num,
+                token,
+                model_dim,
+                inter_dim,
+                expert,
+                topk,
+                act_type,
+                dtype,
+                q_dtype_a,
+                q_dtype_w,
+                q_type,
+                use_g1u1,
+                doweight_stage1,
+            )
+            keyname = " ".join(map(str, row[self.keys].values))
+            better_kernels[i] = {
+                "name": keyname,
+                "key": key,
+                "row": row,
+                "kernel_name": None,
+                "e2e_us": e2e_us,
+                "err_ratio": err_ratio,
+                "e2e_us_base": e2e_us,
+                "err_ratio_base": err_ratio,
+            }
+            print(keyname, e2e_us, err_ratio)
+
+        from functools import partial
+
+        def target_fused_moe(
+            hidden_states,
+            w1,  # [expert(local_expert:EP), inter_dim*2, dim] N,K
+            w2,  # [expert(local_expert:EP), dim, inter_dim]
+            topk_weight,
+            topk_ids,
+            expert_mask=None,
+            activation=ActivationType.Silu,
+            quant_type=QuantType.No,
+            doweight_stage1=False,
+            w1_scale=None,
+            w2_scale=None,
+            num_local_tokens=None,
+            moe_sorting_dispatch_policy=0,
+            dtype=None,
+            config_string="",
+        ):
+            return fused_moe_asmjit_aot(
+                hidden_states,
+                w1,
+                w2,
+                topk_weight,
+                topk_ids,
+                activation,
+                quant_type,
+                w1_scale,
+                w2_scale,
+                expert_mask,
+                num_local_tokens,
+                moe_sorting_dispatch_policy,
+                config_string=config_string,
+            )
+
+        GREEN = "\033[0;32m"
+        YELLOW = "\033[1;33m"
+        RED = "\033[0;31m"
+        END = "\033[0m"
+        for config_string in get_tune_space():
+            results_cur = self.run_config(
+                args,
+                target_fused_moe=partial(target_fused_moe, config_string=config_string),
+                try_extra_ref=True,
+            )
+            block_m = 16
+            ksplit = 0
+            run_1stage = 1
+            err1 = "0%"
+            err2 = "0%"
+            kernelName1 = "fused_moe_asmjit_aot__" + config_string
+            kernelName2 = ""
+            xbf16 = 0
+            for i in range(len(self.untunedf)):
+                k = better_kernels[i]
+                e2e_us = results_cur[i]["e2e_us"]
+                status = results_cur[i]["status"]
+                err_ratio = results_cur[i]["err_ratio"]
+                # skip invalid kernel
+                if e2e_us < 0 or status != "ok":
+                    print(
+                        f"{k['name']} {RED} {e2e_us=:.3f} {status=} {END} {kernelName1}"
+                    )
+                    continue
+                row = self.untunedf.iloc[i]
+                print(
+                    f"{k['name']} {YELLOW} {float(k['e2e_us_base']):.3f}us -> {float(e2e_us):.3f}us (err: {k['err_ratio']*100:.0f}%) {END} {kernelName1}"
+                )
+                if e2e_us < k["e2e_us"]:
+                    k["e2e_us"] = e2e_us
+                    k["err_ratio"] = err_ratio
+                    k["kernel_name"] = kernelName1
+                    tflops, bw = self.calculate(
+                        (k["key"], "stage1", kernelName1, block_m, e2e_us, err1)
+                    )
+                    k["results"] = (
+                        block_m,
+                        ksplit,
+                        e2e_us,
+                        kernelName1,
+                        f"{err_ratio*100:.2f}%",
+                        0.0,
+                        kernelName2,
+                        err2,
+                        e2e_us,
+                        run_1stage,
+                        xbf16,
+                        tflops,
+                        bw,
+                    )
+
+        tune_results = []
+
+        for i, k in better_kernels.items():
+            if k["kernel_name"] is None:
+                continue
+            tune_results.append([*k["row"].values, *k["results"]])
+            print(
+                f"{k['name']} {GREEN} {float(k['e2e_us_base']):.3f}us -> {float(k['e2e_us']):.3f}us  (err: {k['err_ratio_base']*100:.0f}% -> {k['err_ratio']*100:.0f}%)  {END} {k['kernel_name']}"
+            )
+
+        new_tunedf = pd.DataFrame(tune_results, columns=self.columns)
+        output_file = self.get_out_file(args.tune_file)
+        old_tunedf = self.get_tuned_gemm_list(output_file)
+
+        if "_tag" == old_tunedf.columns[-1]:
+            new_tunedf["_tag"] = ""
+            self.columns.append("_tag")
+
+        resultdf = self.update_tunedf(old_tunedf, new_tunedf)
+
+        if "_tag" == old_tunedf.columns[-1]:
+            self.columns.pop(-1)
+
+        resultdf.to_csv(output_file, index=False)
+        print(f"{args.tune_file} has been updated!")
+
 
 if __name__ == "__main__":
 
@@ -2558,4 +3000,8 @@ if __name__ == "__main__":
     tuner = FmoeTuner("fmoeTuner", key, resultList, "fmoe tuner")
     args = tuner.parse_args()
 
-    tuner.run(args, False)
+    if args.e2e_tune:
+        tuner.pre_process(args)
+        tuner.e2e_tune(args)
+    else:
+        tuner.run(args, False)
