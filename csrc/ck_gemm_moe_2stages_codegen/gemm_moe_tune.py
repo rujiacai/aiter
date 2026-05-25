@@ -2900,7 +2900,6 @@ class FmoeTuner(TunerCommon):
             err2 = "0%"
             kernelName1 = "fused_moe_asmjit_aot__" + config_string
             kernelName2 = ""
-            xbf16 = 0
             for i in range(len(self.untunedf)):
                 k = better_kernels[i]
                 e2e_us = results_cur[i]["e2e_us"]
@@ -2934,7 +2933,6 @@ class FmoeTuner(TunerCommon):
                         err2,
                         e2e_us,
                         run_1stage,
-                        xbf16,
                         tflops,
                         bw,
                     )
