@@ -249,7 +249,7 @@ def fused_moe_asmjit_aot(
             with_silu=False,
             quant_type_str=qtype_str,
         )
-    elif 2 <= B <= 32:
+    elif 2 <= B <= 256:
         # Stage 1: Shared ``moe_sorting`` + ``moe_gemm_batch``;
         # stage 2: Choose between ``moe_2stage_down_loopn`` and ``moe_2stage_splitk`` based on ``use_down_loopn`` condition.
         BLOCK_M = kcfgs.BLOCK_M
