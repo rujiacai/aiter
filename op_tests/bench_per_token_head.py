@@ -33,6 +33,9 @@ if int(os.environ.get("BENCH_BYPASS_ROCM72_SKIP", "1")):
 
 PAGE_SIZE = int(os.environ.get("BENCH_PAGE_SIZE", "1024"))
 VERIFY = bool(int(os.environ.get("BENCH_VERIFY", "0")))
+# KV cache memory layout: "linear" (4D) or "vectorized" (5D swizzled).
+# Vectorized is the production layout used by serving frameworks.
+KV_LAYOUT = os.environ.get("BENCH_KV_LAYOUT", "linear")
 
 DEFAULT_SEQS = (1024, 16384, 32768, 65536, 131072)
 _parser = argparse.ArgumentParser(
@@ -89,7 +92,7 @@ def _call_kernel(fn, **kwargs):
 def _run_one(shape):
     b, qo, kv, nhq, nhk, hd, c, sc = shape
     common = dict(
-        kvcache_layout="linear",
+        kvcache_layout=KV_LAYOUT,
         table_layout="sglang",
         batch_size=b,
         qo_len=qo,
@@ -164,7 +167,8 @@ else:
     print("Verification: OFF (set BENCH_VERIFY=1 to enable)")
 print(
     f"Config: nhq={_nhq}, nhk={_nhk}, hd={_hd}, "
-    f"causal={_causal}, soft_cap={_sc}, page_size={PAGE_SIZE}"
+    f"causal={_causal}, soft_cap={_sc}, page_size={PAGE_SIZE}, "
+    f"kv_layout={KV_LAYOUT}"
 )
 _HEADER = (
     f"{'batch':>5} | "
