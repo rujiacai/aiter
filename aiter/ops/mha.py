@@ -979,13 +979,19 @@ def cmdGenFunc_mha_batch_prefill(
     kv_block_descale: Optional[Tensor] = None,  # [num_block, num_kv_head, 2]
     # PER_TOKEN_HEAD mode descales (mutually exclusive with above)
     q_descale_per_token: Optional[Tensor] = None,  # [total_q, nhead_q] fp32
-    k_descale_per_token: Optional[Tensor] = None,  # [num_total_pages, page_block_size, nhead_k] fp32
-    v_descale_per_head: Optional[Tensor] = None,   # [nhead_k] fp32
+    k_descale_per_token: Optional[
+        Tensor
+    ] = None,  # [num_total_pages, page_block_size, nhead_k] fp32
+    v_descale_per_head: Optional[Tensor] = None,  # [nhead_k] fp32
     sink_ptr: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
     kv_last_page_lens: Optional[Tensor] = None,
     block_table: Optional[Tensor] = None,
     seqlen_k: Optional[Tensor] = None,
+    # PER_TOKEN_HEAD caller P scale: not part of the kernel cache key (handled
+    # at runtime), declared here only for positional-forwarding compatibility.
+    p_scale: Optional[Tensor] = None,
+    p_scale_inv: Optional[Tensor] = None,
 ):
     # causal=true is the same as causal=false in this case
     causal = is_causal
@@ -2810,6 +2816,11 @@ def mha_batch_prefill(
     seqlen_k: Optional[Tensor] = None,
     sink_ptr: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
+    # PER_TOKEN_HEAD optional per-q-head P scale [num_head_q] fp32.
+    # p_scale_inv is accepted for API parity but unused (the kernel folds
+    # log2(p_scale) into the exp2 row-max shift instead of dividing).
+    p_scale: Optional[torch.Tensor] = None,
+    p_scale_inv: Optional[torch.Tensor] = None,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]: ...
 
 
@@ -2847,6 +2858,8 @@ def _mha_batch_prefill(
     k_descale_per_token: Optional[torch.Tensor] = None,
     v_descale_per_head: Optional[torch.Tensor] = None,
     sink_ptr: Optional[Tensor] = None,
+    p_scale: Optional[torch.Tensor] = None,
+    p_scale_inv: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
 
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
@@ -2883,7 +2896,8 @@ def _mha_batch_prefill(
         seqlen_k,
         sink_ptr,
         None,
-        # custom_build_args={"md_name": md_name, "blob_gen_cmd": blob_gen_cmd},
+        p_scale,
+        p_scale_inv,
     )
     return out, softmax_lse, S_dmask, rng_state
 
@@ -2916,8 +2930,13 @@ def mha_batch_prefill_func(
     kv_block_descale=None,  # [num_block, num_kv_head, 2] per-page K/V descales
     q_descale_per_token=None,  # [total_q, nhead_q] fp32 (PER_TOKEN_HEAD mode)
     k_descale_per_token=None,  # [num_total_pages, page_block_size, nhead_k] fp32
-    v_descale_per_head=None,   # [nhead_k] fp32
+    v_descale_per_head=None,  # [nhead_k] fp32
     sink_ptr=None,
+    sink_size: int = 0,
+    # PER_TOKEN_HEAD optional per-q-head P scale [num_head_q] fp32; p_scale_inv
+    # accepted for API parity but unused (folded via exp2-shift, see kernel).
+    p_scale=None,
+    p_scale_inv=None,
 ):
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)
@@ -2985,6 +3004,8 @@ def mha_batch_prefill_func(
         k_descale_per_token=k_descale_per_token,
         v_descale_per_head=v_descale_per_head,
         sink_ptr=sink_ptr,
+        p_scale=p_scale,
+        p_scale_inv=p_scale_inv,
     )
     out = out_padded[..., :head_size_v_og]
 
