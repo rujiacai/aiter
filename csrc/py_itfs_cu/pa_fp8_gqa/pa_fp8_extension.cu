@@ -256,6 +256,14 @@ void launch_main_v2_impl(
     const int kv_head_stride  = k_cache.stride(1);
     const int max_num_blocks_per_seq = static_cast<int>(block_tables.size(1));
 
+    // k_scale per-kv-head element stride = size of the last (contiguous) dim:
+    //   flat   [nb, nkv, block_size]      → block_size
+    //   packed [nb, 1,   nkv, head_dim/4] → head_dim/4  (FlyDSL fp32 view)
+    // The kernel indexes k_scale[(kphys*nkv + kv_head)*stride + slot], so the
+    // FlyDSL packed scale buffer is consumed natively (zero host copy).
+    const int ks_head_stride =
+        static_cast<int>(k_scale_t.size(k_scale_t.dim() - 1));
+
     dim3 grid(num_seqs, num_fat_partitions, num_kv_heads);
     dim3 block(v0::kNumThreads);
 
@@ -289,7 +297,7 @@ void launch_main_v2_impl(
                 block_tables.data_ptr<int>(),
                 context_lens.data_ptr<int>(),
                 max_num_blocks_per_seq,
-                q_stride, kv_block_stride, kv_head_stride,
+                q_stride, kv_block_stride, kv_head_stride, ks_head_stride,
                 exp_sums.data_ptr<float>(),
                 max_logits.data_ptr<float>(),
                 reinterpret_cast<output_t*>(tmp_out.data_ptr()),

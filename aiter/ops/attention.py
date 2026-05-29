@@ -616,6 +616,11 @@ def pa_fp8_gqa_decode(
     assert num_kv_heads == 1 and num_q_heads == 8
     assert head_size == 128 and block_size == 16 and partition_size == 256
 
+    assert k_scale.dtype == torch.float32, (
+        "k_scale must be the fp32 view of the packed FP8 scales; call "
+        ".view(torch.float32) on the fp8 buffer before pa_fp8_gqa_decode"
+    )
+
     # bf16 query is quantised in-kernel (max|Q|) so the external q_scale is
     # ignored by the C++ (passes nullptr); accept None and forward an empty
     # fp32 tensor.  An fp8 query always carries a real q_scale (gate-enforced).

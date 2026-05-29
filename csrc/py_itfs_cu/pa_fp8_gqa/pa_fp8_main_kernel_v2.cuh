@@ -126,6 +126,7 @@ void pa_fp8_main_kernel_v2(
     const int                                q_stride,
     const int                                kv_block_stride,
     const int                                kv_head_stride,
+    const int                                ks_head_stride,  // k_scale per-kv-head stride: block_size (flat [nb,nkv,bs]) or head_dim/4 (FlyDSL packed fp32-view [nb,1,nkv,hd/4])
     float* __restrict__                      exp_sums,
     float* __restrict__                      max_logits,
     output_t* __restrict__                   out,
@@ -349,9 +350,16 @@ void pa_fp8_main_kernel_v2(
         else if (rowid == 1) my_kphys = kphys_local[1];
         else if (rowid == 2) my_kphys = kphys_local[2];
         else                 my_kphys = kphys_local[3];
+        // K-scale element layout is parameterised by `ks_head_stride`
+        //   flat   [nb, nkv, bs]              → ks_head_stride = block_size
+        //   packed [nb, 1, nkv, head_dim/4]   → ks_head_stride = head_dim/4
+        // Both map (kphys, kv_head, slot) → (kphys*nkv + kv_head)*stride + slot.
+        // For the packed FlyDSL layout scale_rows==1 (block_size*4 <= head_dim,
+        // i.e. v2's fixed bs=16/hd=128), so slot < block_size <= head_dim/4 always
+        // lands in row 0 — no row term needed and the padding tail is never read.
         const int64_t ks_off =
               (static_cast<int64_t>(my_kphys) * gridDim.z + kv_head_idx)
-                  * kBlockSize
+                  * ks_head_stride
             + lane16id;
         my_ks_carried = k_scale_ptr[ks_off];
 
