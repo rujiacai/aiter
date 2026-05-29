@@ -40,6 +40,13 @@ get_ck_fmha_batch_prefill_args(bool has_lse,
                                // Per-page descale for KV_BLOCKSCALE mode (Q per-tensor, K/V per-page)
                                // Mutually exclusive with k_descale/v_descale
                                std::optional<const at::Tensor>& kv_block_descale, // [num_block, num_kv_head, 2]
+                               // PER_TOKEN_HEAD mode descales.
+                               std::optional<const at::Tensor>& q_descale_per_token,
+                               std::optional<const at::Tensor>& k_descale_per_token,
+                               std::optional<const at::Tensor>& v_descale_per_head,
+                               // PER_TOKEN_HEAD optional per-q-head P scale.
+                               std::optional<const at::Tensor>& p_scale,
+                               std::optional<const at::Tensor>& p_scale_inv,
                                at::Tensor out,
                                at::Tensor softmax_lse,
                                at::Tensor dropout_randval,
@@ -397,6 +404,81 @@ get_ck_fmha_batch_prefill_args(bool has_lse,
         args.nhead_stride_kv_block_descale  = k_descale_view.stride(1);
     }
 
+    // PER_TOKEN_HEAD: Q/K per-token per-head, V per-head. All three tensors required.
+    // Reuses args.q_descale_ptr / args.k_descale_ptr / args.v_descale_ptr; layout & strides
+    // disambiguated by the kernel via qscale_type.
+    if(q_descale_per_token.has_value())
+    {
+        TORCH_CHECK(k_descale_per_token.has_value() && v_descale_per_head.has_value(),
+                    "PER_TOKEN_HEAD mode requires q_descale_per_token, k_descale_per_token, "
+                    "and v_descale_per_head to all be provided.");
+
+        auto q_sc = q_descale_per_token.value();
+        auto k_sc = k_descale_per_token.value();
+        auto v_sc = v_descale_per_head.value();
+        CHECK_DEVICE(q_sc);
+        CHECK_DEVICE(k_sc);
+        CHECK_DEVICE(v_sc);
+        TORCH_CHECK(q_sc.scalar_type() == at::kFloat, "q_descale_per_token must be float32");
+        TORCH_CHECK(k_sc.scalar_type() == at::kFloat, "k_descale_per_token must be float32");
+        TORCH_CHECK(v_sc.scalar_type() == at::kFloat, "v_descale_per_head must be float32");
+
+        TORCH_CHECK(q_sc.dim() == 2,
+                    "q_descale_per_token must be 2D [total_q, nhead_q]");
+        TORCH_CHECK(q_sc.size(0) == total_q && q_sc.size(1) == h,
+                    "q_descale_per_token must have shape [total_q, nhead_q]");
+
+        TORCH_CHECK(k_sc.dim() == 3,
+                    "k_descale_per_token must be 3D [num_total_pages, page_block_size, nhead_k]");
+        TORCH_CHECK(k_sc.size(0) == num_total_pages && k_sc.size(1) == page_block_size &&
+                        k_sc.size(2) == h_k,
+                    "k_descale_per_token must have shape [num_total_pages, page_block_size, nhead_k]");
+
+        TORCH_CHECK(v_sc.dim() == 1 && v_sc.size(0) == h_k,
+                    "v_descale_per_head must be 1D with shape [nhead_k]");
+
+        args.q_descale_ptr             = q_sc.data_ptr();
+        args.k_descale_ptr             = k_sc.data_ptr();
+        args.v_descale_ptr             = v_sc.data_ptr();
+        args.stride_q_descale_token    = q_sc.stride(0);
+        args.nhead_stride_q_descale    = q_sc.stride(1);
+        args.nblock_stride_k_descale_page = k_sc.stride(0);
+        args.stride_k_descale_token    = k_sc.stride(1);
+        args.nhead_stride_k_descale    = k_sc.stride(2);
+        args.nhead_stride_v_descale    = v_sc.stride(0);
+
+        // Optional per-q-head P scale. We fold log2(p_scale) into the exp2
+        // row-max shift in the kernel; p_scale_inv is accepted for API parity
+        // but unused (the shift-fold doesn't need a reciprocal).
+        if(p_scale.has_value())
+        {
+            auto p_sc = p_scale.value();
+            CHECK_DEVICE(p_sc);
+            TORCH_CHECK(p_sc.scalar_type() == at::kFloat,
+                        "p_scale must be float32");
+            TORCH_CHECK(p_sc.dim() == 1 && p_sc.size(0) == h,
+                        "p_scale must be 1D with shape [num_head_q]");
+            TORCH_CHECK(p_sc.stride(0) == 1,
+                        "p_scale must be contiguous along its head dim");
+            args.p_scale_ptr = p_sc.data_ptr();
+
+            if(p_scale_inv.has_value())
+            {
+                auto p_sc_inv = p_scale_inv.value();
+                CHECK_DEVICE(p_sc_inv);
+                TORCH_CHECK(p_sc_inv.scalar_type() == at::kFloat,
+                            "p_scale_inv must be float32");
+                TORCH_CHECK(p_sc_inv.dim() == 1 && p_sc_inv.size(0) == h,
+                            "p_scale_inv must be 1D with shape [num_head_q]");
+            }
+        }
+        else
+        {
+            TORCH_CHECK(!p_scale_inv.has_value(),
+                        "p_scale_inv may only be supplied together with p_scale.");
+        }
+    }
+
     return args;
 }
 
@@ -425,11 +507,18 @@ mha_batch_prefill(at::Tensor& q,       // [total_q, hq, d]
                   std::optional<const at::Tensor> k_descale,     // [1]
                   std::optional<const at::Tensor> v_descale,     // [1]
                   std::optional<const at::Tensor> kv_block_descale,      // [num_block, num_kv_head, 2] for KV_BLOCKSCALE
+                  // PER_TOKEN_HEAD: Q/K per-token per-head, V per-head. See header for layouts.
+                  std::optional<const at::Tensor> q_descale_per_token,
+                  std::optional<const at::Tensor> k_descale_per_token,
+                  std::optional<const at::Tensor> v_descale_per_head,
                   std::optional<const at::Tensor> kv_last_page_lens_,
                   std::optional<const at::Tensor> block_table_,
                   std::optional<const at::Tensor> seqlen_k_,
                   std::optional<const at::Tensor> sink_ptr,      // [hq]
-                  std::optional<at::Generator> gen_
+                  std::optional<at::Generator> gen_,
+                  // PER_TOKEN_HEAD optional per-q-head P scale (see header).
+                  std::optional<const at::Tensor> p_scale,
+                  std::optional<const at::Tensor> p_scale_inv
                 )
 {
     auto q_dtype = q.scalar_type();
@@ -457,9 +546,24 @@ mha_batch_prefill(at::Tensor& q,       // [total_q, hq, d]
     // Validate descale tensor combinations:
     // - PERTENSOR mode: q_descale, k_descale, v_descale all provided
     // - KV_BLOCKSCALE mode: q_descale + kv_block_descale provided, k_descale/v_descale NOT provided
+    // - PER_TOKEN_HEAD mode: q/k_descale_per_token + v_descale_per_head provided, all
+    //   per-tensor and kv_block_descale tensors NOT provided
     // - NO_SCALE mode: none provided
     quant_scale_enum qscale_type;
-    if(kv_block_descale.has_value())
+    if(q_descale_per_token.has_value() || k_descale_per_token.has_value() ||
+       v_descale_per_head.has_value())
+    {
+        TORCH_CHECK(q_descale_per_token.has_value() && k_descale_per_token.has_value() &&
+                        v_descale_per_head.has_value(),
+                    "PER_TOKEN_HEAD mode requires q_descale_per_token, k_descale_per_token, "
+                    "and v_descale_per_head to all be provided.");
+        TORCH_CHECK(!q_descale.has_value() && !k_descale.has_value() && !v_descale.has_value() &&
+                        !kv_block_descale.has_value(),
+                    "PER_TOKEN_HEAD descales are mutually exclusive with q/k/v_descale and "
+                    "kv_block_descale.");
+        qscale_type = quant_scale_enum::per_token_head;
+    }
+    else if(kv_block_descale.has_value())
     {
         // KV_BLOCKSCALE: Q per-tensor, K/V per-page
         TORCH_CHECK(q_descale.has_value(),
@@ -770,6 +874,11 @@ mha_batch_prefill(at::Tensor& q,       // [total_q, hq, d]
                                                    k_descale,
                                                    v_descale,
                                                    kv_block_descale,
+                                                   q_descale_per_token,
+                                                   k_descale_per_token,
+                                                   v_descale_per_head,
+                                                   p_scale,
+                                                   p_scale_inv,
                                                    out,
                                                    softmax_lse,
                                                    p,
