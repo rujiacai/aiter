@@ -1,4 +1,4 @@
 [submodule "3rdparty/composable_kernel"]
 	path = 3rdparty/composable_kernel
-	url = https://github.com/ROCm/composable_kernel.git
-	branch = AITERKER-112
+	url = https://github.com/CHINA-CE-TEAM/HY3_CK.git
+	branch = FP8_0602_align_AITERKER112
