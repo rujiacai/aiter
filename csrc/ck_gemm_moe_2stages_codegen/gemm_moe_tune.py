@@ -516,6 +516,7 @@ class FmoeTuner(TunerCommon):
             b_nt=kparams.get("b_nt", 0),
             xcd_swizzle=kparams.get("xcd_swizzle", 0),
             bias=bias,
+            mfma_variant=kparams.get("mfma_variant", None),
         )
 
     @staticmethod

@@ -110,6 +110,20 @@ def shuffle_scale(
         raise ValueError("experts_cnt is required when is_guinterleave=True")
 
     n_experts, k_ = src.shape
+    # MXFP4 scale columns (K/32) must be a multiple of K_Pack*K_Lane (=8) for the
+    # preshuffle reshape below. For non-256-aligned K (e.g. inter_dim=384 -> k_=12)
+    # zero-pad the K-scale columns up to the next multiple of 8 so the shuffled
+    # layout matches what the FlyDSL/CK scale loads expect (padded-K layout).
+    if k_ % 8 != 0:
+        src_padded = torch.zeros(
+            n_experts,
+            (k_ + 7) // 8 * 8,
+            dtype=src.dtype,
+            device=src.device,
+        )
+        src_padded[:, :k_] = src
+        src = src_padded
+        k_ = src.shape[1]
     n_ = n_experts // experts_cnt
     # MXFP4 constants
     K_Pack = 2

@@ -106,6 +106,10 @@ def c_shuffle_epilog(
     n_tile_base,
     # LDS buffer (f16 view, row-major [tile_m, tile_n] flattened)
     lds_out,
+    # 32x32 MFMA lane mapping (required when mfma_m == 32).
+    lane_div_32=None,
+    lane_mod_32=None,
+    mfma_m: int = 16,
     # Element type for LDS loads (defaults to f16). Pass bf16 to support bf16 epilogues.
     frag_elem_type: ir.Type | None = None,
     # Callbacks
@@ -301,7 +305,11 @@ def c_shuffle_epilog(
     # ---------------- Step 1: write C tile to LDS (row-major, fp16) ----------------
     tile_n_idx = arith.constant(int(tile_n), index=True)
     n_tile_base_v = n_tile_base
-    col_base_local = n_tile_base_v + lane_mod_16  # index within [0,tile_n)
+    write_lane_mod = lane_mod_32 if int(mfma_m) == 32 else lane_mod_16
+    write_lane_div = lane_div_32 if int(mfma_m) == 32 else lane_div_16
+    if int(mfma_m) == 32 and (write_lane_mod is None or write_lane_div is None):
+        raise ValueError("mfma_m=32 requires lane_div_32 and lane_mod_32")
+    col_base_local = n_tile_base_v + write_lane_mod  # index within [0,tile_n)
 
     _lds_row_base_offset = (
         lds_row_offset * tile_n_idx if lds_row_offset is not None else None
@@ -324,14 +332,28 @@ def c_shuffle_epilog(
 
     # Ensure all LDS reads finished before the lds write.
     gpu.barrier()
-    default_epilog(
-        arith=arith,
-        range_constexpr=range_constexpr,
-        m_repeat=m_repeat,
-        lane_div_16=lane_div_16,
-        bx_m=bx_m,
-        body_row=_write_row,
-    )
+    if int(mfma_m) == 32:
+        # CK row-major 32x32 MFMA mapping:
+        # row = mi*32 + lane_div32*4 + (ii//4)*8 + (ii%4), ii in [0,16).
+        lane_div_32_mul4 = write_lane_div * arith.index(4)
+        for mi in range_constexpr(m_repeat):
+            mi_base = arith.constant(mi * 32, index=True)
+            for ii in range_constexpr(16):
+                row_off = lane_div_32_mul4 + arith.constant(
+                    (ii // 4) * 8 + (ii % 4), index=True
+                )
+                row_in_tile = mi_base + row_off
+                row = bx_m + row_in_tile
+                _write_row(mi, ii, row_in_tile, row)
+    else:
+        default_epilog(
+            arith=arith,
+            range_constexpr=range_constexpr,
+            m_repeat=m_repeat,
+            lane_div_16=lane_div_16,
+            bx_m=bx_m,
+            body_row=_write_row,
+        )
 
     # Ensure all LDS writes are visible before the shuffle-read.
     gpu.barrier()

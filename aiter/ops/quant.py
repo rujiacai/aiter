@@ -817,10 +817,16 @@ def fused_dynamic_mxfp8_quant_moe_sort(
     """
     M, N = input.view(-1, input.shape[-1]).shape
     N_o = (N + 31) // 32
+    # The HIP launcher writes the swizzled e8m0 scale using a K-padded layout
+    # (scaleN_pad = round_up(N/32, 8); see fused_dynamic_mx_quant_moe_sort_hip /
+    # fp4_scale_shuffle_idx). For non-256-aligned K (e.g. inter_dim=384 -> N_o=12)
+    # the buffer must reserve those padded columns, otherwise the kernel writes
+    # out of bounds. When N_o is already a multiple of 8 this is a no-op.
+    N_o_pad = (N_o + 7) // 8 * 8
     out = torch.empty(M, N, dtype=dtypes.fp8, device=input.device)
     scale = torch.empty(
         (sorted_ids.shape[0] + 31) // 32 * 32,
-        N_o,
+        N_o_pad,
         dtype=dtypes.fp8_e8m0,
         device=input.device,
     )

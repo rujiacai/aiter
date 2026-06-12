@@ -848,6 +848,7 @@ def _flydsl_stage2_wrapper(
         model_dim_pad=model_dim_pad,
         bias=bias2,
         xcd_swizzle=parsed.get("xcd_swizzle", 0),
+        mfma_variant=parsed.get("mfma_variant", None),
     )
 
 
