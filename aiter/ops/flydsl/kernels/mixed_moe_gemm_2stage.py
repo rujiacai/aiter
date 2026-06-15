@@ -2247,7 +2247,14 @@ def compile_mixed_moe_gemm1(
                     return (s >> _c28_i32) | e2m1
 
                 if const_expr(_need_sort):
-                    _n32_sort = _sorted_scale_cols_i32 * _c32_i32
+                    # 32-row-group byte stride must use the K-PADDED scale cols
+                    # (padded to a multiple of 8, e.g. 12 -> 16). Using the real
+                    # scale_cols makes consecutive row-groups overlap for non-256-
+                    # aligned inter_dim (384: 12*32=384 < 512-byte in-group span),
+                    # corrupting the sorted scale stage2 reads (padded layout).
+                    _n32_sort = arith.constant(
+                        ((inter_dim // 32 + 7) // 8 * 8) * 32, type=T.i32
+                    )
 
                 # Mutable slot for split-K N-offset (gate=0, up=inter_dim)
                 _sk_n_offset = [0]

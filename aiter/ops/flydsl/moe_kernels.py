@@ -855,8 +855,13 @@ def flydsl_moe_stage1(
     )
     padded_rows = (sorted_size + 255) // 256 * 256
     padded_cols = (scale_cols + 7) // 8 * 8
+    # Zero-init: the fused silu+quant+scale-sort kernel only writes the real
+    # scale_cols (=inter_dim/32) columns. For non-256-aligned inter_dim the
+    # buffer is K-padded to a multiple of 8 (e.g. 12 -> 16) and those pad
+    # columns stay unwritten; an uninitialized e8m0 byte 0xFF decodes to 2^128
+    # (inf), and stage2 reads the padded columns (0 OOB-activation * inf = NaN).
     out_scale_sorted_flat = (
-        torch.empty(padded_rows * padded_cols, dtype=torch.uint8, device=dev)
+        torch.zeros(padded_rows * padded_cols, dtype=torch.uint8, device=dev)
         if _need_sort
         else torch.empty(0, dtype=torch.uint8, device=dev)
     )
