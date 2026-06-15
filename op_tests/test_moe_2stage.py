@@ -378,7 +378,13 @@ def test_fmoe(
         sim = 2 * (x * y).sum() / denominator
         return 1 - sim
 
+    def cos_sim(x: torch.Tensor, y: torch.Tensor):
+        x, y = x.double().flatten(), y.double().flatten()
+        return (torch.dot(x, y) / (x.norm() * y.norm() + 1e-12)).item()
+
     logits_diff = calc_diff(out2_ref, out2_ck)
+    cosine = cos_sim(out2_ref, out2_ck)
+    logging.info(f"cos_sim={cosine:.6f}  logits_diff={float(logits_diff):.6f}")
     if logits_diff > 1e-3:
         logging.warning(
             f"logits_diff: {logits_diff} is too large, please check the implementation"
@@ -392,7 +398,7 @@ def test_fmoe(
             f"accuracy check failed (non-strict): err={err}, logits_diff={logits_diff}"
         )
 
-    return {"us": us2, "logits_diff": float(logits_diff)}
+    return {"us": us2, "logits_diff": float(logits_diff), "cos_sim": float(cosine)}
 
 
 test_fmoe_with_aot_cache_check = fail_on_aot_cache_miss(_aiter_mk)(test_fmoe)
