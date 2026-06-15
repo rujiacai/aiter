@@ -1130,11 +1130,18 @@ class FmoeTuner(TunerCommon):
                 a2_qt = ref1.to(dtypes.fp8)
                 M = sorted_ids.shape[0]
                 N = a2_qt.shape[-1]
+                # The mxfp32 stage2 reads the A2 microscale through a layout
+                # built with K padded up to a multiple of 256 (_inter_dim_scale),
+                # so the sorted scale tensor's K/32 columns must be padded to the
+                # same multiple-of-8 width; otherwise the kernel's scale reads
+                # run off the end of an unpadded tensor (garbage / illegal access)
+                # for large sorted sizes (e.g. many experts).
+                n_kcol = ((N + 255) // 256) * 256 // 32
                 a2_scale = torch.ones(
-                    [token * topk, N // 32], dtype=dtypes.fp8_e8m0, device=a2_qt.device
+                    [token * topk, n_kcol], dtype=dtypes.fp8_e8m0, device=a2_qt.device
                 )
                 a2_scale_mxfp4_sort = torch.ones(
-                    [M, N // 32], dtype=dtypes.fp8_e8m0, device=a2_qt.device
+                    [M, n_kcol], dtype=dtypes.fp8_e8m0, device=a2_qt.device
                 )
             else:
                 torch_quant = aiter.get_torch_quant(q_type)

@@ -3246,13 +3246,14 @@ def compile_mixed_moe_gemm2(
                 if const_expr(is_f4_a or is_f8_a):
                     # A2 microscale: e8m0 in sorted layout [sorted_size, K/32].
                     # Caller must pre-scatter a2_scale via moe_mxfp4_sort.
-                    # The sorted scale tensor is K-padded to `_inter_dim_scale`
-                    # (inter_dim rounded up to 256) so its layout matches
-                    # `layout_a_scale`. num_records must use the SAME padded
-                    # K/32, else high-row (high-expert) scale reads that are
-                    # in-bounds for the padded tensor get OOB-clamped to 0 ->
-                    # MFMA scales by 0 -> those experts vanish (only triggers
-                    # for non-256-aligned inter_dim).
+                    # The scale is read via `layout_a_scale` (built with the
+                    # padded c_k=`_inter_dim_scale`), so the sorted scale tensor
+                    # MUST be K-padded to `_inter_dim_scale`/32 columns and
+                    # num_records MUST use the SAME padded K/32 — otherwise the
+                    # 16-wide layout reads either get OOB-clamped to 0 (sx too
+                    # small -> lost scales) or overrun an unpadded tensor (sx too
+                    # large -> garbage). Both halves (kernel + caller padding)
+                    # are required.
                     kblk = arith.constant(_inter_dim_scale // 32, index=True)  # padded K/32
                     sx_nbytes_idx = num_valid_idx * kblk
                     sx_nbytes_i32 = arith.index_cast(T.i32, sx_nbytes_idx)
