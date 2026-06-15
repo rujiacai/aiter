@@ -206,15 +206,9 @@ def get_flydsl_stage2_kernels(
     # tile_k=128 candidates run on the dedicated MFMA32x32x64 f8f6f4 path, which
     # avoids K padding for FP4 weights (e.g. inter_dim=384). Supported for fp4
     # and fp8 activations, reduce mode only, tile_m in (32, 64), tile_n == 128.
-    #
-    # The in-kernel MFMA32x32x64 compute is not implemented yet (see
-    # compile_mixed_moe_gemm2). Gate the tuner candidates behind an env flag so
-    # the default sweep is unaffected until the kernel lands; set
-    # AITER_ENABLE_MOE_STAGE2_MFMA32=1 to enable tuning once it is ready.
-    _enable_mfma32 = os.environ.get(
-        "AITER_ENABLE_MOE_STAGE2_MFMA32", "0"
-    ).strip().lower() in ("1", "true", "yes")
-    if _enable_mfma32 and is_fp4 and _stage2_mfma_variant_tag(128, a_dtype, b_dtype):
+    # Always offered for FP4 weights (the in-kernel MFMA32x32x64 path is
+    # implemented and validated).
+    if is_fp4 and _stage2_mfma_variant_tag(128, a_dtype, b_dtype):
         for tm in (32, 64):
             for bnt in b_nts:
                 for xcd in xcd_swizzles:
