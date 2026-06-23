@@ -199,6 +199,7 @@ def _precompile_to_cache(
     a_scale_one: bool = False,
     xcd_swizzle: int = 0,
     enable_bias: bool = False,
+    mfma_variant=None,
     stage1_fuse_quant=None,
     swiglu_limit: float = 0.0,
     **kwargs,
@@ -724,6 +725,7 @@ def _precompile_to_cache(
                 b_nt=b_nt,
                 xcd_swizzle=xcd_swizzle,
                 enable_bias=enable_bias,
+                mfma_variant=mfma_variant,
             )
             _run_compiled(exe, args)
 

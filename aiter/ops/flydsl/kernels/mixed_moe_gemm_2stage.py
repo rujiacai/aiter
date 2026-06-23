@@ -4451,7 +4451,11 @@ def compile_mixed_moe_gemm2(
                         # DMA X(next_k1) -> ping (non-blocking, overlaps with compute)
                         prefetch_x_to_lds(next_k1, lds_x_ping)
                         b_ping_lo = _load_b_dispatch(next_k1_bk)
-                        a_scale_ping, b_scale_ping = _prefetch_scale_dispatch(next_k1)
+                        # NOTE: _prefetch_scale_dispatch -> _k_base / _k_shift_bits
+                        # require Python-int args so the compile-time scale
+                        # sub-group shift folds to a constant; pass next_k1_py, not
+                        # the MLIR Value next_k1, else arith.constant bad_casts.
+                        a_scale_ping, b_scale_ping = _prefetch_scale_dispatch(next_k1_py)
                         scale_opsel_ping = _scale_opsel(k_iv_py + int(tile_k))
 
                         acc, _ = compute_tile(
