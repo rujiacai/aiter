@@ -81,13 +81,23 @@ def moe_sorting_atomic_fwd(
 
     partial = torch.empty(n_cs * E, dtype=torch.int32, device=device)
 
-    (launch_fill, launch_zero, launch_count, launch_cumsum, launch_write_eids,
+    # AITER_SORT_CONTIG=1: contiguous (not grid-stride) block partitioning in
+    # count/scatter -> coarsely token-ordered output -> better stage2 locality,
+    # fully on-GPU (no host argsort). Default off.
+    # AITER_SORT_ORDERED=1: exact token-ascending order within each expert
+    # (CK-quality), fully on-GPU; scatter uses a single-thread in-LDS rank pass
+    # (slower sort, optimal stage2). Implies contiguous partitioning.
+    _ordered = os.environ.get("AITER_SORT_ORDERED", "0") == "1"
+    _contig = _ordered or os.environ.get("AITER_SORT_CONTIG", "0") == "1"
+
+    (launch_fill, launch_count, launch_cumsum, launch_write_eids,
      launch_scatter) = compile_moe_sorting_atomic(
-        num_experts=E, topk=topk, nblocks=n_cs, unit_size=unit_size
+        num_experts=E, topk=topk, nblocks=n_cs, unit_size=unit_size,
+        contig=_contig, ordered=_ordered,
     )
 
     stream = torch.cuda.current_stream()
-    base = (E, topk, unit_size, device.index, n_cs)
+    base = (E, topk, unit_size, device.index, n_cs, _contig, _ordered)
 
     # count is fused with moe_buf zeroing: blocks [n_cs, n_cs+n_zero) clear
     # moe_buf concurrently with the n_cs counting blocks (the clear is HBM-BW
