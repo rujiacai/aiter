@@ -130,7 +130,16 @@ ORDERED_SUB = 2048  # LDS sub-chunk for the exact-ordered scatter
 @functools.lru_cache(maxsize=128)
 def compile_moe_sorting_atomic(*, num_experts: int, topk: int, nblocks: int,
                                unit_size: int = UNIT_SIZE, contig: bool = False,
-                               ordered: bool = False, fuse_cumsum: bool = True):
+                               ordered: bool = False, fuse_cumsum: bool = True,
+                               fuse_launch: bool = True):
+    # fuse_launch=True: cut 5 kernel launches down to 3 by merging the two
+    # dependency-free kernel pairs into single launches (cumsum stays alone -- a
+    # grid barrier sits on both sides of it):
+    #   stage0: count_kernel also does fill (blocks [NB, NB+n_fill) write the
+    #           sorted_ids sentinel / zero sorted_weights) and moe_buf zeroing.
+    #   stage2: scatter_kernel also does write_eids (blocks [NB, NB+E) write
+    #           sorted_expert_ids for expert bid-NB).
+    # Output is identical; this only removes launch/scheduling overhead.
     # fuse_cumsum=True: drop cumsum's phase C (the single-block NB*E serial
     # rewrite of partial[b,e] -> base slot). Instead each scatter block computes
     # its own base on the fly: base[bid,e] = ws_offset[e] + sum_{b'<bid} count[b',e],
@@ -222,8 +231,13 @@ def compile_moe_sorting_atomic(*, num_experts: int, topk: int, nblocks: int,
         topk_ids: fx.Tensor,
         partial: fx.Tensor,
         moe_buf_i32: fx.Tensor,
+        sorted_ids: fx.Tensor,
+        sorted_weights: fx.Tensor,
         i32_total: fx.Int32,
         i32_v4_total: fx.Int32,
+        i32_sorted_len: fx.Int32,
+        i32_sentinel: fx.Int32,
+        i32_nfill: fx.Int32,
     ):
         bid = gpu.block_idx.x
         tid = gpu.thread_idx.x
@@ -232,6 +246,8 @@ def compile_moe_sorting_atomic(*, num_experts: int, topk: int, nblocks: int,
         c_E = fx.Int32(E)
         c_NB = fx.Int32(NB)
         c_oob = fx.Int32(0x7FFFFFFF)
+        # zero blocks start after the count blocks (+ the fill blocks when fused).
+        c_fill_end = (c_NB + i32_nfill) if fuse_launch else c_NB
 
         ifop_c = scf.IfOp(_unwrap(bid < c_NB))
         with _if_then(ifop_c):
@@ -281,14 +297,31 @@ def compile_moe_sorting_atomic(*, num_experts: int, topk: int, nblocks: int,
                 dst = valid.select(row + e, c_oob)
                 buffer_ops.buffer_store(c, part_rsrc, dst)
 
-        ifop_z = scf.IfOp(_unwrap(bid >= c_NB))
+        if fuse_launch:
+            # blocks [NB, NB+nfill) fill sorted_ids with sentinel / zero weights
+            # (the old standalone fill_kernel, folded in to save a launch).
+            ifop_f = scf.IfOp(_unwrap((bid >= c_NB) & (bid < c_fill_end)))
+            with _if_then(ifop_f):
+                sids_rsrc = buffer_ops.create_buffer_resource(sorted_ids, max_size=True)
+                sw_rsrc = buffer_ops.create_buffer_resource(sorted_weights, max_size=True)
+                fid0 = (bid - c_NB) * fx.Int32(BLOCK_SIZE) + tid
+                fstride = i32_nfill * fx.Int32(BLOCK_SIZE)
+                fniters = _grid_stride_niters(i32_sorted_len, fstride)
+                for _f in range(fx.Index(0), ArithValue(fniters).index_cast(T.index), fx.Index(1)):
+                    fidx = fid0 + fx.Int32(_f) * fstride
+                    fvalid = fidx < i32_sorted_len
+                    fsafe = fvalid.select(fidx, c_oob)
+                    buffer_ops.buffer_store(i32_sentinel, sids_rsrc, fsafe)
+                    buffer_ops.buffer_store(c_zero, sw_rsrc, fsafe)
+
+        ifop_z = scf.IfOp(_unwrap(bid >= c_fill_end))
         with _if_then(ifop_z):
             mb_rsrc = buffer_ops.create_buffer_resource(moe_buf_i32, max_size=True)
             _z = _unwrap(fx.Int32(0))
             c_zero_v4 = vector.from_elements(T.vec(4, T.i32), [_z, _z, _z, _z])
             c4 = fx.Int32(4)
-            zid0 = (bid - c_NB) * fx.Int32(BLOCK_SIZE) + tid
-            zstride = (gpu.grid_dim.x - c_NB) * fx.Int32(BLOCK_SIZE)
+            zid0 = (bid - c_fill_end) * fx.Int32(BLOCK_SIZE) + tid
+            zstride = (gpu.grid_dim.x - c_fill_end) * fx.Int32(BLOCK_SIZE)
             zniters = _grid_stride_niters(i32_v4_total, zstride)
             for _z2 in range(fx.Index(0), ArithValue(zniters).index_cast(T.index), fx.Index(1)):
                 zidx = zid0 + fx.Int32(_z2) * zstride
@@ -440,7 +473,9 @@ def compile_moe_sorting_atomic(*, num_experts: int, topk: int, nblocks: int,
             buffer_ops.buffer_store(eid, se_rsrc, safe)
 
     # ---- K3: single-pass scatter. partial[bid, e] holds this block's base
-    #          slot for expert e (computed in cumsum). ----
+    #          slot for expert e (computed in cumsum).  When fuse_launch, blocks
+    #          [NB, NB+E) instead run the write_eids work (no data dependency on
+    #          the scatter blocks -- both only read cumsum's outputs). ----
     @flyc.kernel(known_block_size=[BLOCK_SIZE, 1, 1])
     def scatter_kernel(
         topk_ids: fx.Tensor,
@@ -449,6 +484,7 @@ def compile_moe_sorting_atomic(*, num_experts: int, topk: int, nblocks: int,
         workspace: fx.Tensor,
         sorted_ids: fx.Tensor,
         sorted_weights: fx.Tensor,
+        sorted_expert_ids: fx.Tensor,
         i32_total: fx.Int32,
     ):
         bid = gpu.block_idx.x
@@ -465,6 +501,7 @@ def compile_moe_sorting_atomic(*, num_experts: int, topk: int, nblocks: int,
         sids_rsrc = buffer_ops.create_buffer_resource(sorted_ids, max_size=True)
         sw_rsrc = buffer_ops.create_buffer_resource(sorted_weights, max_size=True)
         ws_rsrc = buffer_ops.create_buffer_resource(workspace, max_size=True)
+        se_rsrc = buffer_ops.create_buffer_resource(sorted_expert_ids, max_size=True)
         base = alloc_sc.get_base()
 
         def _block_base(safe_e):
@@ -483,30 +520,58 @@ def compile_moe_sorting_atomic(*, num_experts: int, topk: int, nblocks: int,
                 part_rsrc, bid * c_E + safe_e, vec_width=1, dtype=T.i32
             )
 
-        if ordered:
-            # ---- fast (~exact) ordered scatter (contiguous partition) ----
-            # wcur[e] starts at the block's base slot (partial[bid,e]).  We walk
-            # the block's contiguous tokens in BLOCK_SIZE sub-chunks IN ORDER
-            # (a barrier between sub-chunks), using a parallel LDS atomic cursor.
-            # Across sub-chunks order is preserved; within one 256-token sub-chunk
-            # the atomic scrambles only ~1 token/expert -> effectively token
-            # order, at full atomic (parallel) speed (no single-thread pass).
-            wcur = SmemPtr(base, sc_wcur_off, T.i32, shape=(E + 1,)).get()
+        def _emit_scatter():
+            if ordered:
+                # ---- fast (~exact) ordered scatter (contiguous partition) ----
+                # wcur[e] starts at the block's base slot.  We walk the block's
+                # contiguous tokens in BLOCK_SIZE sub-chunks IN ORDER (barrier
+                # between sub-chunks), using a parallel LDS atomic cursor.  Across
+                # sub-chunks order is preserved; within one 256-token sub-chunk the
+                # atomic scrambles only ~1 token/expert -> effectively token order.
+                wcur = SmemPtr(base, sc_wcur_off, T.i32, shape=(E + 1,)).get()
+                for _c in range_constexpr(0, E, BLOCK_SIZE):
+                    e = fx.Int32(_c) + tid
+                    valid = e < c_E
+                    safe_e = valid.select(e, c_zero)
+                    b = _block_base(safe_e)
+                    _lds_store(wcur, b, valid.select(e, c_E))
+                gpu.barrier()
+
+                chunk = (i32_total + c_NB - c_one) // c_NB
+                start = bid * chunk
+                blk_end = start + chunk
+                nit = _grid_stride_niters(chunk, fx.Int32(BLOCK_SIZE))
+                for _i in range(fx.Index(0), ArithValue(nit).index_cast(T.index), fx.Index(1)):
+                    idx = start + fx.Int32(_i) * fx.Int32(BLOCK_SIZE) + tid
+                    valid = (idx < i32_total) & (idx < blk_end)
+                    safe = valid.select(idx, c_zero)
+                    eid = buffer_ops.buffer_load(ids_rsrc, safe, vec_width=1, dtype=T.i32)
+                    token = safe // c_topk_i
+                    kslot = safe % c_topk_i
+                    packed = (kslot << fx.Int32(24)) | token
+                    w_i32 = buffer_ops.buffer_load(w_rsrc, safe, vec_width=1, dtype=T.i32)
+                    inc = valid.select(c_one, c_zero)
+                    slot = _lds_atomic_add(wcur, eid, inc)  # = base[eid] + running
+                    safe_slot = valid.select(slot, c_oob)
+                    buffer_ops.buffer_store(packed, sids_rsrc, safe_slot)
+                    buffer_ops.buffer_store(w_i32, sw_rsrc, safe_slot)
+                    gpu.barrier()  # serialize sub-chunks -> preserve token order
+                return
+
+            bbase = SmemPtr(base, sc_base_off, T.i32, shape=(E + 1,)).get()
+            wcur = SmemPtr(base, sc_wcur_off, T.i32, shape=(E,)).get()
+
             for _c in range_constexpr(0, E, BLOCK_SIZE):
                 e = fx.Int32(_c) + tid
                 valid = e < c_E
                 safe_e = valid.select(e, c_zero)
                 b = _block_base(safe_e)
-                _lds_store(wcur, b, valid.select(e, c_E))
+                store_e = valid.select(e, c_E)
+                _lds_store(bbase, b, store_e)
+                _lds_store(wcur, c_zero, safe_e)
             gpu.barrier()
 
-            chunk = (i32_total + c_NB - c_one) // c_NB
-            start = bid * chunk
-            blk_end = start + chunk
-            nit = _grid_stride_niters(chunk, fx.Int32(BLOCK_SIZE))
-            for _i in range(fx.Index(0), ArithValue(nit).index_cast(T.index), fx.Index(1)):
-                idx = start + fx.Int32(_i) * fx.Int32(BLOCK_SIZE) + tid
-                valid = (idx < i32_total) & (idx < blk_end)
+            def _scatter_one(idx, valid):
                 safe = valid.select(idx, c_zero)
                 eid = buffer_ops.buffer_load(ids_rsrc, safe, vec_width=1, dtype=T.i32)
                 token = safe // c_topk_i
@@ -514,56 +579,55 @@ def compile_moe_sorting_atomic(*, num_experts: int, topk: int, nblocks: int,
                 packed = (kslot << fx.Int32(24)) | token
                 w_i32 = buffer_ops.buffer_load(w_rsrc, safe, vec_width=1, dtype=T.i32)
                 inc = valid.select(c_one, c_zero)
-                slot = _lds_atomic_add(wcur, eid, inc)  # = base[eid] + running
+                lpos = _lds_atomic_add(wcur, eid, inc)
+                slot = _lds_load(bbase, eid) + lpos
                 safe_slot = valid.select(slot, c_oob)
                 buffer_ops.buffer_store(packed, sids_rsrc, safe_slot)
                 buffer_ops.buffer_store(w_i32, sw_rsrc, safe_slot)
-                gpu.barrier()  # serialize sub-chunks -> preserve token order
-            return
 
-        bbase = SmemPtr(base, sc_base_off, T.i32, shape=(E + 1,)).get()
-        wcur = SmemPtr(base, sc_wcur_off, T.i32, shape=(E,)).get()
+            if contig:
+                # MUST match count's partition so partial[bid,e] base is consistent.
+                chunk = (i32_total + c_NB - c_one) // c_NB
+                start = bid * chunk
+                blk_end = start + chunk
+                nit = _grid_stride_niters(chunk, fx.Int32(BLOCK_SIZE))
+                for _i in range(fx.Index(0), ArithValue(nit).index_cast(T.index), fx.Index(1)):
+                    idx = start + fx.Int32(_i) * fx.Int32(BLOCK_SIZE) + tid
+                    _scatter_one(idx, (idx < i32_total) & (idx < blk_end))
+            else:
+                # only NB blocks scatter -> stride over NB, not the (NB+E) grid.
+                gid0 = bid * fx.Int32(BLOCK_SIZE) + tid
+                stride = c_NB * fx.Int32(BLOCK_SIZE)
+                niters = _grid_stride_niters(i32_total, stride)
+                for _i in range(fx.Index(0), ArithValue(niters).index_cast(T.index), fx.Index(1)):
+                    idx = gid0 + fx.Int32(_i) * stride
+                    _scatter_one(idx, idx < i32_total)
 
-        for _c in range_constexpr(0, E, BLOCK_SIZE):
-            e = fx.Int32(_c) + tid
-            valid = e < c_E
-            safe_e = valid.select(e, c_zero)
-            b = _block_base(safe_e)
-            store_e = valid.select(e, c_E)
-            _lds_store(bbase, b, store_e)
-            _lds_store(wcur, c_zero, safe_e)
-        gpu.barrier()
+        def _emit_eids(eid):
+            # block writes expert id `eid` into its sorted_expert_ids block range.
+            o0 = buffer_ops.buffer_load(ws_rsrc, fx.Int32(OFF) + eid, vec_width=1, dtype=T.i32)
+            o1 = buffer_ops.buffer_load(
+                ws_rsrc, fx.Int32(OFF) + eid + c_one, vec_width=1, dtype=T.i32
+            )
+            blk0 = o0 // fx.Int32(c_unit)
+            nb = (o1 - o0) // fx.Int32(c_unit)
+            niters = _grid_stride_niters(nb, fx.Int32(BLOCK_SIZE))
+            for _j in range(fx.Index(0), ArithValue(niters).index_cast(T.index), fx.Index(1)):
+                j = fx.Int32(_j) * fx.Int32(BLOCK_SIZE) + tid
+                valid = j < nb
+                safe = valid.select(blk0 + j, c_oob)
+                buffer_ops.buffer_store(eid, se_rsrc, safe)
 
-        def _scatter_one(idx, valid):
-            safe = valid.select(idx, c_zero)
-            eid = buffer_ops.buffer_load(ids_rsrc, safe, vec_width=1, dtype=T.i32)
-            token = safe // c_topk_i
-            kslot = safe % c_topk_i
-            packed = (kslot << fx.Int32(24)) | token
-            w_i32 = buffer_ops.buffer_load(w_rsrc, safe, vec_width=1, dtype=T.i32)
-            inc = valid.select(c_one, c_zero)
-            lpos = _lds_atomic_add(wcur, eid, inc)
-            slot = _lds_load(bbase, eid) + lpos
-            safe_slot = valid.select(slot, c_oob)
-            buffer_ops.buffer_store(packed, sids_rsrc, safe_slot)
-            buffer_ops.buffer_store(w_i32, sw_rsrc, safe_slot)
-
-        if contig:
-            # MUST match count's partition so partial[bid,e] base is consistent.
-            chunk = (i32_total + c_NB - c_one) // c_NB
-            start = bid * chunk
-            blk_end = start + chunk
-            nit = _grid_stride_niters(chunk, fx.Int32(BLOCK_SIZE))
-            for _i in range(fx.Index(0), ArithValue(nit).index_cast(T.index), fx.Index(1)):
-                idx = start + fx.Int32(_i) * fx.Int32(BLOCK_SIZE) + tid
-                _scatter_one(idx, (idx < i32_total) & (idx < blk_end))
+        if fuse_launch:
+            # blocks [0, NB) scatter; blocks [NB, NB+E) write expert ids.
+            ifs = scf.IfOp(_unwrap(bid < c_NB))
+            with _if_then(ifs):
+                _emit_scatter()
+            ife = scf.IfOp(_unwrap(bid >= c_NB))
+            with _if_then(ife):
+                _emit_eids(bid - c_NB)
         else:
-            gid0 = bid * fx.Int32(BLOCK_SIZE) + tid
-            stride = gpu.grid_dim.x * fx.Int32(BLOCK_SIZE)
-            niters = _grid_stride_niters(i32_total, stride)
-            for _i in range(fx.Index(0), ArithValue(niters).index_cast(T.index), fx.Index(1)):
-                idx = gid0 + fx.Int32(_i) * stride
-                _scatter_one(idx, idx < i32_total)
+            _emit_scatter()
 
     # ---- launch wrappers ----
     @flyc.jit
@@ -573,13 +637,16 @@ def compile_moe_sorting_atomic(*, num_experts: int, topk: int, nblocks: int,
         launcher.launch(grid=(n_grid, 1, 1), block=(BLOCK_SIZE, 1, 1), stream=stream)
 
     @flyc.jit
-    def launch_count(topk_ids, partial, moe_buf_i32, i32_total, i32_v4_total,
+    def launch_count(topk_ids, partial, moe_buf_i32, sorted_ids, sorted_weights,
+                     i32_total, i32_v4_total, i32_sorted_len, i32_sentinel, i32_nfill,
                      n_grid: fx.Int32, stream: fx.Stream = fx.Stream(None)):
         alloc_cnt.finalized = False
         ctx = CompilationContext.get_current()
         with ir.InsertionPoint(ctx.gpu_module_body):
             alloc_cnt.finalize()
-        launcher = count_kernel(topk_ids, partial, moe_buf_i32, i32_total, i32_v4_total)
+        launcher = count_kernel(topk_ids, partial, moe_buf_i32, sorted_ids,
+                                sorted_weights, i32_total, i32_v4_total,
+                                i32_sorted_len, i32_sentinel, i32_nfill)
         launcher.launch(grid=(n_grid, 1, 1), block=(BLOCK_SIZE, 1, 1), stream=stream)
 
     @flyc.jit
@@ -600,7 +667,7 @@ def compile_moe_sorting_atomic(*, num_experts: int, topk: int, nblocks: int,
 
     @flyc.jit
     def launch_scatter(topk_ids, topk_weights, partial, workspace, sorted_ids,
-                       sorted_weights, i32_total, n_grid: fx.Int32,
+                       sorted_weights, sorted_expert_ids, i32_total, n_grid: fx.Int32,
                        stream: fx.Stream = fx.Stream(None)):
         alloc_sc.finalized = False
         ctx = CompilationContext.get_current()
@@ -608,7 +675,7 @@ def compile_moe_sorting_atomic(*, num_experts: int, topk: int, nblocks: int,
             alloc_sc.finalize()
         launcher = scatter_kernel(
             topk_ids, topk_weights, partial, workspace, sorted_ids, sorted_weights,
-            i32_total
+            sorted_expert_ids, i32_total
         )
         launcher.launch(grid=(n_grid, 1, 1), block=(BLOCK_SIZE, 1, 1), stream=stream)
 

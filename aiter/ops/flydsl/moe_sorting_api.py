@@ -93,15 +93,20 @@ def moe_sorting_atomic_fwd(
     # let each scatter block compute its base from raw counts + ws_offset. Pure
     # optimization (identical output); set 0 to use the legacy phase-C path.
     _fuse_cumsum = os.environ.get("AITER_SORT_FUSE_CUMSUM", "1") == "1"
+    # AITER_SORT_FUSE_LAUNCH=1 (default): cut 5 launches to 3 by folding fill into
+    # count (stage0) and write_eids into scatter (stage2). Identical output.
+    _fuse_launch = os.environ.get("AITER_SORT_FUSE_LAUNCH", "1") == "1"
 
     (launch_fill, launch_count, launch_cumsum, launch_write_eids,
      launch_scatter) = compile_moe_sorting_atomic(
         num_experts=E, topk=topk, nblocks=n_cs, unit_size=unit_size,
         contig=_contig, ordered=_ordered, fuse_cumsum=_fuse_cumsum,
+        fuse_launch=_fuse_launch,
     )
 
     stream = torch.cuda.current_stream()
-    base = (E, topk, unit_size, device.index, n_cs, _contig, _ordered, _fuse_cumsum)
+    base = (E, topk, unit_size, device.index, n_cs, _contig, _ordered, _fuse_cumsum,
+            _fuse_launch)
 
     # count is fused with moe_buf zeroing: blocks [n_cs, n_cs+n_zero) clear
     # moe_buf concurrently with the n_cs counting blocks (the clear is HBM-BW
@@ -110,20 +115,36 @@ def moe_sorting_atomic_fwd(
     # or when the caller zeroes moe_buf elsewhere, e.g. fused into stage1 init).
     if os.environ.get("AITER_SORT_SKIP_ZERO", "0") == "1":
         v4_total = 0
-    count_grid = n_cs + (n_zero if v4_total > 0 else 0)
+    _n_zero = n_zero if v4_total > 0 else 0
 
-    _launch_cached(base + ("fill",), launch_fill,
-                   (sorted_ids, sorted_weights, sorted_len, sentinel, n_fill), stream)
-    _launch_cached(base + ("count",), launch_count,
-                   (topk_ids, partial, moe_buf_i32, N, v4_total, count_grid), stream)
-    _launch_cached(base + ("cumsum",), launch_cumsum,
-                   (partial, ws, num_valid_ids, M), stream)
-    _launch_cached(base + ("weids",), launch_write_eids,
-                   (ws, sorted_expert_ids, E), stream)
-    _launch_cached(base + ("scatter",), launch_scatter,
-                   (topk_ids, topk_weights, partial, ws, sorted_ids, sorted_weights,
-                    N, n_cs),
-                   stream)
+    if _fuse_launch:
+        # stage0: count[0,n_cs) + fill[n_cs,n_cs+n_fill) + zero[..]; one launch.
+        count_grid = n_cs + n_fill + _n_zero
+        _launch_cached(base + ("count",), launch_count,
+                       (topk_ids, partial, moe_buf_i32, sorted_ids, sorted_weights,
+                        N, v4_total, sorted_len, sentinel, n_fill, count_grid), stream)
+        _launch_cached(base + ("cumsum",), launch_cumsum,
+                       (partial, ws, num_valid_ids, M), stream)
+        # stage2: scatter[0,n_cs) + write_eids[n_cs,n_cs+E); one launch.
+        _launch_cached(base + ("scatter",), launch_scatter,
+                       (topk_ids, topk_weights, partial, ws, sorted_ids, sorted_weights,
+                        sorted_expert_ids, N, n_cs + E),
+                       stream)
+    else:
+        count_grid = n_cs + _n_zero
+        _launch_cached(base + ("fill",), launch_fill,
+                       (sorted_ids, sorted_weights, sorted_len, sentinel, n_fill), stream)
+        _launch_cached(base + ("count",), launch_count,
+                       (topk_ids, partial, moe_buf_i32, sorted_ids, sorted_weights,
+                        N, v4_total, sorted_len, sentinel, 0, count_grid), stream)
+        _launch_cached(base + ("cumsum",), launch_cumsum,
+                       (partial, ws, num_valid_ids, M), stream)
+        _launch_cached(base + ("weids",), launch_write_eids,
+                       (ws, sorted_expert_ids, E), stream)
+        _launch_cached(base + ("scatter",), launch_scatter,
+                       (topk_ids, topk_weights, partial, ws, sorted_ids, sorted_weights,
+                        sorted_expert_ids, N, n_cs),
+                       stream)
 
     # DIAGNOSTIC: re-sort each expert segment so token ids are ascending (like
     # CK), keeping num_valid / padding / segments identical. Used to isolate the
