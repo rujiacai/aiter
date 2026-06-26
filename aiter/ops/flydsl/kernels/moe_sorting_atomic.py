@@ -130,7 +130,13 @@ ORDERED_SUB = 2048  # LDS sub-chunk for the exact-ordered scatter
 @functools.lru_cache(maxsize=128)
 def compile_moe_sorting_atomic(*, num_experts: int, topk: int, nblocks: int,
                                unit_size: int = UNIT_SIZE, contig: bool = False,
-                               ordered: bool = False):
+                               ordered: bool = False, fuse_cumsum: bool = True):
+    # fuse_cumsum=True: drop cumsum's phase C (the single-block NB*E serial
+    # rewrite of partial[b,e] -> base slot). Instead each scatter block computes
+    # its own base on the fly: base[bid,e] = ws_offset[e] + sum_{b'<bid} count[b',e],
+    # reading the global ws_offset[] + the raw per-block counts (NB<=32, parallel
+    # across blocks). Kills the underutilized single-block cumsum tail. partial
+    # then stays as RAW counts (not rewritten). Results are identical.
     # ordered=True: exact token-ascending order within each expert (like CK),
     # produced fully on-GPU. Implies contiguous partitioning; the scatter uses
     # a single-thread in-LDS rank pass (deterministic, in token order) + a
@@ -163,9 +169,15 @@ def compile_moe_sorting_atomic(*, num_experts: int, topk: int, nblocks: int,
     cnt_hist_off = _alloc_region(alloc_cnt, E)
 
     # cumsum kernel LDS: total[E+1] (dummy slot E for OOB lanes), offsetL[E].
+    # PAR_SCAN: when E <= BLOCK_SIZE each thread owns one expert, so phase B can
+    # use a parallel (Hillis-Steele) prefix scan instead of a single-thread
+    # serial loop -> ~log2(BLOCK_SIZE) steps instead of E.  Needs scan[BLOCK_SIZE].
+    PAR_SCAN = E <= BLOCK_SIZE
     alloc_cs = SmemAllocator(None, arch=arch)
     cs_tot_off = _alloc_region(alloc_cs, E + 1)
     cs_off_off = _alloc_region(alloc_cs, E)
+    if PAR_SCAN:
+        cs_scan_off = _alloc_region(alloc_cs, BLOCK_SIZE)
 
     # scatter kernel LDS.
     alloc_sc = SmemAllocator(None, arch=arch)
@@ -297,6 +309,7 @@ def compile_moe_sorting_atomic(*, num_experts: int, topk: int, nblocks: int,
         c_one = fx.Int32(1)
         c_E = fx.Int32(E)
         c_unit_i = fx.Int32(c_unit)
+        c_oob = fx.Int32(0x7FFFFFFF)
         part_rsrc = buffer_ops.create_buffer_resource(partial, max_size=True)
         ws_rsrc = buffer_ops.create_buffer_resource(workspace, max_size=True)
         nv_rsrc = buffer_ops.create_buffer_resource(num_valid_ids, max_size=True)
@@ -317,35 +330,90 @@ def compile_moe_sorting_atomic(*, num_experts: int, topk: int, nblocks: int,
             _lds_store(total, s, valid.select(e, c_E))
         gpu.barrier()
 
-        # phase B: thread 0 does the serial padded exclusive prefix over experts
-        ifop = scf.IfOp(_unwrap(tid == c_zero))
-        with _if_then(ifop):
-            off = c_zero
-            for _e in range_constexpr(0, E):
-                cnt = _lds_load(total, fx.Int32(_e))
-                blocks = (cnt + c_unit_i - c_one) // c_unit_i
-                padded = (cnt == c_zero).select(c_zero, blocks * c_unit_i)
-                _lds_store(offl, off, fx.Int32(_e))
-                buffer_ops.buffer_store(off, ws_rsrc, fx.Int32(OFF + _e))
-                off = off + padded
-            buffer_ops.buffer_store(off, ws_rsrc, fx.Int32(OFF + E))
-            buffer_ops.buffer_store(off, nv_rsrc, c_zero)
-            buffer_ops.buffer_store(i32_tokens, nv_rsrc, c_one)
-        gpu.barrier()
-
-        # phase C: each thread e turns partial[b, e] (a count) into the running
-        # base slot for block b's expert-e tokens.
-        for _c in range_constexpr(0, E, BLOCK_SIZE):
-            e = fx.Int32(_c) + tid
+        # phase B: padded exclusive prefix over experts -> ws_offset[E+1].
+        if PAR_SCAN:
+            # ---- parallel Hillis-Steele scan (one thread == one expert) ----
+            scan = SmemPtr(base, cs_scan_off, T.i32, shape=(BLOCK_SIZE,)).get()
+            e = tid
             valid = e < c_E
             safe_e = valid.select(e, c_zero)
-            running = _lds_load(offl, safe_e)
-            for _b in range_constexpr(0, NB):
-                off_b = fx.Int32(_b) * c_E + safe_e
-                v = buffer_ops.buffer_load(part_rsrc, off_b, vec_width=1, dtype=T.i32)
-                dst = valid.select(off_b, fx.Int32(0x7FFFFFFF))
-                buffer_ops.buffer_store(running, part_rsrc, dst)
-                running = running + v
+            cnt = _lds_load(total, safe_e)
+            blocks = (cnt + c_unit_i - c_one) // c_unit_i
+            my_pad = valid.select(
+                (cnt == c_zero).select(c_zero, blocks * c_unit_i), c_zero
+            )
+            _lds_store(scan, my_pad, e)
+            gpu.barrier()
+            nsteps = BLOCK_SIZE.bit_length() - 1  # log2(BLOCK_SIZE) Hillis-Steele steps
+            for _s in range_constexpr(0, nsteps):
+                d = 1 << _s
+                ge = e >= fx.Int32(d)
+                src = ge.select(e - fx.Int32(d), c_zero)
+                add = ge.select(_lds_load(scan, src), c_zero)
+                cur = _lds_load(scan, e)
+                gpu.barrier()
+                _lds_store(scan, cur + add, e)
+                gpu.barrier()
+            # scan[e] now = inclusive prefix; exclusive offset = inclusive - my_pad
+            excl = _lds_load(scan, e) - my_pad
+            buffer_ops.buffer_store(
+                excl, ws_rsrc, valid.select(fx.Int32(OFF) + e, c_oob)
+            )
+            if not fuse_cumsum:
+                ifv = scf.IfOp(_unwrap(valid))
+                with _if_then(ifv):
+                    _lds_store(offl, excl, e)
+            ifop_t = scf.IfOp(_unwrap(tid == c_zero))
+            with _if_then(ifop_t):
+                tot = _lds_load(scan, fx.Int32(E - 1))  # inclusive[E-1] = grand total
+                buffer_ops.buffer_store(tot, ws_rsrc, fx.Int32(OFF + E))
+                buffer_ops.buffer_store(tot, nv_rsrc, c_zero)
+                buffer_ops.buffer_store(i32_tokens, nv_rsrc, c_one)
+            gpu.barrier()
+        else:
+            # ---- fallback: thread 0 serial scan in LDS, then parallel ws write
+            # (used when E > BLOCK_SIZE so the one-thread-per-expert map breaks) ----
+            ifop = scf.IfOp(_unwrap(tid == c_zero))
+            with _if_then(ifop):
+                off = c_zero
+                for _e in range_constexpr(0, E):
+                    cnt = _lds_load(total, fx.Int32(_e))
+                    blocks = (cnt + c_unit_i - c_one) // c_unit_i
+                    padded = (cnt == c_zero).select(c_zero, blocks * c_unit_i)
+                    _lds_store(offl, off, fx.Int32(_e))
+                    off = off + padded
+                _lds_store(total, off, c_E)  # stash grand total in dummy slot E
+                buffer_ops.buffer_store(off, nv_rsrc, c_zero)
+                buffer_ops.buffer_store(i32_tokens, nv_rsrc, c_one)
+            gpu.barrier()
+            for _c in range_constexpr(0, E, BLOCK_SIZE):
+                e = fx.Int32(_c) + tid
+                valid = e < c_E
+                safe_e = valid.select(e, c_zero)
+                v = _lds_load(offl, safe_e)
+                buffer_ops.buffer_store(v, ws_rsrc, valid.select(fx.Int32(OFF) + e, c_oob))
+            ifop_t = scf.IfOp(_unwrap(tid == c_zero))
+            with _if_then(ifop_t):
+                tot = _lds_load(total, c_E)
+                buffer_ops.buffer_store(tot, ws_rsrc, fx.Int32(OFF + E))
+            gpu.barrier()
+
+        # phase C: each thread e turns partial[b, e] (a count) into the running
+        # base slot for block b's expert-e tokens.  SKIPPED when fuse_cumsum:
+        # the scatter kernel then computes each block's base on the fly from the
+        # raw counts + ws_offset (avoids this single-block NB*E serial rewrite).
+        if not fuse_cumsum:
+            for _c in range_constexpr(0, E, BLOCK_SIZE):
+                e = fx.Int32(_c) + tid
+                valid = e < c_E
+                safe_e = valid.select(e, c_zero)
+                running = _lds_load(offl, safe_e)
+                for _b in range_constexpr(0, NB):
+                    off_b = fx.Int32(_b) * c_E + safe_e
+                    v = buffer_ops.buffer_load(part_rsrc, off_b, vec_width=1, dtype=T.i32)
+                    dst = valid.select(off_b, fx.Int32(0x7FFFFFFF))
+                    buffer_ops.buffer_store(running, part_rsrc, dst)
+                    running = running + v
 
     # ---- K2b: write expert ids into sorted_expert_ids (grid = E) ----
     @flyc.kernel(known_block_size=[BLOCK_SIZE, 1, 1])
@@ -378,6 +446,7 @@ def compile_moe_sorting_atomic(*, num_experts: int, topk: int, nblocks: int,
         topk_ids: fx.Tensor,
         topk_weights: fx.Tensor,
         partial: fx.Tensor,
+        workspace: fx.Tensor,
         sorted_ids: fx.Tensor,
         sorted_weights: fx.Tensor,
         i32_total: fx.Int32,
@@ -395,7 +464,24 @@ def compile_moe_sorting_atomic(*, num_experts: int, topk: int, nblocks: int,
         part_rsrc = buffer_ops.create_buffer_resource(partial, max_size=True)
         sids_rsrc = buffer_ops.create_buffer_resource(sorted_ids, max_size=True)
         sw_rsrc = buffer_ops.create_buffer_resource(sorted_weights, max_size=True)
+        ws_rsrc = buffer_ops.create_buffer_resource(workspace, max_size=True)
         base = alloc_sc.get_base()
+
+        def _block_base(safe_e):
+            # per-block base slot for expert safe_e.
+            if fuse_cumsum:
+                # partial holds RAW counts; base = ws_offset[e] + prefix over blocks.
+                b = buffer_ops.buffer_load(ws_rsrc, safe_e, vec_width=1, dtype=T.i32)
+                for _b in range_constexpr(0, NB):
+                    cnt = buffer_ops.buffer_load(
+                        part_rsrc, fx.Int32(_b) * c_E + safe_e, vec_width=1, dtype=T.i32
+                    )
+                    b = b + (fx.Int32(_b) < bid).select(cnt, c_zero)
+                return b
+            # partial already rewritten to base slots by cumsum's phase C.
+            return buffer_ops.buffer_load(
+                part_rsrc, bid * c_E + safe_e, vec_width=1, dtype=T.i32
+            )
 
         if ordered:
             # ---- fast (~exact) ordered scatter (contiguous partition) ----
@@ -406,12 +492,11 @@ def compile_moe_sorting_atomic(*, num_experts: int, topk: int, nblocks: int,
             # the atomic scrambles only ~1 token/expert -> effectively token
             # order, at full atomic (parallel) speed (no single-thread pass).
             wcur = SmemPtr(base, sc_wcur_off, T.i32, shape=(E + 1,)).get()
-            row = bid * c_E
             for _c in range_constexpr(0, E, BLOCK_SIZE):
                 e = fx.Int32(_c) + tid
                 valid = e < c_E
                 safe_e = valid.select(e, c_zero)
-                b = buffer_ops.buffer_load(part_rsrc, row + safe_e, vec_width=1, dtype=T.i32)
+                b = _block_base(safe_e)
                 _lds_store(wcur, b, valid.select(e, c_E))
             gpu.barrier()
 
@@ -439,12 +524,11 @@ def compile_moe_sorting_atomic(*, num_experts: int, topk: int, nblocks: int,
         bbase = SmemPtr(base, sc_base_off, T.i32, shape=(E + 1,)).get()
         wcur = SmemPtr(base, sc_wcur_off, T.i32, shape=(E,)).get()
 
-        row = bid * c_E
         for _c in range_constexpr(0, E, BLOCK_SIZE):
             e = fx.Int32(_c) + tid
             valid = e < c_E
             safe_e = valid.select(e, c_zero)
-            b = buffer_ops.buffer_load(part_rsrc, row + safe_e, vec_width=1, dtype=T.i32)
+            b = _block_base(safe_e)
             store_e = valid.select(e, c_E)
             _lds_store(bbase, b, store_e)
             _lds_store(wcur, c_zero, safe_e)
@@ -515,14 +599,16 @@ def compile_moe_sorting_atomic(*, num_experts: int, topk: int, nblocks: int,
         launcher.launch(grid=(n_grid, 1, 1), block=(BLOCK_SIZE, 1, 1), stream=stream)
 
     @flyc.jit
-    def launch_scatter(topk_ids, topk_weights, partial, sorted_ids, sorted_weights,
-                       i32_total, n_grid: fx.Int32, stream: fx.Stream = fx.Stream(None)):
+    def launch_scatter(topk_ids, topk_weights, partial, workspace, sorted_ids,
+                       sorted_weights, i32_total, n_grid: fx.Int32,
+                       stream: fx.Stream = fx.Stream(None)):
         alloc_sc.finalized = False
         ctx = CompilationContext.get_current()
         with ir.InsertionPoint(ctx.gpu_module_body):
             alloc_sc.finalize()
         launcher = scatter_kernel(
-            topk_ids, topk_weights, partial, sorted_ids, sorted_weights, i32_total
+            topk_ids, topk_weights, partial, workspace, sorted_ids, sorted_weights,
+            i32_total
         )
         launcher.launch(grid=(n_grid, 1, 1), block=(BLOCK_SIZE, 1, 1), stream=stream)
 

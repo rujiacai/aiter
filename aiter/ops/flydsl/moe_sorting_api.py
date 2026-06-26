@@ -89,15 +89,19 @@ def moe_sorting_atomic_fwd(
     # (slower sort, optimal stage2). Implies contiguous partitioning.
     _ordered = os.environ.get("AITER_SORT_ORDERED", "0") == "1"
     _contig = _ordered or os.environ.get("AITER_SORT_CONTIG", "0") == "1"
+    # AITER_SORT_FUSE_CUMSUM=1 (default): drop cumsum's single-block phase C and
+    # let each scatter block compute its base from raw counts + ws_offset. Pure
+    # optimization (identical output); set 0 to use the legacy phase-C path.
+    _fuse_cumsum = os.environ.get("AITER_SORT_FUSE_CUMSUM", "1") == "1"
 
     (launch_fill, launch_count, launch_cumsum, launch_write_eids,
      launch_scatter) = compile_moe_sorting_atomic(
         num_experts=E, topk=topk, nblocks=n_cs, unit_size=unit_size,
-        contig=_contig, ordered=_ordered,
+        contig=_contig, ordered=_ordered, fuse_cumsum=_fuse_cumsum,
     )
 
     stream = torch.cuda.current_stream()
-    base = (E, topk, unit_size, device.index, n_cs, _contig, _ordered)
+    base = (E, topk, unit_size, device.index, n_cs, _contig, _ordered, _fuse_cumsum)
 
     # count is fused with moe_buf zeroing: blocks [n_cs, n_cs+n_zero) clear
     # moe_buf concurrently with the n_cs counting blocks (the clear is HBM-BW
@@ -117,7 +121,8 @@ def moe_sorting_atomic_fwd(
     _launch_cached(base + ("weids",), launch_write_eids,
                    (ws, sorted_expert_ids, E), stream)
     _launch_cached(base + ("scatter",), launch_scatter,
-                   (topk_ids, topk_weights, partial, sorted_ids, sorted_weights, N, n_cs),
+                   (topk_ids, topk_weights, partial, ws, sorted_ids, sorted_weights,
+                    N, n_cs),
                    stream)
 
     # DIAGNOSTIC: re-sort each expert segment so token ids are ascending (like
