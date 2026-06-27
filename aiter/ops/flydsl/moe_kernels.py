@@ -114,7 +114,9 @@ def _parse_flydsl_kernel_name(name: str) -> Optional[Dict]:
     if stage == 1:
         params.update({"k_batch": 1, "gate_only": False})
     else:
-        params.update({"mode": "atomic", "sort_block_m": 0, "persist": False})
+        params.update(
+            {"mode": "atomic", "sort_block_m": 0, "persist": False, "k_batch": 1}
+        )
 
     for token in (match.group("rest") or "").split("_"):
         if not token:
@@ -129,7 +131,7 @@ def _parse_flydsl_kernel_name(name: str) -> Optional[Dict]:
             params["waves_per_eu"] = int(token[1:])
         elif token.startswith("bnt") and token[3:].isdigit():
             params["b_nt"] = int(token[3:])
-        elif stage == 1 and token.startswith("kb") and token[2:].isdigit():
+        elif token.startswith("kb") and token[2:].isdigit():
             params["k_batch"] = int(token[2:])
         elif stage == 1 and token == "go":
             params["gate_only"] = True
@@ -248,7 +250,12 @@ def get_flydsl_stage1_kernels(
     tile_ks = [256] if is_fp4 else [128, 256]
     tile_ms = [16, 32, 64, 128] if is_fp4 else [32, 64, 128]
     waves_per_eus = [1, 2, 3, 4] if is_fp4 else [0, 1, 2, 3, 4]
-    k_batches = [1, 2, 4, 8, 16] if is_fp4 else [1]
+    # Non-fp4 split-K is supported by moe_gemm_2stage.compile_moe_gemm1 (the GEMM
+    # writes raw gate/up partials with atomic-add; silu/mul is deferred to the
+    # post-kernel reduction). It requires the CShuffle epilogue (tile_n % 128 == 0),
+    # guarded below. The autotuner only picks these when they win, so the default
+    # (best) performance is preserved.
+    k_batches = [1, 2, 4, 8, 16] if is_fp4 else [1, 2, 4]
     b_nts = [0, 2] if is_fp4 else [0, 2]
     async_copies = _async_copy_candidates()
     for tm in tile_ms:
@@ -291,6 +298,13 @@ def get_flydsl_stage1_kernels(
                                     continue
                                 if tn // 32 * 64 > 256:
                                     continue
+                            elif kb > 1:
+                                # Non-fp4 split-K stage1 requires the CShuffle epilogue
+                                # (raw partials are shuffled to contiguous half2 frags
+                                # for packed atomic-add). It is only enabled when
+                                # tile_n % 128 == 0 (use_cshuffle_epilog resolves True).
+                                if tn % 128 != 0:
+                                    continue
                             # Split-K stage1 requires:
                             #   model_dim % k_batch == 0 and
                             #   (model_dim // k_batch) % tile_k == 0
@@ -299,7 +313,10 @@ def get_flydsl_stage1_kernels(
                             if model_dim is not None and kb > 1:
                                 if model_dim % kb != 0:
                                     continue
-                                if (model_dim // kb) % tk != 0:
+                                # The stage1 ping-pong loop has a fixed 2-tile
+                                # tail, so the per-slice tile count must be even
+                                # (an odd count silently drops the middle tile).
+                                if (model_dim // kb) % (2 * tk) != 0:
                                     continue
                             gate_onlys = [False, True] if kb > 1 and is_fp4 else [False]
                             for bnt in b_nts:
@@ -382,43 +399,60 @@ def get_flydsl_stage2_kernels(
                             ):
                                 continue
                             for bnt in b_nts:
-                                base_name = flydsl_kernel_name(
-                                    2,
-                                    a_dtype,
-                                    b_dtype,
-                                    out_dtype,
-                                    tm,
-                                    tn,
-                                    tk,
-                                    mode,
-                                )
-                                if async_copy:
-                                    base_name += "_async"
-                                if mfma_variant_tag:
-                                    base_name += f"_{mfma_variant_tag}"
-                                if is_fp4 and wpe != 1:
-                                    base_name += f"_w{wpe}"
-                                elif not is_fp4 and wpe > 0:
-                                    base_name += f"_w{wpe}"
-                                if bnt != 2:
-                                    base_name += f"_bnt{bnt}"
-                                base_params = {
-                                    "stage": 2,
-                                    "a_dtype": a_dtype,
-                                    "b_dtype": b_dtype,
-                                    "out_dtype": out_dtype,
-                                    "tile_m": tm,
-                                    "tile_n": tn,
-                                    "tile_k": tk,
-                                    "mode": mode,
-                                    "MPerBlock": tm,
-                                    "use_async_copy": async_copy,
-                                    "waves_per_eu": wpe,
-                                    "b_nt": bnt,
-                                }
-                                if mfma_variant_tag:
-                                    base_params["mfma_variant"] = mfma_variant_tag
-                                kernels[base_name] = base_params
+                                # Non-fp4 split-K stage2: K=inter_dim is partitioned
+                                # across k_batch workgroups that atomic-accumulate
+                                # their partials (requires atomic mode). Only valid
+                                # when inter_dim (k_dim) is divisible appropriately.
+                                if (not is_fp4) and mode == "atomic" and wpe == 3:
+                                    _stage2_kbs = [1, 2, 4]
+                                else:
+                                    _stage2_kbs = [1]
+                                for kb in _stage2_kbs:
+                                    if kb > 1 and k_dim is not None:
+                                        if k_dim % kb != 0:
+                                            continue
+                                        if (k_dim // kb) % tk != 0:
+                                            continue
+                                    base_name = flydsl_kernel_name(
+                                        2,
+                                        a_dtype,
+                                        b_dtype,
+                                        out_dtype,
+                                        tm,
+                                        tn,
+                                        tk,
+                                        mode,
+                                    )
+                                    if async_copy:
+                                        base_name += "_async"
+                                    if mfma_variant_tag:
+                                        base_name += f"_{mfma_variant_tag}"
+                                    if is_fp4 and wpe != 1:
+                                        base_name += f"_w{wpe}"
+                                    elif not is_fp4 and wpe > 0:
+                                        base_name += f"_w{wpe}"
+                                    if bnt != 2:
+                                        base_name += f"_bnt{bnt}"
+                                    if kb != 1:
+                                        base_name += f"_kb{kb}"
+                                    base_params = {
+                                        "stage": 2,
+                                        "a_dtype": a_dtype,
+                                        "b_dtype": b_dtype,
+                                        "out_dtype": out_dtype,
+                                        "tile_m": tm,
+                                        "tile_n": tn,
+                                        "tile_k": tk,
+                                        "mode": mode,
+                                        "MPerBlock": tm,
+                                        "use_async_copy": async_copy,
+                                        "waves_per_eu": wpe,
+                                        "b_nt": bnt,
+                                        "k_batch": kb,
+                                    }
+                                    if mfma_variant_tag:
+                                        base_params["mfma_variant"] = mfma_variant_tag
+                                    kernels[base_name] = base_params
     return kernels
 
 
@@ -510,6 +544,7 @@ def compile_flydsl_moe_stage1(
             use_async_copy=use_async_copy,
             waves_per_eu=waves_per_eu,
             b_nt=b_nt,
+            k_batch=k_batch,
         )
 
 
@@ -532,6 +567,7 @@ def compile_flydsl_moe_stage2(
     waves_per_eu: int = 3,
     b_nt: int = 2,
     mfma_variant: Optional[str] = None,
+    k_batch: int = 1,
 ):
     """Compile stage2 kernel (cached via underlying lru_cache)."""
     if b_dtype == "fp4":
@@ -573,6 +609,7 @@ def compile_flydsl_moe_stage2(
             use_async_copy=use_async_copy,
             waves_per_eu=waves_per_eu,
             b_nt=b_nt,
+            k_batch=k_batch,
         )
 
 
@@ -1091,8 +1128,13 @@ def flydsl_moe_stage2(
     b_nt: int = 2,
     mfma_variant: Optional[str] = None,
     zero_intermediate: bool = True,
+    k_batch: int = 1,
 ) -> torch.Tensor:
     """Down-projection GEMM (MOE stage2). Supports atomic/reduce modes.
+
+    When k_batch>1 (split-K), the K=inter_dim contraction is partitioned across
+    k_batch workgroups (grid.z) that atomic-accumulate their partials into the
+    output. Requires atomic mode (mode != "reduce").
 
     a: (token_num, topk, inter_dim), w1: (E, model_dim, inter_dim) pre-shuffled.
     Returns (token_num, model_dim).
@@ -1222,6 +1264,7 @@ def flydsl_moe_stage2(
         waves_per_eu=waves_per_eu,
         b_nt=b_nt,
         mfma_variant=mfma_variant,
+        k_batch=k_batch,
     )
     _run_compiled(exe, args)
 

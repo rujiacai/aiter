@@ -559,6 +559,7 @@ class FmoeTuner(TunerCommon):
             b_nt=kparams.get("b_nt", 2),
             mfma_variant=kparams.get("mfma_variant", None),
             zero_intermediate=zero_intermediate,
+            k_batch=kparams.get("k_batch", 1),
         )
 
     @staticmethod
