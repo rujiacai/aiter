@@ -39,6 +39,7 @@ except ImportError:
 
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm, scf, memref
+from flydsl._mlir.dialects import gpu as _gpu_mlir
 from flydsl.expr.typing import T
 
 
@@ -56,6 +57,84 @@ from .mfma_preshuffle_pipeline import (
     crd2idx,
 )
 from .mfma_epilogues import c_shuffle_epilog, default_epilog, mfma_epilog
+
+
+# ── XCD-locality grid remap ────────────────────────────────────────────────
+# The default 2D launch is grid=(gx=n_tiles, gy=expert_blocks) walked X-fast.
+# Under multi-XCD chunked dispatch with TG_CHUNK_SIZE==1, consecutive workgroups
+# round-robin across the XCDs. With the default layout a single expert-block (one
+# gy row) spans the whole X axis, so that expert's n_tiles scatter across all
+# XCDs and every XCD pulls the same expert weights into its own L2 (zero reuse).
+#
+# Remap to a 3D grid (NUM_XCD, gx, ceil(gy/NUM_XCD)):
+#   block_id.x -> xcd   (0..NUM_XCD-1, one per XCD via chunk=1)
+#   block_id.y -> n_tile  (walks the full original gx)
+#   block_id.z -> expert-block group
+#   expert_block = z*NUM_XCD + xcd
+# X-fast walk then sends (x=0..7,y=0) to XCD0..7, (x=*,y=1) again to XCD0..7, ...
+# so each XCD completes ALL n_tiles of one expert before advancing to the next
+# expert (z+1) -> that expert's weights stay resident in the XCD's L2.
+# gy need not be a multiple of NUM_XCD: trailing blocks (expert_block >= gy) are
+# dropped by the existing blk_valid guard (bx_m >= max_token/num_valid).
+MOE_XCD_REMAP = os.environ.get("AITER_MOE_XCD_REMAP", "1") not in ("0", "false", "False")
+# XCD remap axis selector (only meaningful when MOE_XCD_REMAP is on).
+#   default (gy-first): split the sorted-M / expert-block axis (gy) across XCDs ->
+#     grid=(NUM_XCD, gx, ceil(gy/NUM_XCD)). Each XCD owns a token-block slice and
+#     sweeps all n_tiles per block => input-activation (token) stays L2-resident.
+#   AITER_MOE_XCD_GX=1 (gx-first): split the N / n_tile axis (gx) across XCDs ->
+#     grid=(NUM_XCD, gy, ceil(gx/NUM_XCD)). Each XCD owns an n_tile slice and sweeps
+#     all M blocks per n_tile => expert-weight (B) stays L2-resident.
+# In gx-first the rounding overruns the N (by) axis instead of the M (bx) axis, so
+# the out-of-range guard is on by < n_tiles (folded into blk_valid) and bx is always
+# in range.
+MOE_XCD_REMAP_GX = os.environ.get("AITER_MOE_XCD_GX", "0") not in ("0", "false", "False")
+MOE_NUM_XCD = int(os.environ.get("AITER_MOE_NUM_XCD", "8"))
+# Debug probe: when set, each workgroup's leader thread prints the
+# (block.x, block.y, block.z) -> (expert_block bx, n_tile by, hw XCD id) mapping
+# via gpu.printf so the real-kernel (x,y,z)<->XCD correspondence can be inspected.
+MOE_XCD_DEBUG = os.environ.get("AITER_MOE_XCD_DEBUG", "0") not in ("0", "false", "False")
+# Stage2 output bypass-L2 experiment. Stage2 has two output paths -- in-kernel
+# atomic accumulation (accumulate=True) and per-(token,slot) store + a separate
+# reduction kernel (accumulate=False). The final MoE output has no intra-XCD
+# reuse under XCD remap (a token's topk partials land on different XCDs), so
+# caching it mostly pollutes L2. When AITER_MOE_OUT_NT is set, mark both output
+# paths non-temporal so they stream past L2 instead of allocating lines.
+#   _OUT_ATOMIC_AUX : raw buffer-atomic cachepolicy bits. Use SLC=2 only (stream /
+#     no-L2-allocate). Do NOT set GLC for the no-return fadd -- GLC flips it to the
+#     return-value variant and faults (hipErrorIllegalAddress).
+#   _OUT_STORE_CM   : buffer_ops cache_modifier (0 = normal, 2 = non-temporal)
+MOE_OUT_NT = os.environ.get("AITER_MOE_OUT_NT", "0") not in ("0", "false", "False")
+_OUT_ATOMIC_AUX = 2 if MOE_OUT_NT else 0
+_OUT_STORE_CM = 2 if MOE_OUT_NT else 0
+# Input-activation (token) bypass-L2 experiment. When AITER_MOE_X_NT is set, the
+# X (stage1) / a2 (stage2) activation loads are marked non-temporal so they stream
+# past L2. Diagnostic: if remap's L2 gain comes from activation reuse, bypassing X
+# should collapse the L2 hit rate.
+#   _X_CM     : buffer_ops cache_modifier (0 = normal, 2 = non-temporal)
+#   _X_DMA_AUX: raw_ptr_buffer_load_lds aux (SLC=2) for the async-copy path
+MOE_X_NT = os.environ.get("AITER_MOE_X_NT", "0") not in ("0", "false", "False")
+_X_CM = 2 if MOE_X_NT else 0
+_X_DMA_AUX = 2 if MOE_X_NT else 0
+# Weight (B) cache-policy override. The per-kernel `b_nt` is parsed from the tuned
+# kernel name (b_nt=2 => weights non-temporal/bypass-L2, the default for most
+# configs; only `_bnt0` names use b_nt=0 => weights cached). Set AITER_MOE_B_NT to
+# force a single value across ALL flydsl moe kernels (e.g. 0 = force weights into
+# L2) for clean L2 diagnosis. Empty = keep each kernel's own b_nt.
+_MOE_B_NT_OVERRIDE = os.environ.get("AITER_MOE_B_NT", "")
+# Scale + index/metadata bypass-L2 experiment. The quant scales (scale_x per token,
+# scale_w per expert) and the routing metadata (sorted_token_ids / expert_ids /
+# sorted_weights / max_token_id) are small but very hot -- they stay in L2 and
+# nearly always hit, so they dominate the residual L2 hit rate even when X/B/OUT
+# are all bypassed. When AITER_MOE_SCALE_NT is set, mark these loads non-temporal
+# too, to confirm they are the source of the leftover hits.
+#   _SCALE_CM: buffer_ops cache_modifier (0 = normal, 2 = non-temporal)
+MOE_SCALE_NT = os.environ.get("AITER_MOE_SCALE_NT", "0") not in ("0", "false", "False")
+_SCALE_CM = 2 if MOE_SCALE_NT else 0
+
+
+def _eff_b_nt(b_nt):
+    """Effective weight cache_modifier: env override wins when set."""
+    return int(_MOE_B_NT_OVERRIDE) if _MOE_B_NT_OVERRIDE != "" else b_nt
 
 
 def _barrier(vmcnt=63, lgkmcnt=63):
@@ -107,6 +186,49 @@ def _s_nop(count=1):
         has_side_effects=True,
         is_align_stack=False,
     )
+
+
+def _get_xcc_id():
+    """Read the hardware XCC/XCD id via inline asm (HW_REG_XCC_ID==20, field [3:0]).
+
+    Mirrors get_xcc_id() in xcd_chunk_probe3d.hip:
+        s_getreg_b32 %0, hwreg(20, 0, 4)
+    Returns an i32 holding the XCD index of the executing workgroup.
+    """
+    return llvm.InlineAsmOp(
+        T.i32,
+        [],
+        "s_getreg_b32 $0, hwreg(20, 0, 4)",
+        "=s",
+        has_side_effects=True,
+    ).result
+
+
+def _xcd_debug_print(stage, bx, by):
+    """Leader-thread gpu.printf of (block.x,y,z) -> (bx, by, hw XCD).
+
+    No-op unless AITER_MOE_XCD_DEBUG is set. `bx` is the expert-block id and
+    `by` the n-tile id as computed by the kernel (remap or default layout), so
+    the printout shows the real launch->XCD correspondence on hardware.
+    """
+    if not MOE_XCD_DEBUG:
+        return
+    tx = gpu.thread_id("x")
+    is_leader = arith.cmpi(arith.CmpIPredicate.eq, tx, fx.Index(0))
+    _dbg_if = scf.IfOp(is_leader)
+    with _if_then(_dbg_if):
+        raw = arith._to_raw
+        bidx = arith.index_cast(T.i32, gpu.block_id("x"))
+        bidy = arith.index_cast(T.i32, gpu.block_id("y"))
+        bidz = arith.index_cast(T.i32, gpu.block_id("z"))
+        bx_i = arith.index_cast(T.i32, bx)
+        by_i = arith.index_cast(T.i32, by)
+        xcd = _get_xcc_id()
+        # flydsl gpu.printf is variadic: printf(format, v0, v1, ...) -- spread args.
+        _gpu_mlir.printf(
+            f"XCDDBG s{stage} blk=(%d,%d,%d) bx=%d by=%d -> xcd=%d\n",
+            raw(bidx), raw(bidy), raw(bidz), raw(bx_i), raw(by_i), raw(xcd),
+        )
 
 
 def _mfma_i32_16x16x64_i8(a_v4i32, b_v4i32, acc_v4i32):
@@ -201,6 +323,7 @@ def compile_moe_gemm1(
       Non-temporal cache modifier for B (weight) buffer loads.
       0 = normal caching, 2 = non-temporal (GLC+SLC).
     """
+    b_nt = _eff_b_nt(b_nt)
 
     gpu_arch = get_hip_arch()
     allocator = SmemAllocator(None, arch=gpu_arch)
@@ -507,22 +630,96 @@ def compile_moe_gemm1(
             # Align with Aiter launch mapping (NSwizzle==false):
             # - blockIdx.x -> N dimension (tile along inter_dim)
             # - blockIdx.y -> expert-block id / M dimension (tile along sorted M)
-            by = gpu.block_id("x")  # tile along inter_dim
-            bx = gpu.block_id("y")  # tile along sorted M
-
-            # Block validity: compute as early as possible so invalid blocks skip all buffer-resource
-            # setup, LDS pointer math, and gmem prefetch work.
-            bx_m = bx * fx.Index(tile_m)
-            maxids_rsrc = buffer_ops.create_buffer_resource(
-                arg_max_token_ids,
-                max_size=False,
-                num_records_bytes=fx.Index(4),
-            )
-            max_token_id_i32 = buffer_ops.buffer_load(
-                maxids_rsrc, fx.Index(0), vec_width=1, dtype=T.i32
-            )
-            bx_m_i32 = arith.index_cast(T.i32, bx_m)
-            blk_valid = arith.cmpi(arith.CmpIPredicate.ult, bx_m_i32, max_token_id_i32)
+            if MOE_XCD_REMAP and MOE_XCD_REMAP_GX:
+                # gx-first: grid=(NUM_XCD, gy, ceil(gx/NUM_XCD)). N (n_tile) is split
+                # across XCDs; bx (sorted M) walks the full gy on block_id.y so it is
+                # always in range. The rounding now overruns by (n_tile), so guard
+                # by < n_tiles and fold it into blk_valid.
+                _xcd = gpu.block_id("x")  # 0..NUM_XCD-1 (one per XCD, chunk=1)
+                bx = gpu.block_id("y")  # tile along sorted M (full range)
+                _bz = gpu.block_id("z")  # n_tile group
+                by = _bz * fx.Index(MOE_NUM_XCD) + _xcd  # tile along inter_dim (n-tile)
+                bx_m = bx * fx.Index(tile_m)
+                bx_m_i32 = arith.index_cast(T.i32, bx_m)
+                # n_tiles must match the launcher's gx = inter_in // tile_n.
+                n_tiles_i32 = arith.index_cast(T.i32, inter_in // fx.Index(tile_n))
+                by_in_range = arith.cmpi(
+                    arith.CmpIPredicate.ult, arith.index_cast(T.i32, by), n_tiles_i32
+                )
+                # Only in-range (by) blocks load max_token_id and run the token check;
+                # padding blocks (by >= n_tiles) skip the load and yield invalid directly.
+                _rng_if = scf.IfOp(by_in_range, [ir.IntegerType.get_signless(1)], has_else=True)
+                with _if_then(_rng_if):
+                    maxids_rsrc = buffer_ops.create_buffer_resource(
+                        arg_max_token_ids,
+                        max_size=False,
+                        num_records_bytes=fx.Index(4),
+                    )
+                    max_token_id_i32 = buffer_ops.buffer_load(
+                        maxids_rsrc, fx.Index(0), vec_width=1, dtype=T.i32
+                    )
+                    tok_ok = arith.cmpi(
+                        arith.CmpIPredicate.ult, bx_m_i32, max_token_id_i32
+                    )
+                    scf.YieldOp([tok_ok])
+                with _if_else(_rng_if):
+                    scf.YieldOp([arith.constant(0, type=ir.IntegerType.get_signless(1))])
+                blk_valid = _rng_if.results[0]
+            elif MOE_XCD_REMAP:
+                # grid=(NUM_XCD, gx, ceil(gy/NUM_XCD)); see MOE_XCD_REMAP note.
+                _xcd = gpu.block_id("x")  # 0..NUM_XCD-1 (one per XCD, chunk=1)
+                by = gpu.block_id("y")  # tile along inter_dim (n-tile)
+                _bz = gpu.block_id("z")  # expert-block group
+                bx = _bz * fx.Index(MOE_NUM_XCD) + _xcd  # tile along sorted M
+                # The XCD remap rounds the grid up, so bx can run past the real
+                # number of expert blocks (size_expert_ids). Flag those pure-padding
+                # blocks here and fold into blk_valid below so they exit via the
+                # whole-kernel gate (no OOB, no wasted buffer/gmem work).
+                bx_in_range = arith.cmpi(
+                    arith.CmpIPredicate.ult,
+                    arith.index_cast(T.i32, bx),
+                    i32_size_expert_ids_in,
+                )
+                # Keep bx_m / bx_m_i32 in the enclosing scope so the gated body below can
+                # use bx_m (sorted_row, _tid_row, etc.) -- they must dominate that region.
+                bx_m = bx * fx.Index(tile_m)
+                bx_m_i32 = arith.index_cast(T.i32, bx_m)
+                # Only in-range blocks load max_token_id and run the token check; padding
+                # blocks (bx >= size_expert_ids) skip the load and yield invalid directly.
+                _rng_if = scf.IfOp(bx_in_range, [ir.IntegerType.get_signless(1)], has_else=True)
+                with _if_then(_rng_if):
+                    maxids_rsrc = buffer_ops.create_buffer_resource(
+                        arg_max_token_ids,
+                        max_size=False,
+                        num_records_bytes=fx.Index(4),
+                    )
+                    max_token_id_i32 = buffer_ops.buffer_load(
+                        maxids_rsrc, fx.Index(0), vec_width=1, dtype=T.i32
+                    )
+                    tok_ok = arith.cmpi(
+                        arith.CmpIPredicate.ult, bx_m_i32, max_token_id_i32
+                    )
+                    scf.YieldOp([tok_ok])
+                with _if_else(_rng_if):
+                    scf.YieldOp([arith.constant(0, type=ir.IntegerType.get_signless(1))])
+                blk_valid = _rng_if.results[0]
+            else:
+                by = gpu.block_id("x")  # tile along inter_dim
+                bx = gpu.block_id("y")  # tile along sorted M
+                # Block validity: compute as early as possible so invalid blocks skip all buffer-resource
+                # setup, LDS pointer math, and gmem prefetch work.
+                bx_m = bx * fx.Index(tile_m)
+                maxids_rsrc = buffer_ops.create_buffer_resource(
+                    arg_max_token_ids,
+                    max_size=False,
+                    num_records_bytes=fx.Index(4),
+                )
+                max_token_id_i32 = buffer_ops.buffer_load(
+                    maxids_rsrc, fx.Index(0), vec_width=1, dtype=T.i32
+                )
+                bx_m_i32 = arith.index_cast(T.i32, bx_m)
+                blk_valid = arith.cmpi(arith.CmpIPredicate.ult, bx_m_i32, max_token_id_i32)
+            _xcd_debug_print(1, bx, by)
             # Common constants/atoms (hoisted): keep IR small like GEMM.
             # XOR16 swizzle parameter (in bytes; constant, power-of-two in our configs).
             k_blocks16 = arith.index(tile_k_bytes // 16)
@@ -744,14 +941,17 @@ def compile_moe_gemm1(
                             rsrc=x_rsrc,
                             vec_elems=vec16_elems,
                             elem_bytes=elem_bytes,
+                            cache_modifier=_X_CM,
                         )
                     # For 8B/4B, load raw i32 dwords directly.
                     if x_load_bytes == 8:
                         return buffer_ops.buffer_load(
-                            x_rsrc, idx_i32, vec_width=2, dtype=T.i32
+                            x_rsrc, idx_i32, vec_width=2, dtype=T.i32,
+                            cache_modifier=_X_CM,
                         )
                     return buffer_ops.buffer_load(
-                        x_rsrc, idx_i32, vec_width=1, dtype=T.i32
+                        x_rsrc, idx_i32, vec_width=1, dtype=T.i32,
+                        cache_modifier=_X_CM,
                     )
 
                 def load_x_tile(base_k):
@@ -1079,7 +1279,7 @@ def compile_moe_gemm1(
                                 global_offset,
                                 arith.constant(0, type=T.i32),
                                 arith.constant(0, type=T.i32),
-                                arith.constant(0, type=T.i32),
+                                arith.constant(_X_DMA_AUX, type=T.i32),
                             )
 
                     def prefetch_x_to_lds(base_k, lds_base):
@@ -1149,7 +1349,7 @@ def compile_moe_gemm1(
                                 fx.Float32(1.0)
                                 if not needs_scale_w
                                 else buffer_ops.buffer_load(
-                                    sw_rsrc, row_gate_idx, vec_width=1, dtype=T.f32
+                                    sw_rsrc, row_gate_idx, vec_width=1, dtype=T.f32, cache_modifier=_SCALE_CM
                                 )
                             )
                             if use_g1u1:
@@ -1158,7 +1358,7 @@ def compile_moe_gemm1(
                                     fx.Float32(1.0)
                                     if not needs_scale_w
                                     else buffer_ops.buffer_load(
-                                        sw_rsrc, row_up_idx, vec_width=1, dtype=T.f32
+                                        sw_rsrc, row_up_idx, vec_width=1, dtype=T.f32, cache_modifier=_SCALE_CM
                                     )
                                 )
                         epilogue_pf = (sw_gate_pf, sw_up_pf)
@@ -1574,7 +1774,7 @@ def compile_moe_gemm1(
                             fx.Float32(1.0)
                             if not needs_scale_w
                             else buffer_ops.buffer_load(
-                                sw_rsrc, row_gate_idx, vec_width=1, dtype=T.f32
+                                sw_rsrc, row_gate_idx, vec_width=1, dtype=T.f32, cache_modifier=_SCALE_CM
                             )
                         )
                         if use_g1u1:
@@ -1582,7 +1782,7 @@ def compile_moe_gemm1(
                                 fx.Float32(1.0)
                                 if not needs_scale_w
                                 else buffer_ops.buffer_load(
-                                    sw_rsrc, row_up_idx, vec_width=1, dtype=T.f32
+                                    sw_rsrc, row_up_idx, vec_width=1, dtype=T.f32, cache_modifier=_SCALE_CM
                                 )
                             )
                         else:
@@ -1630,7 +1830,7 @@ def compile_moe_gemm1(
                                 else arith.select(
                                     t_valid,
                                     buffer_ops.buffer_load(
-                                        sx_rsrc, ts2, vec_width=1, dtype=T.f32
+                                        sx_rsrc, ts2, vec_width=1, dtype=T.f32, cache_modifier=_SCALE_CM
                                     ),
                                     fx.Float32(0.0),
                                 )
@@ -1642,7 +1842,7 @@ def compile_moe_gemm1(
                                 else arith.select(
                                     t_valid,
                                     buffer_ops.buffer_load(
-                                        sx_rsrc, t2, vec_width=1, dtype=T.f32
+                                        sx_rsrc, t2, vec_width=1, dtype=T.f32, cache_modifier=_SCALE_CM
                                     ),
                                     fx.Float32(0.0),
                                 )
@@ -1762,7 +1962,7 @@ def compile_moe_gemm1(
                             else arith.select(
                                 t_valid,
                                 buffer_ops.buffer_load(
-                                    sx_rsrc, ts2, vec_width=1, dtype=T.f32
+                                    sx_rsrc, ts2, vec_width=1, dtype=T.f32, cache_modifier=_SCALE_CM
                                 ),
                                 fx.Float32(0.0),
                             )
@@ -1774,7 +1974,7 @@ def compile_moe_gemm1(
                             else arith.select(
                                 t_valid,
                                 buffer_ops.buffer_load(
-                                    sx_rsrc, t2, vec_width=1, dtype=T.f32
+                                    sx_rsrc, t2, vec_width=1, dtype=T.f32, cache_modifier=_SCALE_CM
                                 ),
                                 fx.Float32(0.0),
                             )
@@ -1873,6 +2073,18 @@ def compile_moe_gemm1(
         size_expert_ids_in = arith.index_cast(T.index, i32_size_expert_ids_in)
         gx = inter_in // fx.Index(tile_n)
         gy = size_expert_ids_in
+        if MOE_XCD_REMAP:
+            if MOE_XCD_REMAP_GX:
+                # (NUM_XCD, expert_blocks, ceil(n_tiles/NUM_XCD)): split N across XCDs
+                # so each XCD keeps its weight n_tile slice L2-resident.
+                gz = (gx + fx.Index(MOE_NUM_XCD - 1)) // fx.Index(MOE_NUM_XCD)
+                grid_dims = (fx.Index(MOE_NUM_XCD), gy, gz)
+            else:
+                # (NUM_XCD, n_tiles, ceil(expert_blocks/NUM_XCD)) for XCD L2 locality
+                gz = (gy + fx.Index(MOE_NUM_XCD - 1)) // fx.Index(MOE_NUM_XCD)
+                grid_dims = (fx.Index(MOE_NUM_XCD), gx, gz)
+        else:
+            grid_dims = (gx, gy, 1)
 
         moe_gemm1(
             arg_out,
@@ -1889,7 +2101,7 @@ def compile_moe_gemm1(
             i32_k_in,
             i32_size_expert_ids_in,
         ).launch(
-            grid=(gx, gy, 1),
+            grid=grid_dims,
             block=(total_threads, 1, 1),
             stream=stream,
         )
@@ -1941,6 +2153,7 @@ def compile_moe_gemm2(
       Non-temporal cache modifier for B (weight) buffer loads.
       0 = normal caching, 2 = non-temporal (GLC+SLC).
     """
+    b_nt = _eff_b_nt(b_nt)
     gpu_arch = get_hip_arch()
     allocator = SmemAllocator(None, arch=gpu_arch)
 
@@ -2215,8 +2428,40 @@ def compile_moe_gemm2(
             # Align with Aiter launch mapping:
             # - blockIdx.x -> N dimension (tile along model_dim)
             # - blockIdx.y -> expert-block id / M dimension (tile along sorted M)
-            by = gpu.block_id("x")  # tile along model_dim
-            bx = gpu.block_id("y")  # tile along sorted M
+            if MOE_XCD_REMAP and MOE_XCD_REMAP_GX:
+                # gx-first: grid=(NUM_XCD, gy, ceil(gx/NUM_XCD)). N (n_tile) split across
+                # XCDs; bx (sorted M) walks the full gy on block_id.y => always in range.
+                # The rounding overruns by (n_tile), so guard by < n_tiles (folded into
+                # blk_valid below).
+                _xcd = gpu.block_id("x")  # 0..NUM_XCD-1 (one per XCD, chunk=1)
+                bx = gpu.block_id("y")  # tile along sorted M (full range)
+                _bz = gpu.block_id("z")  # n_tile group
+                by = _bz * fx.Index(MOE_NUM_XCD) + _xcd  # tile along model_dim (n-tile)
+                # n_tiles must match the launcher's gx = n_in // tile_n.
+                _n_tiles_i32 = arith.index_cast(T.i32, n_in // fx.Index(tile_n))
+                by_in_range = arith.cmpi(
+                    arith.CmpIPredicate.ult, arith.index_cast(T.i32, by), _n_tiles_i32
+                )
+            elif MOE_XCD_REMAP:
+                # grid=(NUM_XCD, gx, ceil(gy/NUM_XCD)); see MOE_XCD_REMAP note.
+                _xcd = gpu.block_id("x")  # 0..NUM_XCD-1 (one per XCD, chunk=1)
+                by = gpu.block_id("y")  # tile along model_dim (n-tile)
+                _bz = gpu.block_id("z")  # expert-block group
+                bx = _bz * fx.Index(MOE_NUM_XCD) + _xcd  # tile along sorted M
+                # The XCD remap rounds the grid up, so bx can run past the real
+                # number of expert blocks (size_expert_ids). Flag those pure-padding
+                # blocks here and fold into blk_valid below so they exit via the
+                # whole-kernel gate (no OOB, no wasted buffer/gmem work).
+                bx_in_range = arith.cmpi(
+                    arith.CmpIPredicate.ult,
+                    arith.index_cast(T.i32, bx),
+                    i32_size_expert_ids_in,
+                )
+            else:
+                by = gpu.block_id("x")  # tile along model_dim
+                bx = gpu.block_id("y")  # tile along sorted M
+
+            _xcd_debug_print(2, bx, by)
 
             # XOR16 swizzle parameter (in bytes; constant, power-of-two in our configs).
             k_blocks16 = arith.index(tile_k_bytes // 16)
@@ -2337,16 +2582,67 @@ def compile_moe_gemm2(
 
             # Early-exit guard (as in 2ce65fb): some routing paths can produce extra/garbage
             # expert blocks beyond `num_valid_ids`. Skip those blocks entirely to avoid OOB.
-            numids_rsrc = buffer_ops.create_buffer_resource(
-                arg_num_valid_ids,
-                max_size=False,
-                num_records_bytes=fx.Index(4),
-            )
-            num_valid_i32 = buffer_ops.buffer_load(
-                numids_rsrc, fx.Index(0), vec_width=1, dtype=T.i32
-            )
             bx_m_i32 = arith.index_cast(T.i32, bx_m)
-            blk_valid = arith.cmpi(arith.CmpIPredicate.ult, bx_m_i32, num_valid_i32)
+            if MOE_XCD_REMAP and not MOE_XCD_REMAP_GX:
+                # Only in-range blocks load num_valid_ids and run the token check; padding
+                # blocks (bx >= size_expert_ids) skip the load and yield invalid directly.
+                # num_valid_i32 is also yielded out (the gated body uses it in precompute_row);
+                # padding blocks yield a dummy 0 that is never consumed (blk_valid is False).
+                _i1_ty = ir.IntegerType.get_signless(1)
+                _rng_if = scf.IfOp(bx_in_range, [_i1_ty, T.i32], has_else=True)
+                with _if_then(_rng_if):
+                    numids_rsrc = buffer_ops.create_buffer_resource(
+                        arg_num_valid_ids,
+                        max_size=False,
+                        num_records_bytes=fx.Index(4),
+                    )
+                    _nv = buffer_ops.buffer_load(
+                        numids_rsrc, fx.Index(0), vec_width=1, dtype=T.i32
+                    )
+                    tok_ok = arith.cmpi(arith.CmpIPredicate.ult, bx_m_i32, _nv)
+                    scf.YieldOp([tok_ok, _nv])
+                with _if_else(_rng_if):
+                    scf.YieldOp(
+                        [arith.constant(0, type=_i1_ty), arith.constant(0, type=T.i32)]
+                    )
+                blk_valid = _rng_if.results[0]
+                num_valid_i32 = _rng_if.results[1]
+            elif MOE_XCD_REMAP and MOE_XCD_REMAP_GX:
+                # gx-first: bx (sorted M) is always in range; the rounding overruns by
+                # (n_tile). Only in-range (by) blocks load num_valid_ids and run the token
+                # check; padding blocks (by >= n_tiles) skip the load and yield invalid.
+                _i1_ty = ir.IntegerType.get_signless(1)
+                _rng_if = scf.IfOp(by_in_range, [_i1_ty, T.i32], has_else=True)
+                with _if_then(_rng_if):
+                    numids_rsrc = buffer_ops.create_buffer_resource(
+                        arg_num_valid_ids,
+                        max_size=False,
+                        num_records_bytes=fx.Index(4),
+                    )
+                    _nv = buffer_ops.buffer_load(
+                        numids_rsrc, fx.Index(0), vec_width=1, dtype=T.i32
+                    )
+                    tok_ok = arith.cmpi(arith.CmpIPredicate.ult, bx_m_i32, _nv)
+                    scf.YieldOp([tok_ok, _nv])
+                with _if_else(_rng_if):
+                    scf.YieldOp(
+                        [arith.constant(0, type=_i1_ty), arith.constant(0, type=T.i32)]
+                    )
+                blk_valid = _rng_if.results[0]
+                num_valid_i32 = _rng_if.results[1]
+            else:
+                # non-remap: bx (sorted M) is always in range, so load num_valid directly.
+                numids_rsrc = buffer_ops.create_buffer_resource(
+                    arg_num_valid_ids,
+                    max_size=False,
+                    num_records_bytes=fx.Index(4),
+                )
+                num_valid_i32 = buffer_ops.buffer_load(
+                    numids_rsrc, fx.Index(0), vec_width=1, dtype=T.i32
+                )
+                blk_valid = arith.cmpi(
+                    arith.CmpIPredicate.ult, bx_m_i32, num_valid_i32
+                )
 
             def _moe_gemm2_then_body():
                 # Expert id for this M tile.
@@ -2418,13 +2714,16 @@ def compile_moe_gemm2(
                             rsrc=x_rsrc,
                             vec_elems=vec16_elems,
                             elem_bytes=elem_bytes,
+                            cache_modifier=_X_CM,
                         )
                     if x_load_bytes == 8:
                         return buffer_ops.buffer_load(
-                            x_rsrc, idx_i32, vec_width=2, dtype=T.i32
+                            x_rsrc, idx_i32, vec_width=2, dtype=T.i32,
+                            cache_modifier=_X_CM,
                         )
                     return buffer_ops.buffer_load(
-                        x_rsrc, idx_i32, vec_width=1, dtype=T.i32
+                        x_rsrc, idx_i32, vec_width=1, dtype=T.i32,
+                        cache_modifier=_X_CM,
                     )
 
                 # decode routed token once (per thread's M-slice) and build a base offset.
@@ -2756,7 +3055,7 @@ def compile_moe_gemm2(
                                 global_offset,
                                 arith.constant(0, type=T.i32),
                                 arith.constant(0, type=T.i32),
-                                arith.constant(0, type=T.i32),
+                                arith.constant(_X_DMA_AUX, type=T.i32),
                             )
 
                     def prefetch_x_to_lds(base_k, lds_base):
@@ -2820,7 +3119,7 @@ def compile_moe_gemm2(
                                 fx.Float32(1.0)
                                 if not needs_scale_w
                                 else buffer_ops.buffer_load(
-                                    sw_rsrc, row_w_idx, vec_width=1, dtype=T.f32
+                                    sw_rsrc, row_w_idx, vec_width=1, dtype=T.f32, cache_modifier=_SCALE_CM
                                 )
                             )
                         # Also prefetch per-row routed/topk weights (sorted_weights) when enabled.
@@ -3250,6 +3549,7 @@ def compile_moe_gemm2(
                 topk_i32_v = topk_i32
 
                 zero_i32 = fx.Int32(0)
+                out_aux_i32 = fx.Int32(_OUT_ATOMIC_AUX)  # buffer-atomic cachepolicy (bypass L2 when set)
                 c2_i32 = fx.Int32(2)  # 2B element size for f16/bf16
                 mask_even_i32 = fx.Int32(
                     0xFFFFFFFE
@@ -3263,7 +3563,7 @@ def compile_moe_gemm2(
                         out_rsrc,
                         byte_off_i32,
                         zero_i32,
-                        zero_i32,
+                        out_aux_i32,
                     )
 
                 sw_pf = None
@@ -3283,7 +3583,7 @@ def compile_moe_gemm2(
                             fx.Float32(1.0)
                             if not needs_scale_w
                             else buffer_ops.buffer_load(
-                                sw_rsrc, row_w_idx, vec_width=1, dtype=T.f32
+                                sw_rsrc, row_w_idx, vec_width=1, dtype=T.f32, cache_modifier=_SCALE_CM
                             )
                         )
 
@@ -3297,7 +3597,7 @@ def compile_moe_gemm2(
                             out_rsrc,
                             byte_off_i32,
                             zero_i32,
-                            zero_i32,
+                            out_aux_i32,
                         )
 
                     def _stage2_row_atomic(*, mi: int, ii: int, row_in_tile, row):
@@ -3319,7 +3619,7 @@ def compile_moe_gemm2(
                             else arith.select(
                                 ts_ok,
                                 buffer_ops.buffer_load(
-                                    sx_rsrc, ts2, vec_width=1, dtype=T.f32
+                                    sx_rsrc, ts2, vec_width=1, dtype=T.f32, cache_modifier=_SCALE_CM
                                 ),
                                 fx.Float32(0.0),
                             )
@@ -3410,7 +3710,7 @@ def compile_moe_gemm2(
                             else arith.select(
                                 ts_ok,
                                 buffer_ops.buffer_load(
-                                    sx_rsrc, ts2, vec_width=1, dtype=T.f32
+                                    sx_rsrc, ts2, vec_width=1, dtype=T.f32, cache_modifier=_SCALE_CM
                                 ),
                                 fx.Float32(0.0),
                             )
@@ -3565,6 +3865,18 @@ def compile_moe_gemm2(
         size_expert_ids_in = arith.index_cast(T.index, i32_size_expert_ids_in)
         gx = n_in // fx.Index(tile_n)
         gy = size_expert_ids_in
+        if MOE_XCD_REMAP:
+            if MOE_XCD_REMAP_GX:
+                # (NUM_XCD, expert_blocks, ceil(n_tiles/NUM_XCD)): split N across XCDs
+                # so each XCD keeps its weight n_tile slice L2-resident.
+                gz = (gx + fx.Index(MOE_NUM_XCD - 1)) // fx.Index(MOE_NUM_XCD)
+                grid_dims = (fx.Index(MOE_NUM_XCD), gy, gz)
+            else:
+                # (NUM_XCD, n_tiles, ceil(expert_blocks/NUM_XCD)) for XCD L2 locality
+                gz = (gy + fx.Index(MOE_NUM_XCD - 1)) // fx.Index(MOE_NUM_XCD)
+                grid_dims = (fx.Index(MOE_NUM_XCD), gx, gz)
+        else:
+            grid_dims = (gx, gy, 1)
 
         moe_gemm2(
             arg_out,
@@ -3581,7 +3893,7 @@ def compile_moe_gemm2(
             i32_k_in,
             i32_size_expert_ids_in,
         ).launch(
-            grid=(gx, gy, 1),
+            grid=grid_dims,
             block=(total_threads, 1, 1),
             stream=stream,
         )
@@ -3741,7 +4053,9 @@ def compile_moe_reduction(
                                 v = arith.trunc_f(elem_type(), v)
                             y_idx = token_idx * c_model_dim + col
                             y_idx_i32 = arith.index_cast(i32_type(), y_idx)
-                            buffer_ops.buffer_store(v, y_rsrc, y_idx_i32)
+                            buffer_ops.buffer_store(
+                                v, y_rsrc, y_idx_i32, cache_modifier=_OUT_STORE_CM
+                            )
 
                     with _if_else(_if_full):
                         # Tail path: scalar load/store per lane.
@@ -3799,7 +4113,9 @@ def compile_moe_reduction(
                                     out = arith.trunc_f(elem_type(), out)
                                 y_idx = token_idx * c_model_dim + col
                                 y_idx_i32 = arith.index_cast(i32_type(), y_idx)
-                                buffer_ops.buffer_store(out, y_rsrc, y_idx_i32)
+                                buffer_ops.buffer_store(
+                                    out, y_rsrc, y_idx_i32, cache_modifier=_OUT_STORE_CM
+                                )
 
     # ── Host launcher (flyc.jit + .launch) ────────────────────────────────
     tile_size = BLOCK_SIZE * VEC_WIDTH

@@ -484,6 +484,7 @@ def buffer_copy_gmem16_dwordx4(
     rsrc,
     vec_elems: int = 16,
     elem_bytes: int = 1,
+    cache_modifier: int = 0,
 ):
     """Copy 16 bytes from global memory into regs via buffer-load dwordx4 lowering."""
     if int(vec_elems) <= 0:
@@ -497,6 +498,7 @@ def buffer_copy_gmem16_dwordx4(
         vec_elems=vec_elems,
         elem_bytes=elem_bytes,
         offset_in_bytes=False,
+        cache_modifier=cache_modifier,
     )
 
 
