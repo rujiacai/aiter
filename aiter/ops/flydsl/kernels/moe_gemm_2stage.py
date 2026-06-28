@@ -89,6 +89,16 @@ MOE_XCD_REMAP = os.environ.get("AITER_MOE_XCD_REMAP", "1") not in ("0", "false",
 # in range.
 MOE_XCD_REMAP_GX = os.environ.get("AITER_MOE_XCD_GX", "0") not in ("0", "false", "False")
 MOE_NUM_XCD = int(os.environ.get("AITER_MOE_NUM_XCD", "8"))
+# Split-K dispatch axis (experiment): where the k_batch factor is folded into the
+# launch grid (only the gy-first remap branch honors this; other modes use "z").
+#   "z" (default): grid=(NUM_XCD, gx, ceil(gy/NUM_XCD)*k_batch); blockIdx.z encodes
+#       group*k_batch+kz. The kz partials of one output tile dispatch ~8*gx apart
+#       (separate rounds) -> the shared atomic output tile is evicted from L2
+#       between partial writes.
+#   "y": grid=(NUM_XCD, gx*k_batch, ceil(gy/NUM_XCD)); blockIdx.y encodes
+#       n_tile*k_batch+kz so a tile's kz partials are adjacent in dispatch order
+#       -> the atomic output tile stays L2-resident across its accumulation.
+MOE_SPLITK_AXIS = os.environ.get("AITER_MOE_SPLITK_AXIS", "z")
 # Debug probe: when set, each workgroup's leader thread prints the
 # (block.x, block.y, block.z) -> (expert_block bx, n_tile by, hw XCD id) mapping
 # via gpu.printf so the real-kernel (x,y,z)<->XCD correspondence can be inspected.
@@ -135,6 +145,62 @@ _SCALE_CM = 2 if MOE_SCALE_NT else 0
 def _eff_b_nt(b_nt):
     """Effective weight cache_modifier: env override wins when set."""
     return int(_MOE_B_NT_OVERRIDE) if _MOE_B_NT_OVERRIDE != "" else b_nt
+
+
+# Canonical default knobs (the env-derived module globals above are the defaults).
+# The dispatch/remap/cache knobs used to be process-wide env globals; they are now
+# per-compile tuning parameters. compile_moe_gemm{1,2} resolve them into LOCALS that
+# shadow the module globals of the same name, so every reference inside the kernel
+# builders (closures) automatically picks up the per-call value.
+def _resolve_moe_knobs(remap, splitk_axis, x_nt, scale_nt, out_nt):
+    """Resolve per-compile dispatch/cache knobs.
+
+    Each arg is None => fall back to the env-derived module default.
+      remap       : "gy" | "gx" | "off"  (XCD remap axis; gy is the canonical default)
+      splitk_axis : "z"  | "y"           (split-K grid fold axis)
+      x_nt        : 0 | 2                 (input-activation load cache_modifier)
+      scale_nt    : 0 | 2                 (scale + routing-metadata cache_modifier)
+      out_nt      : 0 | 2                 (output atomic/store cache_modifier)
+    Returns: (xcd_remap, xcd_remap_gx, splitk_axis,
+              x_cm, x_dma_aux, scale_cm, out_atomic_aux, out_store_cm)
+    """
+    if remap is None:
+        rmp, rgx = MOE_XCD_REMAP, MOE_XCD_REMAP_GX
+    elif remap == "gy":
+        rmp, rgx = True, False
+    elif remap == "gx":
+        rmp, rgx = True, True
+    elif remap == "off":
+        rmp, rgx = False, False
+    else:
+        raise ValueError(f"remap must be 'gy'|'gx'|'off'|None, got {remap!r}")
+    axis = MOE_SPLITK_AXIS if splitk_axis is None else splitk_axis
+    if axis not in ("z", "y"):
+        raise ValueError(f"splitk_axis must be 'z'|'y'|None, got {splitk_axis!r}")
+    x_cm = _X_CM if x_nt is None else (2 if x_nt else 0)
+    x_aux = _X_DMA_AUX if x_nt is None else (2 if x_nt else 0)
+    sc_cm = _SCALE_CM if scale_nt is None else (2 if scale_nt else 0)
+    o_aux = _OUT_ATOMIC_AUX if out_nt is None else (2 if out_nt else 0)
+    o_cm = _OUT_STORE_CM if out_nt is None else (2 if out_nt else 0)
+    return rmp, rgx, axis, x_cm, x_aux, sc_cm, o_aux, o_cm
+
+
+def _moe_knob_tags(xcd_remap, xcd_remap_gx, x_cm, scale_cm, out_aux):
+    """Kernel-name suffix for the resolved knobs. Canonical defaults (remap=gy and
+    all caches normal) produce an EMPTY tag so existing tuned-kernel names and their
+    cached artifacts are byte-identical."""
+    if not xcd_remap:
+        remap_tag = "_roff"
+    elif xcd_remap_gx:
+        remap_tag = "_rgx"
+    else:
+        remap_tag = ""  # gy (canonical default)
+    return (
+        remap_tag
+        + ("_xnt" if x_cm else "")
+        + ("_snt" if scale_cm else "")
+        + ("_ont" if out_aux else "")
+    )
 
 
 def _barrier(vmcnt=63, lgkmcnt=63):
@@ -300,6 +366,11 @@ def compile_moe_gemm1(
     waves_per_eu: int = 3,
     b_nt: int = 2,
     k_batch: int = 1,
+    remap: str | None = None,
+    splitk_axis: str | None = None,
+    x_nt: int | None = None,
+    scale_nt: int | None = None,
+    out_nt: int | None = None,
 ):
     """Compile stage1 kernel (`moe_gemm1`) and return the compiled executable.
 
@@ -323,8 +394,25 @@ def compile_moe_gemm1(
     b_nt:
       Non-temporal cache modifier for B (weight) buffer loads.
       0 = normal caching, 2 = non-temporal (GLC+SLC).
+
+    remap / splitk_axis / x_nt / scale_nt / out_nt:
+      Per-compile dispatch & cache-policy knobs (None => env default). They shadow
+      the module globals of the same name so the kernel builder picks up per-call
+      values; see _resolve_moe_knobs / _moe_knob_tags.
     """
     b_nt = _eff_b_nt(b_nt)
+    # Resolve dispatch/cache knobs into LOCALS that shadow the module globals; all
+    # references inside the nested moe_gemm1 builder resolve to these.
+    (
+        MOE_XCD_REMAP,
+        MOE_XCD_REMAP_GX,
+        MOE_SPLITK_AXIS,
+        _X_CM,
+        _X_DMA_AUX,
+        _SCALE_CM,
+        _OUT_ATOMIC_AUX,
+        _OUT_STORE_CM,
+    ) = _resolve_moe_knobs(remap, splitk_axis, x_nt, scale_nt, out_nt)
 
     gpu_arch = get_hip_arch()
     allocator = SmemAllocator(None, arch=gpu_arch)
@@ -404,7 +492,14 @@ def compile_moe_gemm1(
             )
     else:
         _k_per_batch1 = int(model_dim)
-    _sk_tag1 = f"_sk{k_batch}" if _is_splitk1 else ""
+    # Encode the split-K dispatch axis in the kernel tag so the y-axis variant does
+    # not collide with the z-axis artifact in the (name-keyed) flydsl/disk cache.
+    _sk_axis_tag1 = (
+        "y"
+        if (_is_splitk1 and MOE_SPLITK_AXIS == "y" and MOE_XCD_REMAP and not MOE_XCD_REMAP_GX)
+        else ""
+    )
+    _sk_tag1 = f"_sk{k_batch}{_sk_axis_tag1}" if _is_splitk1 else ""
 
     _is_gfx950 = str(gpu_arch).startswith("gfx950")
     _use_k64_mfma = _is_gfx950 and is_int8
@@ -497,9 +592,12 @@ def compile_moe_gemm1(
     _use_wptr64 = _w_nbytes_static >= (1 << 31)
     _wptr64_tag = "_wptr64" if _use_wptr64 else ""
 
+    _knob_tag = _moe_knob_tags(
+        MOE_XCD_REMAP, MOE_XCD_REMAP_GX, _X_CM, _SCALE_CM, _OUT_ATOMIC_AUX
+    )
     module_name = (
         f"mfma_moe1_{g1u_tag}_{in_dtype}_{out_dtype}_{epilog_tag}"
-        f"_t{tile_m}x{tile_n}x{tile_k}{_async_tag}{_wpe_tag}{_bnt_tag}{_wptr64_tag}{_sk_tag1}"
+        f"_t{tile_m}x{tile_n}x{tile_k}{_async_tag}{_wpe_tag}{_bnt_tag}{_wptr64_tag}{_sk_tag1}{_knob_tag}"
         f"_abi6_wptr64gate"  # ABI bumped: optional 64-bit W load path gated by static size check
     ).replace("-", "_")
 
@@ -664,10 +762,16 @@ def compile_moe_gemm1(
             layout_lds = fx.make_layout(shape_lds, stride_lds)
 
             tx = gpu.thread_id("x")
-            # Split-K: blockIdx.z encodes (group * k_batch + kz). kz selects the
-            # K-slice [kz*K_per_batch, (kz+1)*K_per_batch); `group` is the original
-            # z-grouping used by the XCD remap (n-tile / expert-block group).
-            if _is_splitk1:
+            # Split-K dispatch axis (see MOE_SPLITK_AXIS). "y" only applies to the
+            # gy-first remap branch; kz/k_start are then derived from blockIdx.y
+            # inside that branch. Otherwise blockIdx.z encodes group*k_batch+kz.
+            _sk_axis_y1 = (
+                _is_splitk1
+                and MOE_SPLITK_AXIS == "y"
+                and MOE_XCD_REMAP
+                and not MOE_XCD_REMAP_GX
+            )
+            if _is_splitk1 and not _sk_axis_y1:
                 _bidz_sk = gpu.block_id("z")
                 kz_sk = _bidz_sk % fx.Index(k_batch)
                 _sk_group_z = _bidz_sk // fx.Index(k_batch)
@@ -716,8 +820,18 @@ def compile_moe_gemm1(
             elif MOE_XCD_REMAP:
                 # grid=(NUM_XCD, gx, ceil(gy/NUM_XCD)); see MOE_XCD_REMAP note.
                 _xcd = gpu.block_id("x")  # 0..NUM_XCD-1 (one per XCD, chunk=1)
-                by = gpu.block_id("y")  # tile along inter_dim (n-tile)
-                _bz = _sk_group_z if _is_splitk1 else gpu.block_id("z")  # expert-block group
+                if _sk_axis_y1:
+                    # Split-K on the -2 axis: blockIdx.y = n_tile*k_batch + kz, so a
+                    # tile's kz partials are adjacent in dispatch order. blockIdx.z is
+                    # the pure expert-block group.
+                    _bycomb = gpu.block_id("y")
+                    by = _bycomb // fx.Index(k_batch)  # tile along inter_dim (n-tile)
+                    kz_sk = _bycomb % fx.Index(k_batch)
+                    k_start = kz_sk * fx.Index(_k_per_batch1)
+                    _bz = gpu.block_id("z")  # expert-block group
+                else:
+                    by = gpu.block_id("y")  # tile along inter_dim (n-tile)
+                    _bz = _sk_group_z if _is_splitk1 else gpu.block_id("z")  # expert-block group
                 bx = _bz * fx.Index(MOE_NUM_XCD) + _xcd  # tile along sorted M
                 # The XCD remap rounds the grid up, so bx can run past the real
                 # number of expert blocks (size_expert_ids). Flag those pure-padding
@@ -2304,8 +2418,13 @@ def compile_moe_gemm1(
             else:
                 # (NUM_XCD, n_tiles, ceil(expert_blocks/NUM_XCD)) for XCD L2 locality
                 gz = (gy + fx.Index(MOE_NUM_XCD - 1)) // fx.Index(MOE_NUM_XCD)
-                gz = gz * _sk_kb if _is_splitk1 else gz
-                grid_dims = (fx.Index(MOE_NUM_XCD), gx, gz)
+                if _is_splitk1 and MOE_SPLITK_AXIS == "y":
+                    # Split-K on the -2 axis: fold k_batch into the n_tile dim so a
+                    # tile's kz partials dispatch adjacently (output stays L2-hot).
+                    grid_dims = (fx.Index(MOE_NUM_XCD), gx * _sk_kb, gz)
+                else:
+                    gz = gz * _sk_kb if _is_splitk1 else gz
+                    grid_dims = (fx.Index(MOE_NUM_XCD), gx, gz)
         else:
             grid_dims = (gx, gy, _sk_kb) if _is_splitk1 else (gx, gy, 1)
 
@@ -2352,6 +2471,11 @@ def compile_moe_gemm2(
     waves_per_eu: int = 3,
     b_nt: int = 2,
     k_batch: int = 1,
+    remap: str | None = None,
+    splitk_axis: str | None = None,
+    x_nt: int | None = None,
+    scale_nt: int | None = None,
+    out_nt: int | None = None,
 ):
     """Compile stage2 kernel (`moe_gemm2`) and return the compiled executable.
 
@@ -2376,8 +2500,22 @@ def compile_moe_gemm2(
     b_nt:
       Non-temporal cache modifier for B (weight) buffer loads.
       0 = normal caching, 2 = non-temporal (GLC+SLC).
+
+    remap / splitk_axis / x_nt / scale_nt / out_nt:
+      Per-compile dispatch & cache-policy knobs (None => env default); see
+      _resolve_moe_knobs / _moe_knob_tags.
     """
     b_nt = _eff_b_nt(b_nt)
+    (
+        MOE_XCD_REMAP,
+        MOE_XCD_REMAP_GX,
+        MOE_SPLITK_AXIS,
+        _X_CM,
+        _X_DMA_AUX,
+        _SCALE_CM,
+        _OUT_ATOMIC_AUX,
+        _OUT_STORE_CM,
+    ) = _resolve_moe_knobs(remap, splitk_axis, x_nt, scale_nt, out_nt)
     gpu_arch = get_hip_arch()
     allocator = SmemAllocator(None, arch=gpu_arch)
 
@@ -2438,7 +2576,12 @@ def compile_moe_gemm2(
             )
     else:
         _k_per_batch2 = int(inter_dim)
-    _sk_tag2 = f"_sk{k_batch}" if _is_splitk2 else ""
+    _sk_axis_tag2 = (
+        "y"
+        if (_is_splitk2 and MOE_SPLITK_AXIS == "y" and MOE_XCD_REMAP and not MOE_XCD_REMAP_GX)
+        else ""
+    )
+    _sk_tag2 = f"_sk{k_batch}{_sk_axis_tag2}" if _is_splitk2 else ""
 
     _is_gfx950 = str(gpu_arch).startswith("gfx950")
     _use_k64_mfma = _is_gfx950 and is_int8
@@ -2555,9 +2698,12 @@ def compile_moe_gemm2(
     _use_wptr64 = _w_nbytes_static_s2 >= (1 << 31)
     _wptr64_tag = "_wptr64" if _use_wptr64 else ""
 
+    _knob_tag = _moe_knob_tags(
+        MOE_XCD_REMAP, MOE_XCD_REMAP_GX, _X_CM, _SCALE_CM, _OUT_ATOMIC_AUX
+    )
     module_name = (
         f"mfma_moe2_{in_dtype}_{out_s}_{epilog_tag}"
-        f"_t{tile_m}x{tile_n}x{tile_k}{_async_tag2}{_wpe_tag2}{_bnt_tag2}{_wptr64_tag}{_sk_tag2}"
+        f"_t{tile_m}x{tile_n}x{tile_k}{_async_tag2}{_wpe_tag2}{_bnt_tag2}{_wptr64_tag}{_sk_tag2}{_knob_tag}"
         f"_abi5_wptr64gate"  # ABI bumped: optional 64-bit W load path gated by static size check
     ).replace("-", "_")
 
@@ -2675,10 +2821,16 @@ def compile_moe_gemm2(
             layout_lds = fx.make_layout(shape_lds, stride_lds)
 
             tx = gpu.thread_id("x")
-            # Split-K: blockIdx.z encodes (group * k_batch + kz). kz selects the
-            # K-slice [kz*K_per_batch, (kz+1)*K_per_batch); `group` is the original
-            # z-grouping used by the XCD remap.
-            if _is_splitk2:
+            # Split-K dispatch axis (see MOE_SPLITK_AXIS). "y" only applies to the
+            # gy-first remap branch; kz/k_start are then derived from blockIdx.y
+            # inside that branch. Otherwise blockIdx.z encodes group*k_batch+kz.
+            _sk_axis_y2 = (
+                _is_splitk2
+                and MOE_SPLITK_AXIS == "y"
+                and MOE_XCD_REMAP
+                and not MOE_XCD_REMAP_GX
+            )
+            if _is_splitk2 and not _sk_axis_y2:
                 _bidz_sk = gpu.block_id("z")
                 kz_sk = _bidz_sk % fx.Index(k_batch)
                 _sk_group_z = _bidz_sk // fx.Index(k_batch)
@@ -2706,8 +2858,18 @@ def compile_moe_gemm2(
             elif MOE_XCD_REMAP:
                 # grid=(NUM_XCD, gx, ceil(gy/NUM_XCD)); see MOE_XCD_REMAP note.
                 _xcd = gpu.block_id("x")  # 0..NUM_XCD-1 (one per XCD, chunk=1)
-                by = gpu.block_id("y")  # tile along model_dim (n-tile)
-                _bz = _sk_group_z if _is_splitk2 else gpu.block_id("z")  # expert-block group
+                if _sk_axis_y2:
+                    # Split-K on the -2 axis: blockIdx.y = n_tile*k_batch + kz, so a
+                    # tile's kz partials are adjacent in dispatch order (output stays
+                    # L2-hot). blockIdx.z is the pure expert-block group.
+                    _bycomb = gpu.block_id("y")
+                    by = _bycomb // fx.Index(k_batch)  # tile along model_dim (n-tile)
+                    kz_sk = _bycomb % fx.Index(k_batch)
+                    k_start = kz_sk * fx.Index(_k_per_batch2)
+                    _bz = gpu.block_id("z")  # expert-block group
+                else:
+                    by = gpu.block_id("y")  # tile along model_dim (n-tile)
+                    _bz = _sk_group_z if _is_splitk2 else gpu.block_id("z")  # expert-block group
                 bx = _bz * fx.Index(MOE_NUM_XCD) + _xcd  # tile along sorted M
                 # The XCD remap rounds the grid up, so bx can run past the real
                 # number of expert blocks (size_expert_ids). Flag those pure-padding
@@ -4147,8 +4309,13 @@ def compile_moe_gemm2(
             else:
                 # (NUM_XCD, n_tiles, ceil(expert_blocks/NUM_XCD)) for XCD L2 locality
                 gz = (gy + fx.Index(MOE_NUM_XCD - 1)) // fx.Index(MOE_NUM_XCD)
-                gz = gz * _sk_kb if _is_splitk2 else gz
-                grid_dims = (fx.Index(MOE_NUM_XCD), gx, gz)
+                if _is_splitk2 and MOE_SPLITK_AXIS == "y":
+                    # Split-K on the -2 axis: fold k_batch into the n_tile dim so a
+                    # tile's kz partials dispatch adjacently (output stays L2-hot).
+                    grid_dims = (fx.Index(MOE_NUM_XCD), gx * _sk_kb, gz)
+                else:
+                    gz = gz * _sk_kb if _is_splitk2 else gz
+                    grid_dims = (fx.Index(MOE_NUM_XCD), gx, gz)
         else:
             grid_dims = (gx, gy, _sk_kb) if _is_splitk2 else (gx, gy, 1)
 

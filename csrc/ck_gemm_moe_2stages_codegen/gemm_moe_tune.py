@@ -493,6 +493,11 @@ class FmoeTuner(TunerCommon):
             gate_only=kparams.get("gate_only", False),
             fuse_fp4_quant=fuse_fq,
             fuse_sort_scale=fuse_fq,
+            remap=kparams.get("remap", None),
+            splitk_axis=kparams.get("splitk_axis", None),
+            x_nt=kparams.get("x_nt", None),
+            scale_nt=kparams.get("scale_nt", None),
+            out_nt=kparams.get("out_nt", None),
         )
         if isinstance(result, tuple):
             out_raw = result[0]
@@ -560,6 +565,11 @@ class FmoeTuner(TunerCommon):
             mfma_variant=kparams.get("mfma_variant", None),
             zero_intermediate=zero_intermediate,
             k_batch=kparams.get("k_batch", 1),
+            remap=kparams.get("remap", None),
+            splitk_axis=kparams.get("splitk_axis", None),
+            x_nt=kparams.get("x_nt", None),
+            scale_nt=kparams.get("scale_nt", None),
+            out_nt=kparams.get("out_nt", None),
         )
 
     @staticmethod

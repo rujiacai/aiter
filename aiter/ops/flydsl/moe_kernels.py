@@ -143,6 +143,18 @@ def _parse_flydsl_kernel_name(name: str) -> Optional[Dict]:
             params["sort_block_m"] = int(token[3:])
         elif token == "fq":
             params["fuse_fp4_quant"] = True
+        elif token == "rgx":
+            params["remap"] = "gx"
+        elif token == "roff":
+            params["remap"] = "off"
+        elif token == "axy":
+            params["splitk_axis"] = "y"
+        elif token == "xnt":
+            params["x_nt"] = 2
+        elif token == "snt":
+            params["scale_nt"] = 2
+        elif token == "ont":
+            params["out_nt"] = 2
         else:
             return None
     return params
@@ -196,6 +208,56 @@ def _device_lds_limit_bytes() -> int:
     if gfx not in _LDS_LIMIT_BYTES_BY_GFX:
         raise RuntimeError(f"FlyDSL MoE LDS filtering does not support {gfx!r}.")
     return _LDS_LIMIT_BYTES_BY_GFX[gfx]
+
+
+def _tune_csv(env_name: str, default: list[str]) -> list[str]:
+    """Read a comma-separated tuning candidate list from env (else default)."""
+    raw = os.environ.get(env_name, "")
+    if not raw.strip():
+        return default
+    return [tok.strip() for tok in raw.split(",") if tok.strip()]
+
+
+def _moe_knob_variants(kb: int):
+    """Yield (name_tag, params) for the dispatch/cache tuning knobs.
+
+    Defaults keep a single canonical variant (empty tag, no params) so the tuned
+    candidate set is byte-identical unless widened via env:
+      AITER_TUNE_MOE_REMAP=gy,gx,off   AITER_TUNE_MOE_SPLITK_AXIS=z,y
+      AITER_TUNE_MOE_X_NT=0,2          AITER_TUNE_MOE_SCALE_NT=0,2
+      AITER_TUNE_MOE_OUT_NT=0,2
+    """
+    remaps = _tune_csv("AITER_TUNE_MOE_REMAP", ["gy"])
+    axes = _tune_csv("AITER_TUNE_MOE_SPLITK_AXIS", ["z"])
+    xnts = _tune_csv("AITER_TUNE_MOE_X_NT", ["0"])
+    snts = _tune_csv("AITER_TUNE_MOE_SCALE_NT", ["0"])
+    onts = _tune_csv("AITER_TUNE_MOE_OUT_NT", ["0"])
+    seen = set()
+    for rm in remaps:
+        for ax in axes:
+            # splitk_axis only changes the grid when kb>1; collapse to "z" otherwise
+            # to avoid emitting duplicate kernels under different names.
+            eff_ax = ax if kb > 1 else "z"
+            for xn in xnts:
+                for sn in snts:
+                    for on in onts:
+                        tag, p = "", {}
+                        if rm == "gx":
+                            tag += "_rgx"; p["remap"] = "gx"
+                        elif rm == "off":
+                            tag += "_roff"; p["remap"] = "off"
+                        if eff_ax == "y":
+                            tag += "_axy"; p["splitk_axis"] = "y"
+                        if int(xn):
+                            tag += "_xnt"; p["x_nt"] = 2
+                        if int(sn):
+                            tag += "_snt"; p["scale_nt"] = 2
+                        if int(on):
+                            tag += "_ont"; p["out_nt"] = 2
+                        if tag in seen:
+                            continue
+                        seen.add(tag)
+                        yield tag, p
 
 
 def _async_copy_candidates() -> list[bool]:
@@ -336,7 +398,7 @@ def get_flydsl_stage1_kernels(
                                         name += f"_bnt{bnt}"
                                     if go:
                                         name += "_go"
-                                    kernels[name] = {
+                                    base = {
                                         "stage": 1,
                                         "a_dtype": a_dtype,
                                         "b_dtype": b_dtype,
@@ -352,6 +414,13 @@ def get_flydsl_stage1_kernels(
                                         "b_nt": bnt,
                                         "gate_only": go,
                                     }
+                                    # fp4 stage1 goes through the mixed kernel, which
+                                    # does not take the dispatch/cache knobs.
+                                    if is_fp4:
+                                        kernels[name] = base
+                                        continue
+                                    for ktag, kp in _moe_knob_variants(kb):
+                                        kernels[name + ktag] = {**base, **kp}
     return kernels
 
 
@@ -452,7 +521,13 @@ def get_flydsl_stage2_kernels(
                                     }
                                     if mfma_variant_tag:
                                         base_params["mfma_variant"] = mfma_variant_tag
-                                    kernels[base_name] = base_params
+                                    # fp4 stage2 goes through the mixed kernel, which
+                                    # does not take the dispatch/cache knobs.
+                                    if is_fp4:
+                                        kernels[base_name] = base_params
+                                        continue
+                                    for ktag, kp in _moe_knob_variants(kb):
+                                        kernels[base_name + ktag] = {**base_params, **kp}
     return kernels
 
 
@@ -496,6 +571,11 @@ def compile_flydsl_moe_stage1(
     waves_per_eu: int = 3,
     b_nt: int = 2,
     gate_only: bool = False,
+    remap: Optional[str] = None,
+    splitk_axis: Optional[str] = None,
+    x_nt: Optional[int] = None,
+    scale_nt: Optional[int] = None,
+    out_nt: Optional[int] = None,
 ):
     """Compile stage1 kernel (cached via underlying lru_cache)."""
     if b_dtype == "fp4":
@@ -545,6 +625,11 @@ def compile_flydsl_moe_stage1(
             waves_per_eu=waves_per_eu,
             b_nt=b_nt,
             k_batch=k_batch,
+            remap=remap,
+            splitk_axis=splitk_axis,
+            x_nt=x_nt,
+            scale_nt=scale_nt,
+            out_nt=out_nt,
         )
 
 
@@ -568,6 +653,11 @@ def compile_flydsl_moe_stage2(
     b_nt: int = 2,
     mfma_variant: Optional[str] = None,
     k_batch: int = 1,
+    remap: Optional[str] = None,
+    splitk_axis: Optional[str] = None,
+    x_nt: Optional[int] = None,
+    scale_nt: Optional[int] = None,
+    out_nt: Optional[int] = None,
 ):
     """Compile stage2 kernel (cached via underlying lru_cache)."""
     if b_dtype == "fp4":
@@ -610,6 +700,11 @@ def compile_flydsl_moe_stage2(
             waves_per_eu=waves_per_eu,
             b_nt=b_nt,
             k_batch=k_batch,
+            remap=remap,
+            splitk_axis=splitk_axis,
+            x_nt=x_nt,
+            scale_nt=scale_nt,
+            out_nt=out_nt,
         )
 
 
@@ -826,6 +921,11 @@ def flydsl_moe_stage1(
     waves_per_eu: int = 3,
     b_nt: int = 2,
     gate_only: bool = False,
+    remap: Optional[str] = None,
+    splitk_axis: Optional[str] = None,
+    x_nt: Optional[int] = None,
+    scale_nt: Optional[int] = None,
+    out_nt: Optional[int] = None,
 ):
     """Fused MOE stage1 GEMM.
 
@@ -1049,6 +1149,11 @@ def flydsl_moe_stage1(
         waves_per_eu=waves_per_eu,
         b_nt=b_nt,
         gate_only=gate_only,
+        remap=remap,
+        splitk_axis=splitk_axis,
+        x_nt=x_nt,
+        scale_nt=scale_nt,
+        out_nt=out_nt,
     )
     _run_compiled(exe, args)
 
@@ -1129,6 +1234,11 @@ def flydsl_moe_stage2(
     mfma_variant: Optional[str] = None,
     zero_intermediate: bool = True,
     k_batch: int = 1,
+    remap: Optional[str] = None,
+    splitk_axis: Optional[str] = None,
+    x_nt: Optional[int] = None,
+    scale_nt: Optional[int] = None,
+    out_nt: Optional[int] = None,
 ) -> torch.Tensor:
     """Down-projection GEMM (MOE stage2). Supports atomic/reduce modes.
 
@@ -1265,6 +1375,11 @@ def flydsl_moe_stage2(
         b_nt=b_nt,
         mfma_variant=mfma_variant,
         k_batch=k_batch,
+        remap=remap,
+        splitk_axis=splitk_axis,
+        x_nt=x_nt,
+        scale_nt=scale_nt,
+        out_nt=out_nt,
     )
     _run_compiled(exe, args)
 
