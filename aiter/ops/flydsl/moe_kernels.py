@@ -15,7 +15,6 @@ import flydsl.compiler as flyc
 import torch
 
 _KERNEL_PARAMS: Dict[str, Dict] = {}
-_DIRECT_STAGE2_LAST_WORKSPACE: Optional[torch.Tensor] = None
 
 _SUFFIX_RE = re.compile(r"(?P<fq>_fq)?(?:_sbm(?P<sbm>\d+))?$")
 _KERNEL_NAME_RE = re.compile(
@@ -1029,6 +1028,7 @@ def compile_flydsl_moe_stage2(
     split_reduce: bool = False,
     n_per_wave: int = 32,
     k_batch: int = 1,
+    persist: bool = False,
 ):
     """Compile stage2 kernel (cached via underlying lru_cache)."""
     if direct:
@@ -1108,6 +1108,7 @@ def compile_flydsl_moe_stage2(
             b_nt=b_nt,
             n_per_wave=n_per_wave,
             k_batch=k_batch,
+            persist=persist,
         )
 
 
@@ -1324,18 +1325,11 @@ def _direct_stage2_workspace(
     topk: int,
     model_dim: int,
 ) -> torch.Tensor:
-    global _DIRECT_STAGE2_LAST_WORKSPACE
-    shape = (int(token_num) * int(topk), int(model_dim))
-    workspace = _DIRECT_STAGE2_LAST_WORKSPACE
-    if (
-        workspace is None
-        or workspace.shape != shape
-        or workspace.dtype != out.dtype
-        or workspace.device != out.device
-    ):
-        workspace = torch.empty(shape, dtype=out.dtype, device=out.device)
-        _DIRECT_STAGE2_LAST_WORKSPACE = workspace
-    return workspace
+    return torch.empty(
+        (int(token_num) * int(topk), int(model_dim)),
+        dtype=out.dtype,
+        device=out.device,
+    )
 
 
 def _run_compiled(exe, args):
@@ -2033,6 +2027,7 @@ def flydsl_moe_stage2(
         mfma_variant=mfma_variant,
         n_per_wave=n_per_wave,
         k_batch=k_batch,
+        persist=bool(persist),
     )
     _run_compiled(exe, args)
 
