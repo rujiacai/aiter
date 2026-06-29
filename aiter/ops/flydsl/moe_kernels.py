@@ -112,10 +112,16 @@ def _parse_flydsl_kernel_name(name: str) -> Optional[Dict]:
         "b_nt": 2,
     }
     if stage == 1:
-        params.update({"k_batch": 1, "gate_only": False})
+        params.update({"k_batch": 1, "gate_only": False, "persist_m": 1})
     else:
         params.update(
-            {"mode": "atomic", "sort_block_m": 0, "persist": False, "k_batch": 1}
+            {
+                "mode": "atomic",
+                "sort_block_m": 0,
+                "persist": False,
+                "k_batch": 1,
+                "persist_m": 1,
+            }
         )
 
     for token in (match.group("rest") or "").split("_"):
@@ -133,6 +139,8 @@ def _parse_flydsl_kernel_name(name: str) -> Optional[Dict]:
             params["b_nt"] = int(token[3:])
         elif token.startswith("kb") and token[2:].isdigit():
             params["k_batch"] = int(token[2:])
+        elif token.startswith("pm") and token[2:].isdigit():
+            params["persist_m"] = int(token[2:])
         elif stage == 1 and token == "go":
             params["gate_only"] = True
         elif stage == 1 and token == "fq":
@@ -258,6 +266,26 @@ def _moe_knob_variants(kb: int):
                             continue
                         seen.add(tag)
                         yield tag, p
+
+
+def _persist_m_candidates() -> list[int]:
+    """Yield persist_m tuning candidates (workgroup-merge along M).
+
+    persist_m is the inverse of split-K: each WG serially sweeps persist_m
+    M-blocks (fewer, heavier WGs). Defaults to a small set so large-token configs
+    can be tuned out of the box; override via env, e.g.
+      AITER_TUNE_MOE_PERSIST_M=1,2,4,8
+    """
+    vals = _tune_csv("AITER_TUNE_MOE_PERSIST_M", ["1", "2", "4", "8"])
+    out: list[int] = []
+    for v in vals:
+        try:
+            iv = int(v)
+        except ValueError:
+            continue
+        if iv >= 1 and iv not in out:
+            out.append(iv)
+    return out or [1]
 
 
 def _async_copy_candidates() -> list[bool]:
@@ -419,8 +447,19 @@ def get_flydsl_stage1_kernels(
                                     if is_fp4:
                                         kernels[name] = base
                                         continue
+                                    # persist_m (workgroup-merge along M) is the
+                                    # inverse of split-K, so it only applies when
+                                    # k_batch==1. The tuner gates split-K vs persist
+                                    # by token count.
+                                    _pms = _persist_m_candidates() if kb == 1 else [1]
                                     for ktag, kp in _moe_knob_variants(kb):
-                                        kernels[name + ktag] = {**base, **kp}
+                                        for pm in _pms:
+                                            pmtag = f"_pm{pm}" if pm != 1 else ""
+                                            kernels[name + ktag + pmtag] = {
+                                                **base,
+                                                **kp,
+                                                "persist_m": pm,
+                                            }
     return kernels
 
 
@@ -526,8 +565,19 @@ def get_flydsl_stage2_kernels(
                                     if is_fp4:
                                         kernels[base_name] = base_params
                                         continue
+                                    # persist_m (workgroup-merge along M) is the
+                                    # inverse of split-K, so it only applies when
+                                    # k_batch==1. The tuner gates split-K vs persist
+                                    # by token count.
+                                    _pms = _persist_m_candidates() if kb == 1 else [1]
                                     for ktag, kp in _moe_knob_variants(kb):
-                                        kernels[base_name + ktag] = {**base_params, **kp}
+                                        for pm in _pms:
+                                            pmtag = f"_pm{pm}" if pm != 1 else ""
+                                            kernels[base_name + ktag + pmtag] = {
+                                                **base_params,
+                                                **kp,
+                                                "persist_m": pm,
+                                            }
     return kernels
 
 
@@ -625,6 +675,7 @@ def compile_flydsl_moe_stage1(
             waves_per_eu=waves_per_eu,
             b_nt=b_nt,
             k_batch=k_batch,
+            persist_m=persist_m,
             remap=remap,
             splitk_axis=splitk_axis,
             x_nt=x_nt,
@@ -700,6 +751,7 @@ def compile_flydsl_moe_stage2(
             waves_per_eu=waves_per_eu,
             b_nt=b_nt,
             k_batch=k_batch,
+            persist_m=persist_m,
             remap=remap,
             splitk_axis=splitk_axis,
             x_nt=x_nt,
@@ -1234,6 +1286,7 @@ def flydsl_moe_stage2(
     mfma_variant: Optional[str] = None,
     zero_intermediate: bool = True,
     k_batch: int = 1,
+    persist_m: int = 1,
     remap: Optional[str] = None,
     splitk_axis: Optional[str] = None,
     x_nt: Optional[int] = None,
@@ -1299,7 +1352,7 @@ def flydsl_moe_stage2(
     #     _persist_m = 1  # _persist_m = 1 is better for g1u0
     # else:
     #     _persist_m = -1 if m_blocks > 256 else 1
-    _persist_m = 1
+    _persist_m = persist_m if persist_m and persist_m > 0 else 1
 
     is_fp4 = b_dtype == "fp4"
     _n_in = model_dim

@@ -344,6 +344,31 @@ def _if_else(if_op):
                 scf.YieldOp([])
 
 
+def _persist_anti_licm_tx(tx, mi):
+    """Defeat LICM register bloat inside the persist_m loop.
+
+    Without this, every tid-derived LDS address is loop-invariant, so LLVM
+    hoists the whole address book above the persist loop and pins ~19 VGPRs live
+    across the loop body (occupancy loss, e.g. stage2 VGPR 124->162). We fold an
+    induction-variable-dependent opaque zero into the thread id: ``opaque(mi)``
+    is an inline-asm identity the optimizer cannot see through, so
+    ``opaque(mi) - mi`` is provably 0 at runtime (results unchanged) yet appears
+    loop-variant to the compiler. The address chain is then recomputed (and
+    recycled) each iteration instead of being held live. Returns the perturbed
+    ``tx``; call once right after entering the persist loop body.
+    """
+    mi_i32 = arith.index_cast(T.i32, mi)
+    opaque_iv = llvm.InlineAsmOp(
+        res=ir.IntegerType.get_signless(32),
+        operands_=[mi_i32],
+        asm_string="",
+        constraints="=v,0",
+        has_side_effects=False,
+        is_align_stack=False,
+    ).result
+    return tx + arith.index_cast(T.index, arith.subi(opaque_iv, mi_i32))
+
+
 @functools.lru_cache(maxsize=1024)
 def compile_moe_gemm1(
     *,
@@ -366,6 +391,7 @@ def compile_moe_gemm1(
     waves_per_eu: int = 3,
     b_nt: int = 2,
     k_batch: int = 1,
+    persist_m: int = 1,
     remap: str | None = None,
     splitk_axis: str | None = None,
     x_nt: int | None = None,
@@ -413,6 +439,12 @@ def compile_moe_gemm1(
         _OUT_ATOMIC_AUX,
         _OUT_STORE_CM,
     ) = _resolve_moe_knobs(remap, splitk_axis, x_nt, scale_nt, out_nt)
+    # persist_m (workgroup merge along M) is the inverse of split-K; mutually exclusive.
+    persist_m = int(persist_m)
+    if persist_m > 1 and k_batch > 1:
+        raise ValueError(
+            f"persist_m={persist_m} and k_batch={k_batch} are mutually exclusive"
+        )
 
     gpu_arch = get_hip_arch()
     allocator = SmemAllocator(None, arch=gpu_arch)
@@ -595,9 +627,10 @@ def compile_moe_gemm1(
     _knob_tag = _moe_knob_tags(
         MOE_XCD_REMAP, MOE_XCD_REMAP_GX, _X_CM, _SCALE_CM, _OUT_ATOMIC_AUX
     )
+    _pm_tag = f"_pm{persist_m}" if persist_m != 1 else ""
     module_name = (
         f"mfma_moe1_{g1u_tag}_{in_dtype}_{out_dtype}_{epilog_tag}"
-        f"_t{tile_m}x{tile_n}x{tile_k}{_async_tag}{_wpe_tag}{_bnt_tag}{_wptr64_tag}{_sk_tag1}{_knob_tag}"
+        f"_t{tile_m}x{tile_n}x{tile_k}{_async_tag}{_wpe_tag}{_bnt_tag}{_wptr64_tag}{_sk_tag1}{_knob_tag}{_pm_tag}"
         f"_abi6_wptr64gate"  # ABI bumped: optional 64-bit W load path gated by static size check
     ).replace("-", "_")
 
@@ -779,6 +812,27 @@ def compile_moe_gemm1(
             else:
                 _sk_group_z = None
                 k_start = None
+            # persist_m loop: each WG serially sweeps persist_m M-blocks (inverse of
+            # split-K). persist follows M (see launch grid): remap=gy folds into the
+            # group (z) index, remap=gx / no-remap into the M index (block_id.y).
+            _persist1 = persist_m > 1
+            if _persist1:
+                _c_pm1 = arith.constant(persist_m, index=True)
+                _for_persist1 = scf.ForOp(
+                    arith.constant(0, index=True),
+                    _c_pm1,
+                    arith.constant(1, index=True),
+                )
+                _for_ip1 = ir.InsertionPoint(_for_persist1.body)
+                _for_ip1.__enter__()
+                _mi1 = _for_persist1.induction_variable
+                # Anti-LICM: keep tid-derived LDS addresses loop-variant so they
+                # are recomputed (not hoisted + pinned) each persist iteration.
+                tx = _persist_anti_licm_tx(tx, _mi1)
+
+            def _pm_fold1(v):
+                return (v * _c_pm1 + _mi1) if _persist1 else v
+
             # Align with Aiter launch mapping (NSwizzle==false):
             # - blockIdx.x -> N dimension (tile along inter_dim)
             # - blockIdx.y -> expert-block id / M dimension (tile along sorted M)
@@ -788,7 +842,7 @@ def compile_moe_gemm1(
                 # always in range. The rounding now overruns by (n_tile), so guard
                 # by < n_tiles and fold it into blk_valid.
                 _xcd = gpu.block_id("x")  # 0..NUM_XCD-1 (one per XCD, chunk=1)
-                bx = gpu.block_id("y")  # tile along sorted M (full range)
+                bx = _pm_fold1(gpu.block_id("y"))  # tile along sorted M (full range)
                 _bz = _sk_group_z if _is_splitk1 else gpu.block_id("z")  # n_tile group
                 by = _bz * fx.Index(MOE_NUM_XCD) + _xcd  # tile along inter_dim (n-tile)
                 bx_m = bx * fx.Index(tile_m)
@@ -831,7 +885,11 @@ def compile_moe_gemm1(
                     _bz = gpu.block_id("z")  # expert-block group
                 else:
                     by = gpu.block_id("y")  # tile along inter_dim (n-tile)
-                    _bz = _sk_group_z if _is_splitk1 else gpu.block_id("z")  # expert-block group
+                    _bz = (
+                        _sk_group_z
+                        if _is_splitk1
+                        else _pm_fold1(gpu.block_id("z"))
+                    )  # expert-block group (persist folds into the group dim)
                 bx = _bz * fx.Index(MOE_NUM_XCD) + _xcd  # tile along sorted M
                 # The XCD remap rounds the grid up, so bx can run past the real
                 # number of expert blocks (size_expert_ids). Flag those pure-padding
@@ -867,7 +925,7 @@ def compile_moe_gemm1(
                 blk_valid = _rng_if.results[0]
             else:
                 by = gpu.block_id("x")  # tile along inter_dim
-                bx = gpu.block_id("y")  # tile along sorted M
+                bx = _pm_fold1(gpu.block_id("y"))  # tile along sorted M
                 # Block validity: compute as early as possible so invalid blocks skip all buffer-resource
                 # setup, LDS pointer math, and gmem prefetch work.
                 bx_m = bx * fx.Index(tile_m)
@@ -2274,7 +2332,10 @@ def compile_moe_gemm1(
                         store_pair=store_pair,
                         frag_elem_type=_out_elem_type(),
                     )
-                    return
+                    # NOTE: no early `return` here. An early return would skip the
+                    # persist_m loop close (scf.YieldOp + InsertionPoint exit) emitted
+                    # at the end of the kernel body, leaving the scf.for region open.
+                    # The default-epilog path below is gated on use_cshuffle instead.
 
                 def _stage1_store_row(*, mi: int, ii: int, row_in_tile, row):
                     fused2 = memref.load(lds_tid, [row_in_tile])
@@ -2368,15 +2429,23 @@ def compile_moe_gemm1(
                             idx_out0 = idx0 + col_i32
                             buffer_ops.buffer_store(y, out_rsrc, idx_out0)
 
-                mfma_epilog(
-                    use_cshuffle=False,
-                    arith=arith,
-                    range_constexpr=range_constexpr,
-                    m_repeat=m_repeat,
-                    lane_div_16=lane_div_16,
-                    bx_m=bx_m,
-                    body_row=_stage1_store_row,
-                )
+                if not use_cshuffle_epilog_flag:
+                    mfma_epilog(
+                        use_cshuffle=False,
+                        arith=arith,
+                        range_constexpr=range_constexpr,
+                        m_repeat=m_repeat,
+                        lane_div_16=lane_div_16,
+                        bx_m=bx_m,
+                        body_row=_stage1_store_row,
+                    )
+
+            if _persist1:
+                # barrier so LDS from this M-block is fully consumed before the next
+                # persist iteration reuses it; then close the persist loop.
+                gpu.barrier()
+                scf.YieldOp([])
+                _for_ip1.__exit__(None, None, None)
 
     # ── Host launcher (flyc.jit + .launch) ────────────────────────────────
     @flyc.jit
@@ -2408,13 +2477,22 @@ def compile_moe_gemm1(
         # Split-K multiplies the launch z-dim by k_batch. The kernel decodes
         # blockIdx.z as (group * k_batch + kz); k_batch==1 leaves the grid intact.
         _sk_kb = fx.Index(k_batch)
+
+        # persist_m (>1) divides the M-carrying grid dim so each WG serially sweeps
+        # persist_m M-blocks. persist follows M: remap=gy -> group (z) dim; remap=gx /
+        # no-remap -> M dim (block_id.y).
+        def _pm_ceil(dim):
+            if persist_m == 1:
+                return dim
+            return (dim + fx.Index(persist_m - 1)) // fx.Index(persist_m)
+
         if MOE_XCD_REMAP:
             if MOE_XCD_REMAP_GX:
                 # (NUM_XCD, expert_blocks, ceil(n_tiles/NUM_XCD)): split N across XCDs
                 # so each XCD keeps its weight n_tile slice L2-resident.
                 gz = (gx + fx.Index(MOE_NUM_XCD - 1)) // fx.Index(MOE_NUM_XCD)
                 gz = gz * _sk_kb if _is_splitk1 else gz
-                grid_dims = (fx.Index(MOE_NUM_XCD), gy, gz)
+                grid_dims = (fx.Index(MOE_NUM_XCD), _pm_ceil(gy), gz)
             else:
                 # (NUM_XCD, n_tiles, ceil(expert_blocks/NUM_XCD)) for XCD L2 locality
                 gz = (gy + fx.Index(MOE_NUM_XCD - 1)) // fx.Index(MOE_NUM_XCD)
@@ -2424,9 +2502,11 @@ def compile_moe_gemm1(
                     grid_dims = (fx.Index(MOE_NUM_XCD), gx * _sk_kb, gz)
                 else:
                     gz = gz * _sk_kb if _is_splitk1 else gz
-                    grid_dims = (fx.Index(MOE_NUM_XCD), gx, gz)
+                    grid_dims = (fx.Index(MOE_NUM_XCD), gx, _pm_ceil(gz))
         else:
-            grid_dims = (gx, gy, _sk_kb) if _is_splitk1 else (gx, gy, 1)
+            grid_dims = (
+                (gx, gy, _sk_kb) if _is_splitk1 else (gx, _pm_ceil(gy), 1)
+            )
 
         moe_gemm1(
             arg_out,
@@ -2471,6 +2551,7 @@ def compile_moe_gemm2(
     waves_per_eu: int = 3,
     b_nt: int = 2,
     k_batch: int = 1,
+    persist_m: int = 1,
     remap: str | None = None,
     splitk_axis: str | None = None,
     x_nt: int | None = None,
@@ -2516,6 +2597,13 @@ def compile_moe_gemm2(
         _OUT_ATOMIC_AUX,
         _OUT_STORE_CM,
     ) = _resolve_moe_knobs(remap, splitk_axis, x_nt, scale_nt, out_nt)
+    # persist_m (workgroup merge along M) is the inverse of split-K; the two are
+    # mutually exclusive. Each WG serially sweeps persist_m M-blocks.
+    persist_m = int(persist_m)
+    if persist_m > 1 and k_batch > 1:
+        raise ValueError(
+            f"persist_m={persist_m} and k_batch={k_batch} are mutually exclusive"
+        )
     gpu_arch = get_hip_arch()
     allocator = SmemAllocator(None, arch=gpu_arch)
 
@@ -2701,9 +2789,10 @@ def compile_moe_gemm2(
     _knob_tag = _moe_knob_tags(
         MOE_XCD_REMAP, MOE_XCD_REMAP_GX, _X_CM, _SCALE_CM, _OUT_ATOMIC_AUX
     )
+    _pm_tag = f"_pm{persist_m}" if persist_m != 1 else ""
     module_name = (
         f"mfma_moe2_{in_dtype}_{out_s}_{epilog_tag}"
-        f"_t{tile_m}x{tile_n}x{tile_k}{_async_tag2}{_wpe_tag2}{_bnt_tag2}{_wptr64_tag}{_sk_tag2}{_knob_tag}"
+        f"_t{tile_m}x{tile_n}x{tile_k}{_async_tag2}{_wpe_tag2}{_bnt_tag2}{_wptr64_tag}{_sk_tag2}{_knob_tag}{_pm_tag}"
         f"_abi5_wptr64gate"  # ABI bumped: optional 64-bit W load path gated by static size check
     ).replace("-", "_")
 
@@ -2838,6 +2927,28 @@ def compile_moe_gemm2(
             else:
                 _sk_group_z = None
                 k_start = None
+            # persist_m loop: each WG serially sweeps persist_m M-blocks (the inverse
+            # of split-K). persist follows the M dim (see launch grid): under remap=gy
+            # it folds into the group (z) index, under remap=gx / no-remap into the M
+            # index (block_id.y). persist_m==1 leaves IR/behavior unchanged.
+            _persist2 = persist_m > 1
+            if _persist2:
+                _c_pm2 = arith.constant(persist_m, index=True)
+                _for_persist2 = scf.ForOp(
+                    arith.constant(0, index=True),
+                    _c_pm2,
+                    arith.constant(1, index=True),
+                )
+                _for_ip2 = ir.InsertionPoint(_for_persist2.body)
+                _for_ip2.__enter__()
+                _mi2 = _for_persist2.induction_variable
+                # Anti-LICM: keep tid-derived LDS addresses loop-variant so they
+                # are recomputed (not hoisted + pinned) each persist iteration.
+                tx = _persist_anti_licm_tx(tx, _mi2)
+
+            def _pm_fold2(v):
+                return (v * _c_pm2 + _mi2) if _persist2 else v
+
             # Align with Aiter launch mapping:
             # - blockIdx.x -> N dimension (tile along model_dim)
             # - blockIdx.y -> expert-block id / M dimension (tile along sorted M)
@@ -2847,7 +2958,7 @@ def compile_moe_gemm2(
                 # The rounding overruns by (n_tile), so guard by < n_tiles (folded into
                 # blk_valid below).
                 _xcd = gpu.block_id("x")  # 0..NUM_XCD-1 (one per XCD, chunk=1)
-                bx = gpu.block_id("y")  # tile along sorted M (full range)
+                bx = _pm_fold2(gpu.block_id("y"))  # tile along sorted M (full range)
                 _bz = _sk_group_z if _is_splitk2 else gpu.block_id("z")  # n_tile group
                 by = _bz * fx.Index(MOE_NUM_XCD) + _xcd  # tile along model_dim (n-tile)
                 # n_tiles must match the launcher's gx = n_in // tile_n.
@@ -2869,7 +2980,11 @@ def compile_moe_gemm2(
                     _bz = gpu.block_id("z")  # expert-block group
                 else:
                     by = gpu.block_id("y")  # tile along model_dim (n-tile)
-                    _bz = _sk_group_z if _is_splitk2 else gpu.block_id("z")  # expert-block group
+                    _bz = (
+                        _sk_group_z
+                        if _is_splitk2
+                        else _pm_fold2(gpu.block_id("z"))
+                    )  # expert-block group (persist folds into the group dim)
                 bx = _bz * fx.Index(MOE_NUM_XCD) + _xcd  # tile along sorted M
                 # The XCD remap rounds the grid up, so bx can run past the real
                 # number of expert blocks (size_expert_ids). Flag those pure-padding
@@ -2882,7 +2997,7 @@ def compile_moe_gemm2(
                 )
             else:
                 by = gpu.block_id("x")  # tile along model_dim
-                bx = gpu.block_id("y")  # tile along sorted M
+                bx = _pm_fold2(gpu.block_id("y"))  # tile along sorted M
 
             _xcd_debug_print(2, bx, by)
 
@@ -4269,6 +4384,13 @@ def compile_moe_gemm2(
             with _if_then(_if_blk):
                 _moe_gemm2_then_body()
 
+            if _persist2:
+                # barrier so LDS from this M-block is fully consumed before the next
+                # persist iteration reuses it; then close the persist loop.
+                gpu.barrier()
+                scf.YieldOp([])
+                _for_ip2.__exit__(None, None, None)
+
     # ── Host launcher (flyc.jit + .launch) ────────────────────────────────
     @flyc.jit
     def launch_moe_gemm2(
@@ -4299,13 +4421,22 @@ def compile_moe_gemm2(
         # Split-K multiplies the launch z-dim by k_batch. The kernel decodes
         # blockIdx.z as (group * k_batch + kz); k_batch==1 leaves the grid intact.
         _sk_kb = fx.Index(k_batch)
+
+        # persist_m (>1) divides the M-carrying grid dim so each WG serially sweeps
+        # persist_m M-blocks. persist follows M: under remap=gy that is the group
+        # (z) dim; under remap=gx / no-remap it is the M dim (gy on block_id.y).
+        def _pm_ceil(dim):
+            if persist_m == 1:
+                return dim
+            return (dim + fx.Index(persist_m - 1)) // fx.Index(persist_m)
+
         if MOE_XCD_REMAP:
             if MOE_XCD_REMAP_GX:
                 # (NUM_XCD, expert_blocks, ceil(n_tiles/NUM_XCD)): split N across XCDs
                 # so each XCD keeps its weight n_tile slice L2-resident.
                 gz = (gx + fx.Index(MOE_NUM_XCD - 1)) // fx.Index(MOE_NUM_XCD)
                 gz = gz * _sk_kb if _is_splitk2 else gz
-                grid_dims = (fx.Index(MOE_NUM_XCD), gy, gz)
+                grid_dims = (fx.Index(MOE_NUM_XCD), _pm_ceil(gy), gz)
             else:
                 # (NUM_XCD, n_tiles, ceil(expert_blocks/NUM_XCD)) for XCD L2 locality
                 gz = (gy + fx.Index(MOE_NUM_XCD - 1)) // fx.Index(MOE_NUM_XCD)
@@ -4315,9 +4446,11 @@ def compile_moe_gemm2(
                     grid_dims = (fx.Index(MOE_NUM_XCD), gx * _sk_kb, gz)
                 else:
                     gz = gz * _sk_kb if _is_splitk2 else gz
-                    grid_dims = (fx.Index(MOE_NUM_XCD), gx, gz)
+                    grid_dims = (fx.Index(MOE_NUM_XCD), gx, _pm_ceil(gz))
         else:
-            grid_dims = (gx, gy, _sk_kb) if _is_splitk2 else (gx, gy, 1)
+            grid_dims = (
+                (gx, gy, _sk_kb) if _is_splitk2 else (gx, _pm_ceil(gy), 1)
+            )
 
         moe_gemm2(
             arg_out,
