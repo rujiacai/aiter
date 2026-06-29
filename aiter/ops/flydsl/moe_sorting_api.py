@@ -49,6 +49,7 @@ def moe_sorting_atomic_fwd(
     moe_buf,
     num_experts,
     unit_size=UNIT_SIZE,
+    skip_moe_buf_zero=False,
 ):
     """atomicAdd-based MoE sorting. Outputs must be pre-allocated.
 
@@ -87,7 +88,12 @@ def moe_sorting_atomic_fwd(
     # AITER_SORT_ORDERED=1: exact token-ascending order within each expert
     # (CK-quality), fully on-GPU; scatter uses a single-thread in-LDS rank pass
     # (slower sort, optimal stage2). Implies contiguous partitioning.
-    _ordered = os.environ.get("AITER_SORT_ORDERED", "0") == "1"
+    # Default ON: exact token-ascending order within each expert. The unordered
+    # grid-stride atomic mode sorts marginally faster but scrambles intra-expert
+    # token order, which wrecks the downstream MoE GEMM's gather locality (stage1
+    # gateup ~+1.2ms at 32k tokens) -> net e2e regression. Set AITER_SORT_ORDERED=0
+    # to measure raw sort peak.
+    _ordered = os.environ.get("AITER_SORT_ORDERED", "1") == "1"
     _contig = _ordered or os.environ.get("AITER_SORT_CONTIG", "0") == "1"
     # AITER_SORT_FUSE_CUMSUM=1 (default): drop cumsum's single-block phase C and
     # let each scatter block compute its base from raw counts + ws_offset. Pure
@@ -113,7 +119,9 @@ def moe_sorting_atomic_fwd(
     # bound; counting is cheap, so the clear is largely hidden).
     # AITER_SORT_SKIP_ZERO=1 skips the moe_buf clear (sort-only measurement /
     # or when the caller zeroes moe_buf elsewhere, e.g. fused into stage1 init).
-    if os.environ.get("AITER_SORT_SKIP_ZERO", "0") == "1":
+    # Skip the moe_buf clear when the caller's stage2 doesn't atomic-accumulate
+    # into it (reduce/split-reduce stage2), or when explicitly forced via env.
+    if skip_moe_buf_zero or os.environ.get("AITER_SORT_SKIP_ZERO", "0") == "1":
         v4_total = 0
     _n_zero = n_zero if v4_total > 0 else 0
 
