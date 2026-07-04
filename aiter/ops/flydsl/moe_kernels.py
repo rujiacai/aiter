@@ -141,6 +141,10 @@ def _parse_flydsl_kernel_name(name: str) -> Optional[Dict]:
             params["k_batch"] = int(token[2:])
         elif token.startswith("pm") and token[2:].isdigit():
             params["persist_m"] = int(token[2:])
+        elif token.startswith("bp") and token[2:].isdigit():
+            params["b_pool_depth"] = int(token[2:])
+        elif token.startswith("xp") and token[2:].isdigit():
+            params["x_pool_depth"] = int(token[2:])
         elif stage == 1 and token == "go":
             params["gate_only"] = True
         elif stage == 1 and token == "fq":
@@ -266,6 +270,35 @@ def _moe_knob_variants(kb: int):
                             continue
                         seen.add(tag)
                         yield tag, p
+
+
+def _pool_variants():
+    """Yield (name_tag, params) for stage1/stage2 B/X weight/activation prefetch-pool depths.
+
+    Default candidate set = no-pool + the bp3/xp3 double pool (the tuned winner:
+    ~-3 to -5.5% at mid/large tokens). Widen/override via env, e.g.
+      AITER_TUNE_MOE_POOL=0,bp3,xp3,bp3xp3,bp4xp4
+    Tokens: "0" (none), "bp{N}", "xp{N}", "bp{N}xp{M}". Tag order matches the
+    kernel module_name (_bp{N} before _xp{N}).
+    """
+    import re as _re
+    specs = _tune_csv("AITER_TUNE_MOE_POOL", ["0", "bp3xp3"])
+    seen = set()
+    for s in specs:
+        tag = ""
+        p: Dict = {}
+        mb = _re.search(r"bp(\d+)", s)
+        if mb and int(mb.group(1)) >= 2:
+            p["b_pool_depth"] = int(mb.group(1))
+            tag += f"_bp{mb.group(1)}"
+        mx = _re.search(r"xp(\d+)", s)
+        if mx and int(mx.group(1)) >= 2:
+            p["x_pool_depth"] = int(mx.group(1))
+            tag += f"_xp{mx.group(1)}"
+        if tag in seen:
+            continue
+        seen.add(tag)
+        yield tag, p
 
 
 def _persist_m_candidates() -> list[int]:
@@ -455,6 +488,14 @@ def get_flydsl_stage1_kernels(
                                     for ktag, kp in _moe_knob_variants(kb):
                                         for pm in _pms:
                                             pmtag = f"_pm{pm}" if pm != 1 else ""
+                                            # NOTE: no B/X prefetch-pool candidates for
+                                            # stage1. Measured (all token sizes): bp2/bp3
+                                            # -41%/-71%, xp2/xp3 -5%/-10%, all negative.
+                                            # Stage1 carries gate+up (2x accumulators +
+                                            # 2x weight tiles), so it is occupancy/register
+                                            # bound with no headroom; extra in-flight pool
+                                            # tiles collapse occupancy (bp3 spills). Pool is
+                                            # a stage2-only optimization.
                                             kernels[name + ktag + pmtag] = {
                                                 **base,
                                                 **kp,
@@ -573,11 +614,24 @@ def get_flydsl_stage2_kernels(
                                     for ktag, kp in _moe_knob_variants(kb):
                                         for pm in _pms:
                                             pmtag = f"_pm{pm}" if pm != 1 else ""
-                                            kernels[base_name + ktag + pmtag] = {
-                                                **base_params,
-                                                **kp,
-                                                "persist_m": pm,
-                                            }
+                                            # B/X prefetch pool applies to ALL stage2
+                                            # paths (default, persist_m>1, split-K): the
+                                            # pool is a compile-time ring over the same
+                                            # constexpr K-loop, which is emitted inside the
+                                            # persist-loop body and is split-K slice-aware
+                                            # (uses k_start/num_k_tiles_py). Measured gains
+                                            # ~+5-8% at 16k/40k for pm4 and kb2 (X pool
+                                            # still helps since activations aren't reused
+                                            # across M-blocks). kernel has no pm/kb gate on
+                                            # _use_pool; this just makes them candidates.
+                                            _pvars = list(_pool_variants())
+                                            for ptag, pp in _pvars:
+                                                kernels[base_name + ktag + pmtag + ptag] = {
+                                                    **base_params,
+                                                    **kp,
+                                                    "persist_m": pm,
+                                                    **pp,
+                                                }
     return kernels
 
 
@@ -709,6 +763,8 @@ def compile_flydsl_moe_stage2(
     x_nt: Optional[int] = None,
     scale_nt: Optional[int] = None,
     out_nt: Optional[int] = None,
+    b_pool_depth: int = 0,
+    x_pool_depth: int = 0,
 ):
     """Compile stage2 kernel (cached via underlying lru_cache)."""
     if b_dtype == "fp4":
@@ -757,6 +813,8 @@ def compile_flydsl_moe_stage2(
             x_nt=x_nt,
             scale_nt=scale_nt,
             out_nt=out_nt,
+            b_pool_depth=b_pool_depth,
+            x_pool_depth=x_pool_depth,
         )
 
 
@@ -1292,6 +1350,8 @@ def flydsl_moe_stage2(
     x_nt: Optional[int] = None,
     scale_nt: Optional[int] = None,
     out_nt: Optional[int] = None,
+    b_pool_depth: int = 0,
+    x_pool_depth: int = 0,
 ) -> torch.Tensor:
     """Down-projection GEMM (MOE stage2). Supports atomic/reduce modes.
 
@@ -1433,6 +1493,8 @@ def flydsl_moe_stage2(
         x_nt=x_nt,
         scale_nt=scale_nt,
         out_nt=out_nt,
+        b_pool_depth=b_pool_depth,
+        x_pool_depth=x_pool_depth,
     )
     _run_compiled(exe, args)
 
