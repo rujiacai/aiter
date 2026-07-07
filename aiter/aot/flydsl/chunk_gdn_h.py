@@ -201,8 +201,14 @@ def _compile_chunk_gdn_h_to_cache(
 
     import torch
 
-    has_cuda = torch.cuda.is_available() and torch.cuda.device_count() > 0
-    dev = torch.device("cuda") if has_cuda else torch.device("cpu")
+    # AOT runs inside setup.py's forked ProcessPoolExecutor. Touching real
+    # CUDA in a forked child raises "Cannot re-initialize CUDA in forked
+    # subprocess". COMPILE_ONLY=1 only compiles (no kernel launch), so the
+    # cache key depends solely on shape/dtype/stride -- CPU dummy tensors and
+    # a null stream are sufficient and keep this fork-safe (matches the
+    # cpu-device pattern used by moe.py / gemm.py AOT). Do NOT call any
+    # torch.cuda.* here, as that alone can initialize CUDA in the child.
+    dev = torch.device("cpu")
     torch_dtype = _torch_dtype_for_kernel(dtype)
     state_dtype = torch.bfloat16 if state_bf16 else torch.float32
 
@@ -231,7 +237,7 @@ def _compile_chunk_gdn_h_to_cache(
     cu_seqlens = torch.zeros((N + 1,), device=dev, dtype=torch.int32)
     chunk_offsets = torch.zeros((N + 1,), device=dev, dtype=torch.int32)
 
-    stream = fx.Stream(torch.cuda.current_stream(device=dev) if has_cuda else 0)
+    stream = fx.Stream(0)
 
     launch_fn = compile_chunk_gated_delta_h(
         K=K,

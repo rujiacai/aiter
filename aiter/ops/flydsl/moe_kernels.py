@@ -139,6 +139,19 @@ def get_flydsl_stage1_kernels(
                                     }
     return kernels
 
+def _stage2_mfma_variant_tag(tile_k: int, a_dtype: str, b_dtype: str) -> str:
+    """Tag for the FP4-weight stage2 MFMA32x32x64 path used at tile_k=128.
+
+    tile_k=128 avoids K padding for FP4 weights and runs on the
+    ``mfma_scale_f32_32x32x64_f8f6f4`` instruction, which natively supports both
+    fp4 and fp8 activations (a4w4 and a8w4). Returns "" for the default
+    16x16x128 path (tile_k=256).
+    """
+    if b_dtype != "fp4" or a_dtype not in ("fp4", "fp8"):
+        return ""
+    if int(tile_k) == 128:
+        return "mfma32k64"
+    return ""
 
 def get_flydsl_stage2_kernels(
     a_dtype: str, b_dtype: str, out_dtype: str
@@ -189,6 +202,37 @@ def get_flydsl_stage2_kernels(
                                 **base_params,
                                 "persist": True,
                             }
+    # tile_k=128 candidates run on the dedicated MFMA32x32x64 f8f6f4 path, which
+    # avoids K padding for FP4 weights (e.g. inter_dim=384). Supported for fp4
+    # and fp8 activations, reduce mode only, tile_m in (32, 64), tile_n == 128.
+    # Always offered for FP4 weights (the in-kernel MFMA32x32x64 path is
+    # implemented and validated).
+    if is_fp4 and _stage2_mfma_variant_tag(128, a_dtype, b_dtype):
+        for tm in (32, 64):
+            for bnt in b_nts:
+                for xcd in xcd_swizzles:
+                    base_name = flydsl_kernel_name(
+                        2, a_dtype, b_dtype, out_dtype, tm, 128, 128, "reduce"
+                    )
+                    base_name += "_mfma32k64"
+                    if bnt != 0:
+                        base_name += f"_bnt{bnt}"
+                    if xcd > 0:
+                        base_name += f"_xcd{xcd}"
+                    kernels[base_name] = {
+                        "stage": 2,
+                        "a_dtype": a_dtype,
+                        "b_dtype": b_dtype,
+                        "out_dtype": out_dtype,
+                        "tile_m": tm,
+                        "tile_n": 128,
+                        "tile_k": 128,
+                        "mode": "reduce",
+                        "MPerBlock": tm,
+                        "b_nt": bnt,
+                        "xcd_swizzle": xcd,
+                        "mfma_variant": "mfma32k64",
+                    }
     return kernels
 
 
@@ -386,6 +430,7 @@ def compile_flydsl_moe_stage2(
     inter_dim_pad: int = 0,
     xcd_swizzle: int = 0,
     enable_bias: bool = False,
+    mfma_variant: Optional[str] = None,
 ):
     """Compile stage2 kernel (cached via underlying lru_cache)."""
     if b_dtype == "fp4":
@@ -411,6 +456,7 @@ def compile_flydsl_moe_stage2(
             inter_dim_pad=inter_dim_pad,
             xcd_swizzle=xcd_swizzle,
             enable_bias=enable_bias,
+            mfma_variant=mfma_variant,
         )
     elif a_dtype == "bf16" and b_dtype == "int4":
         # a16wi4: bf16 activations, int4 weights with groupwise scale
@@ -815,8 +861,13 @@ def flydsl_moe_stage1(
     )
     padded_rows = (sorted_size + 255) // 256 * 256
     padded_cols = (scale_cols + 7) // 8 * 8
+    # Zero-init: the fused silu+quant+scale-sort kernel only writes the real
+    # scale_cols (=inter_dim/32) columns. For non-256-aligned inter_dim the
+    # buffer is K-padded to a multiple of 8 (e.g. 12 -> 16) and those pad
+    # columns stay unwritten; an uninitialized e8m0 byte 0xFF decodes to 2^128
+    # (inf), and stage2 reads the padded columns (0 OOB-activation * inf = NaN).
     out_scale_sorted_flat = (
-        torch.empty(padded_rows * padded_cols, dtype=torch.uint8, device=dev)
+        torch.zeros(padded_rows * padded_cols, dtype=torch.uint8, device=dev)
         if _need_sort
         else torch.empty(0, dtype=torch.uint8, device=dev)
     )
@@ -1056,6 +1107,7 @@ def flydsl_moe_stage2(
     inter_dim_pad: int = 0,
     xcd_swizzle: int = 0,
     bias: Optional[torch.Tensor] = None,
+    mfma_variant: Optional[str] = None,
     expert_mask: Optional[torch.Tensor] = None,
     topk_ids: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
@@ -1128,6 +1180,11 @@ def flydsl_moe_stage2(
     if a_dtype == "fp8":
         _persist_m = 1
 
+    # The MFMA32x32x64 tile_k=128 path is validated only with the non-persistent
+    # (persist_m=1) schedule.
+    if mfma_variant == "mfma32k64":
+        _persist_m = 1
+
     if bias is not None and bias.dtype != torch.float32:
         bias = bias.to(torch.float32)
     is_fp4 = b_dtype == "fp4"
@@ -1197,6 +1254,7 @@ def flydsl_moe_stage2(
         inter_dim_pad=inter_dim_pad,
         xcd_swizzle=xcd_swizzle,
         enable_bias=(bias is not None),
+        mfma_variant=mfma_variant,
     )
     _run_compiled(exe, args)
 
