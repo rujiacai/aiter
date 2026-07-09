@@ -151,6 +151,11 @@ def _parse_flydsl_kernel_name(name: str) -> Optional[Dict]:
             params["fuse_fp4_quant"] = True
         elif stage == 2 and token == "persist":
             params["persist"] = True
+        elif stage == 2 and token.startswith("pn") and token[2:].isdigit():
+            # persist_n: number of consecutive N-tiles each workgroup serially
+            # sweeps (per-WG N-loop length), reusing the M-block's activation X
+            # across them. See compile_moe_gemm2.
+            params["persist_n"] = int(token[2:])
         elif token.startswith("sbm") and token[3:].isdigit():
             params["sort_block_m"] = int(token[3:])
         elif token == "fq":
@@ -319,6 +324,29 @@ def _persist_m_candidates() -> list[int]:
         if iv >= 1 and iv not in out:
             out.append(iv)
     return out or [1]
+
+
+def _persist_n_candidates() -> list[int]:
+    """Yield persist_n tuning candidates (N-merge along the output/model_dim).
+
+    persist_n = how many consecutive N-tiles each WG serially sweeps, reusing
+    the M-block's activation X across them (X is independent of the output dim).
+    Default OFF: returns [] so the candidate set is byte-identical unless widened
+    via env, e.g.
+      AITER_TUNE_MOE_PERSIST_N=1,2,4,8,16
+    Only values > 1 emit extra `_pn{n}` variants; per-shape divisibility (n must
+    divide model_dim/tile_n) is checked by the caller when the shape is known.
+    """
+    vals = _tune_csv("AITER_TUNE_MOE_PERSIST_N", ["0"])
+    out: list[int] = []
+    for v in vals:
+        try:
+            iv = int(v)
+        except ValueError:
+            continue
+        if iv > 1 and iv not in out:
+            out.append(iv)
+    return out
 
 
 def _async_copy_candidates() -> list[bool]:
@@ -632,6 +660,31 @@ def get_flydsl_stage2_kernels(
                                                     "persist_m": pm,
                                                     **pp,
                                                 }
+                                                # persist_n (N-merge) variants:
+                                                # each WG sweeps `pn` consecutive
+                                                # N-tiles, reusing the M-block's X.
+                                                # Only for the plain pm==1/kb==1
+                                                # path; default env unset => no
+                                                # extra variants (candidate set
+                                                # unchanged). pn must divide the
+                                                # N-tile count (model_dim/tile_n)
+                                                # when the shape is known.
+                                                if pm == 1 and kb == 1:
+                                                    for pn in _persist_n_candidates():
+                                                        if (
+                                                            n_dim is not None
+                                                            and (n_dim // tn) % pn != 0
+                                                        ):
+                                                            continue
+                                                        kernels[
+                                                            base_name + ktag + pmtag + ptag + f"_pn{pn}"
+                                                        ] = {
+                                                            **base_params,
+                                                            **kp,
+                                                            "persist_m": pm,
+                                                            **pp,
+                                                            "persist_n": pn,
+                                                        }
     return kernels
 
 
@@ -765,6 +818,7 @@ def compile_flydsl_moe_stage2(
     out_nt: Optional[int] = None,
     b_pool_depth: int = 0,
     x_pool_depth: int = 0,
+    persist_n: int = 0,
 ):
     """Compile stage2 kernel (cached via underlying lru_cache)."""
     if b_dtype == "fp4":
@@ -815,6 +869,7 @@ def compile_flydsl_moe_stage2(
             out_nt=out_nt,
             b_pool_depth=b_pool_depth,
             x_pool_depth=x_pool_depth,
+            persist_n=persist_n,
         )
 
 
@@ -1352,6 +1407,7 @@ def flydsl_moe_stage2(
     out_nt: Optional[int] = None,
     b_pool_depth: int = 0,
     x_pool_depth: int = 0,
+    persist_n: int = 0,
 ) -> torch.Tensor:
     """Down-projection GEMM (MOE stage2). Supports atomic/reduce modes.
 
@@ -1495,6 +1551,7 @@ def flydsl_moe_stage2(
         out_nt=out_nt,
         b_pool_depth=b_pool_depth,
         x_pool_depth=x_pool_depth,
+        persist_n=persist_n,
     )
     _run_compiled(exe, args)
 

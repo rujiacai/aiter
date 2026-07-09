@@ -2577,6 +2577,7 @@ def compile_moe_gemm2(
     out_nt: int | None = None,
     b_pool_depth: int = 0,
     x_pool_depth: int = 0,
+    persist_n: int = 0,
 ):
     """Compile stage2 kernel (`moe_gemm2`) and return the compiled executable.
 
@@ -2624,6 +2625,38 @@ def compile_moe_gemm2(
         raise ValueError(
             f"persist_m={persist_m} and k_batch={k_batch} are mutually exclusive"
         )
+
+    # ── persist_n: N-merge factor (analogous to persist_m along M) ───────────
+    # persist_n = how many consecutive N-tiles (output/model_dim tiles) each
+    # workgroup serially sweeps. The N tiles of a given M-block share the SAME
+    # stage2 activation X (X depends only on M/inter_dim, not on the output
+    # dim), so folding several N-tiles into one WG lets X stay L2-resident and
+    # reused across them, and shrinks the launch N-grid dim by persist_n.
+    #   persist_n <= 1 (default) -> each WG covers 1 N-tile (grid N = gx_total,
+    #                               IR byte-identical to before).
+    #   persist_n = k > 1        -> grid N = gx_total/k; each WG loops over k
+    #                               consecutive N-tiles (base = block_id*k + j).
+    # Source precedence: the per-compile `persist_n` arg (from the `_pn{n}`
+    # kernel-name token) takes precedence, else env FLYDSL_MOE_STAGE2_PERSIST_N,
+    # else full-N default. A requested value that does not divide gx_total (or an
+    # unsupported combination) silently falls back to the default (persist_n=1).
+    # NOTE: kept intentionally independent of / mutually simple with the other
+    # workgroup-shaping knobs: persist_n>1 is only honored for the plain path
+    # (k_batch==1, persist_m==1) and when N stays on a single grid axis (i.e.
+    # not the gx-first XCD remap, which already splits N across XCDs).
+    _gx_total = int(model_dim) // int(tile_n)
+    _pn_env = int(os.environ.get("FLYDSL_MOE_STAGE2_PERSIST_N", "0") or "0")
+    _pn_req = int(persist_n) if int(persist_n) > 0 else _pn_env
+    _persist_n_ok = (
+        _pn_req > 1
+        and _pn_req <= _gx_total
+        and (_gx_total % _pn_req == 0)
+        and int(k_batch) == 1
+        and int(persist_m) == 1
+        and not MOE_XCD_REMAP_GX
+    )
+    _persist_n = _pn_req if _persist_n_ok else 1
+
     gpu_arch = get_hip_arch()
     allocator = SmemAllocator(None, arch=gpu_arch)
 
@@ -2817,9 +2850,12 @@ def compile_moe_gemm2(
     _xp_depth = x_pool_depth if x_pool_depth else MOE_S2_XPOOL_DEPTH
     _pool_tag = (f"_bp{_bp_depth}" if _bp_depth >= 2 else "") + (
         f"_xp{_xp_depth}" if _xp_depth >= 2 else "")
+    # Encode persist_n so distinct per-WG N-loop lengths get separate compile
+    # caches. Only emitted when partial (>1) so the default stays byte-identical.
+    _pn_tag = f"_pn{_persist_n}" if _persist_n > 1 else ""
     module_name = (
         f"mfma_moe2_{in_dtype}_{out_s}_{epilog_tag}"
-        f"_t{tile_m}x{tile_n}x{tile_k}{_async_tag2}{_wpe_tag2}{_bnt_tag2}{_wptr64_tag}{_sk_tag2}{_knob_tag}{_pm_tag}{_pool_tag}"
+        f"_t{tile_m}x{tile_n}x{tile_k}{_async_tag2}{_wpe_tag2}{_bnt_tag2}{_wptr64_tag}{_sk_tag2}{_knob_tag}{_pm_tag}{_pool_tag}{_pn_tag}"
         f"_abi5_wptr64gate"  # ABI bumped: optional 64-bit W load path gated by static size check
     ).replace("-", "_")
 
@@ -3209,7 +3245,10 @@ def compile_moe_gemm2(
                     arith.CmpIPredicate.ult, bx_m_i32, num_valid_i32
                 )
 
-            def _moe_gemm2_then_body():
+            def _moe_gemm2_then_body(_by_tile):
+                # `_by_tile` is the N-tile (model_dim tile) index this invocation
+                # computes. With persist_n<=1 it is simply `by`; with persist_n>1
+                # the caller sweeps `persist_n` consecutive tiles per WG.
                 # Expert id for this M tile.
                 expert_i32 = buffer_ops.buffer_load(
                     expert_rsrc, bx, vec_width=1, dtype=T.i32
@@ -3351,7 +3390,7 @@ def compile_moe_gemm2(
                 )
 
                 # Dynamic N tiling within block.
-                by_n = by * fx.Index(tile_n)
+                by_n = _by_tile * fx.Index(tile_n)
                 n_per_wave = tile_n // num_waves
                 num_acc_n = n_per_wave // 16
                 c_n_per_wave = fx.Index(n_per_wave)
@@ -4469,7 +4508,22 @@ def compile_moe_gemm2(
 
             _if_blk = scf.IfOp(blk_valid)
             with _if_then(_if_blk):
-                _moe_gemm2_then_body()
+                if _persist_n > 1:
+                    # persist_n N-loop: this WG serially sweeps `_persist_n`
+                    # consecutive N-tiles for its M-block. `by` is the per-WG
+                    # N-tile counter (launch N-grid was divided by _persist_n),
+                    # so the base tile is by*_persist_n. X for this M-block is
+                    # identical across the tiles, so re-streaming it keeps the
+                    # activation L2-resident (reused) across the sweep. A barrier
+                    # separates iterations so tile j's LDS is fully consumed
+                    # before tile j+1 reuses the same static LDS.
+                    _pn_base = by * fx.Index(_persist_n)
+                    for _pn_j in range_constexpr(_persist_n):
+                        #if _pn_j > 0:
+                        #    gpu.barrier()
+                        _moe_gemm2_then_body(_pn_base + fx.Index(_pn_j))
+                else:
+                    _moe_gemm2_then_body(by)
 
             if _persist2:
                 # barrier so LDS from this M-block is fully consumed before the next
@@ -4503,7 +4557,14 @@ def compile_moe_gemm2(
 
         n_in = arith.index_cast(T.index, i32_n_in)
         size_expert_ids_in = arith.index_cast(T.index, i32_size_expert_ids_in)
-        gx = n_in // fx.Index(tile_n)
+        # persist_n (>1) folds `_persist_n` consecutive N-tiles into each WG, so
+        # the N-tile grid dim shrinks by that factor (each WG loops the merged
+        # tiles internally). _persist_n<=1 keeps the original expression / IR.
+        gx = (
+            n_in // fx.Index(tile_n)
+            if _persist_n <= 1
+            else n_in // fx.Index(int(tile_n) * int(_persist_n))
+        )
         gy = size_expert_ids_in
         # Split-K multiplies the launch z-dim by k_batch. The kernel decodes
         # blockIdx.z as (group * k_batch + kz); k_batch==1 leaves the grid intact.
