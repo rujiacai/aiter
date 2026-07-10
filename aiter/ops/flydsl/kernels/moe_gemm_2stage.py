@@ -4367,24 +4367,17 @@ def compile_moe_gemm2(
                         num_acc_n: int,
                         lds_out,
                     ):
+                        # sx (per-token activation scale): decode+load inline. No
+                        # safe-clamp/select mask -- invalid/padding rows are dropped by
+                        # store_pair's row-validity guard (sentinel row_id==tokens makes
+                        # ts2 OOB -> buffer returns 0), so masking here is redundant.
                         fused2 = memref.load(lds_tid, [row_in_tile])
-                        t2 = fused2 & mask24_i32
-                        s2 = fused2 >> 24
-                        t_ok = arith.cmpi(arith.CmpIPredicate.ult, t2, tokens_i32)
-                        s_ok = arith.cmpi(arith.CmpIPredicate.ult, s2, topk_i32_v)
-                        ts_ok = t_ok & s_ok
-                        t2_safe = ts_ok.select(t2, fx.Int32(0))
-                        s2_safe = ts_ok.select(s2, fx.Int32(0))
-                        ts2 = t2_safe * topk_i32_v + s2_safe
+                        ts2 = (fused2 & mask24_i32) * topk_i32_v + (fused2 >> 24)
                         sx = (
                             fx.Float32(1.0)
                             if is_f16_or_bf16
-                            else arith.select(
-                                ts_ok,
-                                buffer_ops.buffer_load(
-                                    sx_rsrc, ts2, vec_width=1, dtype=T.f32, cache_modifier=_SCALE_CM
-                                ),
-                                fx.Float32(0.0),
+                            else buffer_ops.buffer_load(
+                                sx_rsrc, ts2, vec_width=1, dtype=T.f32, cache_modifier=_SCALE_CM
                             )
                         )
 
@@ -4397,13 +4390,23 @@ def compile_moe_gemm2(
                                     sorted_w_rsrc, row, vec_width=1, dtype=T.f32
                                 )
 
+                        # Depth-1 software pipeline over ni: pre-extract v for ni=0,
+                        # then each step scales/stores the current element while
+                        # pre-extracting the NEXT one. Overlaps the AccVGPR-read +
+                        # scale latency across ni, with only ONE extra value live
+                        # (unlike a full pool -> no VGPR pressure / occupancy loss).
+                        _v_cur = vector.extract(
+                            acc[mi * num_acc_n], static_position=[ii], dynamic_position=[]
+                        )
                         for ni in range_constexpr(num_acc_n):
                             col_local = col_base_local + (ni * 16)
                             sw = sw_vals[ni]
-                            acc_idx = mi * num_acc_n + ni
-                            v = vector.extract(
-                                acc[acc_idx], static_position=[ii], dynamic_position=[]
-                            )
+                            v = _v_cur
+                            if ni + 1 < num_acc_n:
+                                _v_cur = vector.extract(
+                                    acc[mi * num_acc_n + ni + 1],
+                                    static_position=[ii], dynamic_position=[],
+                                )
                             if is_int8:
                                 v = arith.sitofp(T.f32, v)
                             v = v * sx * sw
