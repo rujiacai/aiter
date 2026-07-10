@@ -4309,6 +4309,11 @@ def compile_moe_gemm2(
                                     ),
                                     fx.Float32(0.0),
                                 )
+                            # sx and tw are both per-row; fold into one product here
+                            # (still 0 for invalid rows since both carry the ts_ok mask).
+                            sxtw = sx * tw
+                        else:
+                            sxtw = sx
 
                         idx0 = (
                             t2_safe * model_i32
@@ -4316,16 +4321,14 @@ def compile_moe_gemm2(
 
                         for ni in range_constexpr(num_acc_n):
                             col_g = col_g_list[ni]
-                            sw = sw_vals[ni]
+                            csw = sxtw * sw_vals[ni]
                             acc_idx = mi * num_acc_n + ni
                             v = vector.extract(
                                 acc[acc_idx], static_position=[ii], dynamic_position=[]
                             )
                             if is_int8:
                                 v = arith.sitofp(T.f32, v)
-                            v = v * sx * sw
-                            if doweight_stage2:
-                                v = v * tw
+                            v = v * csw
                             col_i32 = arith.index_cast(T.i32, col_g)
                             idx_elem = idx0 + col_i32
                             byte_off = idx_elem * c4_i32
@@ -4366,6 +4369,7 @@ def compile_moe_gemm2(
                         col_base_local,
                         num_acc_n: int,
                         lds_out,
+                        lds_col_remap=None,
                     ):
                         # sx (per-token activation scale): decode+load inline. No
                         # safe-clamp/select mask -- invalid/padding rows are dropped by
@@ -4389,6 +4393,14 @@ def compile_moe_gemm2(
                                 tw = buffer_ops.buffer_load(
                                     sorted_w_rsrc, row, vec_width=1, dtype=T.f32
                                 )
+                            # Both sx (per-token) and tw (routed weight) are per-row,
+                            # i.e. invariant across ni; fold them into ONE product here
+                            # ("first time") so the ni loop drops a multiply. sw stays
+                            # per-column. FP mul is non-associative so the compiler
+                            # cannot hoist this itself.
+                            sxtw = sx * tw
+                        else:
+                            sxtw = sx
 
                         # Depth-1 software pipeline over ni: pre-extract v for ni=0,
                         # then each step scales/stores the current element while
@@ -4400,7 +4412,9 @@ def compile_moe_gemm2(
                         )
                         for ni in range_constexpr(num_acc_n):
                             col_local = col_base_local + (ni * 16)
-                            sw = sw_vals[ni]
+                            # Per-(row,ni) scale, independent of v -> computed off the
+                            # AccVGPR-read critical path (overlaps the extract latency).
+                            csw = sxtw * sw_vals[ni]
                             v = _v_cur
                             if ni + 1 < num_acc_n:
                                 _v_cur = vector.extract(
@@ -4409,12 +4423,19 @@ def compile_moe_gemm2(
                                 )
                             if is_int8:
                                 v = arith.sitofp(T.f32, v)
-                            v = v * sx * sw
-                            if doweight_stage2:
-                                v = v * tw
+                            v = v * csw
                             v_out = arith.trunc_f(out_elem(), v)
 
-                            lds_idx = row_base_lds + col_local
+                            # Interleaved LDS layout (when enabled): remap the column so
+                            # that a reader thread's n_reps fragments land adjacent -> the
+                            # CShuffle read side can use one wide ds_read instead of n_reps
+                            # narrow reads (halves the read-address VALU + ds_read count).
+                            lds_col = (
+                                lds_col_remap(col_local)
+                                if lds_col_remap is not None
+                                else col_local
+                            )
+                            lds_idx = row_base_lds + lds_col
                             vec1_out = T.vec(1, out_elem())
                             v1 = vector.from_elements(vec1_out, [v_out])
                             vector.store(v1, lds_out, [lds_idx], alignment=2)
@@ -4422,24 +4443,27 @@ def compile_moe_gemm2(
                     def precompute_row(*, row_local, row):
                         fused2 = memref.load(lds_tid, [row_local])
                         row_i32 = arith.index_cast(T.i32, row)
-                        row_valid0 = arith.cmpi(
+                        # Guard ONLY row < num_valid_ids (rejects the uninitialized garbage
+                        # tail). Sentinel padding rows (token==tokens) within num_valid are
+                        # neutralized elsewhere (sx OOB->0 => value 0; out idx OOB->dropped),
+                        # so t<tokens & s<topk are redundant.
+                        row_valid = arith.cmpi(
                             arith.CmpIPredicate.ult, row_i32, num_valid_i32
                         )
                         t = fused2 & mask24_i32
-                        s = fused2 >> 24
-                        t_ok = arith.cmpi(arith.CmpIPredicate.ult, t, tokens_i32)
-                        s_ok = arith.cmpi(arith.CmpIPredicate.ult, s, topk_i32_v)
-                        row_valid = row_valid0 & t_ok & s_ok
-                        return (fused2, row_valid)
+                        # Hoist the per-row output base index (idx0) up-front (invariant
+                        # across ni/columns); store_pair then only adds the column. Keeping
+                        # it here (not deferred into the store guard) lets the scheduler
+                        # overlap the index math across rows.
+                        if bool(accumulate):
+                            idx0 = t * model_i32
+                        else:
+                            s = fused2 >> 24
+                            idx0 = (t * topk_i32_v + s) * model_i32
+                        return (idx0, row_valid)
 
                     def store_pair(*, row_local, row, row_ctx, col_pair0, col_g0, frag):
-                        fused = row_ctx
-                        t = fused & mask24_i32
-                        s = fused >> 24
-                        idx0 = t * model_i32
-                        if not bool(accumulate):
-                            ts = t * topk_i32_v + s
-                            idx0 = ts * model_i32
+                        idx0 = row_ctx
                         col_i32 = arith.index_cast(T.i32, col_g0)
                         idx_elem = idx0 + col_i32
                         idx_elem_even = idx_elem & mask_even_i32
@@ -4507,6 +4531,7 @@ def compile_moe_gemm2(
                         write_row_to_lds=write_row_to_lds,
                         precompute_row=precompute_row,
                         store_pair=store_pair,
+                        interleave_n_reps=True,
                     )
 
             _if_blk = scf.IfOp(blk_valid)
