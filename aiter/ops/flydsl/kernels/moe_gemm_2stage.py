@@ -432,8 +432,14 @@ def compile_moe_gemm1(
     out_nt: int | None = None,
     b_pool_depth: int = 0,
     x_pool_depth: int = 0,
+    mfma_variant: str | None = None,
 ):
     """Compile stage1 kernel (`moe_gemm1`) and return the compiled executable.
+
+    mfma_variant selects the fp8 MFMA ISA (tunable; must be valid for tile_k):
+      - None / "16x16x128" : mfma_scale_f32_16x16x128_f8f6f4 (needs tile_k%128==0),
+                             else falls back to 16x16x32.
+      - "16x16x32"         : force mfma_f32_16x16x32_fp8_fp8 (needs tile_k%32==0).
 
     in_dtype:
       - "fp8": X/W are fp8
@@ -570,9 +576,15 @@ def compile_moe_gemm1(
 
     _is_gfx950 = str(gpu_arch).startswith("gfx950")
     _use_k64_mfma = _is_gfx950 and is_int8
+    # mfma_variant tuning knob (same as stage2): force 16x16x32 when requested,
+    # else auto (wide 16x16x128 scale MFMA whenever tile_k allows).
+    if mfma_variant in ("32x32x16", "mfma32k16"):
+        raise ValueError(f"mfma_variant={mfma_variant!r} (32x32x16) not wired in compile_moe_gemm1")
+    _force_16x16x32 = mfma_variant in ("16x16x32", "mfma16k32")
     _use_k128_mfma_fp8 = (
         _is_gfx950 and not is_int8 and not is_f16_or_bf16
         and (tile_k_bytes % 128) == 0
+        and not _force_16x16x32
     )
 
     mfma_i32_k32 = None
@@ -663,9 +675,10 @@ def compile_moe_gemm1(
         MOE_XCD_REMAP, MOE_XCD_REMAP_GX, _X_CM, _SCALE_CM, _OUT_ATOMIC_AUX
     )
     _pm_tag = f"_pm{persist_m}" if persist_m != 1 else ""
+    _mfma_tag = f"_mi{mfma_variant}" if mfma_variant else ""
     module_name = (
         f"mfma_moe1_{g1u_tag}_{in_dtype}_{out_dtype}_{epilog_tag}"
-        f"_t{tile_m}x{tile_n}x{tile_k}{_async_tag}{_wpe_tag}{_bnt_tag}{_wptr64_tag}{_sk_tag1}{_knob_tag}{_pm_tag}"
+        f"_t{tile_m}x{tile_n}x{tile_k}{_async_tag}{_wpe_tag}{_bnt_tag}{_wptr64_tag}{_sk_tag1}{_knob_tag}{_pm_tag}{_mfma_tag}"
         f"_abi6_wptr64gate"  # ABI bumped: optional 64-bit W load path gated by static size check
     ).replace("-", "_")
 
@@ -2669,8 +2682,15 @@ def compile_moe_gemm2(
     b_pool_depth: int = 0,
     x_pool_depth: int = 0,
     persist_n: int = 0,
+    mfma_variant: str | None = None,
 ):
     """Compile stage2 kernel (`moe_gemm2`) and return the compiled executable.
+
+    mfma_variant selects the fp8 MFMA ISA (tunable; must be valid for tile_k):
+      - None / "16x16x128" : mfma_scale_f32_16x16x128_f8f6f4 (needs tile_k%128==0),
+                             else falls back to 16x16x32.
+      - "16x16x32"         : mfma_f32_16x16x32_fp8_fp8 (needs tile_k%32==0).
+    (32x32x16 not yet wired in this kernel.)
 
     in_dtype:
       - "fp8": A2/W are fp8
@@ -2843,9 +2863,16 @@ def compile_moe_gemm2(
     num_waves = tile_n // 32
     total_threads = num_waves * 64
     tile_k_bytes = int(tile_k) * int(elem_bytes)
+    # mfma_variant tuning knob: pick the fp8 MFMA ISA (given tile_k allows it).
+    #   None/"16x16x128" -> auto (wide scale MFMA when tk%128==0, else 16x16x32)
+    #   "16x16x32"       -> force mfma_f32_16x16x32_fp8_fp8
+    if mfma_variant in ("32x32x16", "mfma32k16"):
+        raise ValueError(f"mfma_variant={mfma_variant!r} (32x32x16) not wired in compile_moe_gemm2")
+    _force_16x16x32 = mfma_variant in ("16x16x32", "mfma16k32")
     _use_k128_mfma_fp8 = (
         _is_gfx950 and not is_int8 and not is_f16_or_bf16
         and (tile_k_bytes % 128) == 0
+        and not _force_16x16x32
     )
     if (tile_k_bytes % 64) != 0:
         raise ValueError(
@@ -2944,9 +2971,10 @@ def compile_moe_gemm2(
     # Encode persist_n so distinct per-WG N-loop lengths get separate compile
     # caches. Only emitted when partial (>1) so the default stays byte-identical.
     _pn_tag = f"_pn{_persist_n}" if _persist_n > 1 else ""
+    _mfma_tag = f"_mi{mfma_variant}" if mfma_variant else ""
     module_name = (
         f"mfma_moe2_{in_dtype}_{out_s}_{epilog_tag}"
-        f"_t{tile_m}x{tile_n}x{tile_k}{_async_tag2}{_wpe_tag2}{_bnt_tag2}{_wptr64_tag}{_sk_tag2}{_knob_tag}{_pm_tag}{_pool_tag}{_pn_tag}"
+        f"_t{tile_m}x{tile_n}x{tile_k}{_async_tag2}{_wpe_tag2}{_bnt_tag2}{_wptr64_tag}{_sk_tag2}{_knob_tag}{_pm_tag}{_pool_tag}{_pn_tag}{_mfma_tag}"
         f"_abi5_wptr64gate"  # ABI bumped: optional 64-bit W load path gated by static size check
     ).replace("-", "_")
 

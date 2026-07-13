@@ -131,7 +131,7 @@ def _parse_flydsl_kernel_name(name: str) -> Optional[Dict]:
             params["use_async_copy"] = True
         elif stage == 2 and token in ("atomic", "reduce"):
             params["mode"] = token
-        elif token in ("mfma16k128", "mfma32k64"):
+        elif token in ("mfma16k128", "mfma32k64", "mfma16k32"):
             params["mfma_variant"] = token
         elif token.startswith("w") and token[1:].isdigit():
             params["waves_per_eu"] = int(token[1:])
@@ -349,6 +349,55 @@ def _persist_n_candidates() -> list[int]:
     return out
 
 
+def _stage2_mfma_variants(tk: int, a_dtype: str, b_dtype: str):
+    """Yield (name_tag, params-overlay) for the fp8 stage2 MFMA-ISA choice.
+
+    For a given tile_k, several MFMA instructions are valid; this exposes that as
+    a tuning dimension so the tuner can pick the best-latency ISA per shape:
+      - auto / 16x16x128 : the wide `mfma_scale_f32_16x16x128_f8f6f4` when
+                           tk % 128 == 0 (else the kernel falls back to 16x16x32).
+      - 16x16x32         : force `mfma_f32_16x16x32_fp8_fp8` even at tk % 128 == 0.
+                           Finer-grained -> lets pooling/soft-pipeline hide more of
+                           the VALU->MFMA dependency stall (anti-starvation).
+
+    Default (env unset) yields only the auto variant, so the candidate set stays
+    byte-identical unless widened via AITER_TUNE_MOE_MFMA=auto,16x16x32. Only ISA
+    valid for the given tile_k (and platform, gfx950 for the wide scale MFMA) are
+    emitted.
+    """
+    if b_dtype == "fp4":
+        # fp4 keeps its dedicated MFMA path (see _stage2_mfma_variant_tag).
+        yield "", {}
+        return
+    specs = _tune_csv("AITER_TUNE_MOE_MFMA", ["auto"])
+    seen: set[str] = set()
+    for s in specs:
+        s = s.strip().lower()
+        if s in ("", "auto", "16x16x128", "mfma16k128"):
+            key = "auto"
+        elif s in ("16x16x32", "mfma16k32"):
+            # Only meaningful where auto would pick the wide 16x16x128 (tk % 128
+            # == 0); at tk % 128 != 0 auto already emits 16x16x32, so forcing it
+            # would just duplicate that candidate.
+            if (tk % 128) != 0:
+                continue
+            key = "mfma16k32"
+        else:
+            raise ValueError(
+                "AITER_TUNE_MOE_MFMA tokens must be in "
+                "{auto,16x16x128,16x16x32}, got " + repr(s)
+            )
+        if key in seen:
+            continue
+        seen.add(key)
+        if key == "auto":
+            yield "", {}
+        else:
+            yield f"_{key}", {"mfma_variant": key}
+    if not seen:
+        yield "", {}
+
+
 def _async_copy_candidates() -> list[bool]:
     gfx = _current_gfx()
     if gfx == "gfx942":
@@ -508,45 +557,47 @@ def get_flydsl_stage1_kernels(
                                     if is_fp4:
                                         kernels[name] = base
                                         continue
-                                    # persist_m (workgroup-merge along M) is the
-                                    # inverse of split-K, so it only applies when
-                                    # k_batch==1. The tuner gates split-K vs persist
-                                    # by token count.
-                                    _pms = _persist_m_candidates() if kb == 1 else [1]
-                                    for ktag, kp in _moe_knob_variants(kb):
-                                        for pm in _pms:
-                                            pmtag = f"_pm{pm}" if pm != 1 else ""
-                                            # NOTE: no B/X prefetch-pool candidates for
-                                            # stage1. Measured (all token sizes): bp2/bp3
-                                            # -41%/-71%, xp2/xp3 -5%/-10%, all negative.
-                                            # Stage1 carries gate+up (2x accumulators +
-                                            # 2x weight tiles), so it is occupancy/register
-                                            # bound with no headroom; extra in-flight pool
-                                            # tiles collapse occupancy (bp3 spills). Pool is
-                                            # a stage2-only optimization.
-                                            kernels[name + ktag + pmtag] = {
-                                                **base,
-                                                **kp,
-                                                "persist_m": pm,
-                                            }
-                                        # B/X prefetch pool: reuse the shared
-                                        # `_pool_variants()` as tunable name tokens
-                                        # (`_bpN`/`_xpN`/`_bpNxpN`) exactly like stage2
-                                        # (driven by AITER_TUNE_MOE_POOL). Only for small N
-                                        # tiles (tile_n<=128) with register room -- gate+up
-                                        # doubles the accumulators, so large tiles spill.
-                                        # k_batch==1, persist_m==1. Skip "" (no-pool already
-                                        # emitted above).
-                                        if kb == 1 and tn <= 128:
-                                            for ptag, pp in _pool_variants():
-                                                if not pp:
-                                                    continue
-                                                kernels[name + ktag + ptag] = {
-                                                    **base,
+                                    # fp8 MFMA-ISA choice (16x16x128 scale vs
+                                    # 16x16x32) is a tuning dimension, gated per
+                                    # tile_k. Default env => auto only, so the
+                                    # candidate set is byte-identical unless widened
+                                    # via AITER_TUNE_MOE_MFMA (shared with stage2).
+                                    for mvtag, mvp in _stage2_mfma_variants(
+                                        tk, a_dtype, b_dtype
+                                    ):
+                                        v_name = name + mvtag
+                                        v_base = {**base, **mvp}
+                                        # persist_m (workgroup-merge along M) is the
+                                        # inverse of split-K, so it only applies when
+                                        # k_batch==1. The tuner gates split-K vs persist
+                                        # by token count.
+                                        _pms = _persist_m_candidates() if kb == 1 else [1]
+                                        for ktag, kp in _moe_knob_variants(kb):
+                                            for pm in _pms:
+                                                pmtag = f"_pm{pm}" if pm != 1 else ""
+                                                kernels[v_name + ktag + pmtag] = {
+                                                    **v_base,
                                                     **kp,
-                                                    "persist_m": 1,
-                                                    **pp,
+                                                    "persist_m": pm,
                                                 }
+                                            # B/X prefetch pool: reuse the shared
+                                            # `_pool_variants()` as tunable name tokens
+                                            # (`_bpN`/`_xpN`/`_bpNxpN`) exactly like stage2
+                                            # (driven by AITER_TUNE_MOE_POOL). Only for small N
+                                            # tiles (tile_n<=128) with register room -- gate+up
+                                            # doubles the accumulators, so large tiles spill.
+                                            # k_batch==1, persist_m==1. Skip "" (no-pool already
+                                            # emitted above).
+                                            if kb == 1 and tn <= 128:
+                                                for ptag, pp in _pool_variants():
+                                                    if not pp:
+                                                        continue
+                                                    kernels[v_name + ktag + ptag] = {
+                                                        **v_base,
+                                                        **kp,
+                                                        "persist_m": 1,
+                                                        **pp,
+                                                    }
     return kernels
 
 
@@ -652,57 +703,67 @@ def get_flydsl_stage2_kernels(
                                     if is_fp4:
                                         kernels[base_name] = base_params
                                         continue
-                                    # persist_m (workgroup-merge along M) is the
-                                    # inverse of split-K, so it only applies when
-                                    # k_batch==1. The tuner gates split-K vs persist
-                                    # by token count.
-                                    _pms = _persist_m_candidates() if kb == 1 else [1]
-                                    for ktag, kp in _moe_knob_variants(kb):
-                                        for pm in _pms:
-                                            pmtag = f"_pm{pm}" if pm != 1 else ""
-                                            # B/X prefetch pool applies to ALL stage2
-                                            # paths (default, persist_m>1, split-K): the
-                                            # pool is a compile-time ring over the same
-                                            # constexpr K-loop, which is emitted inside the
-                                            # persist-loop body and is split-K slice-aware
-                                            # (uses k_start/num_k_tiles_py). Measured gains
-                                            # ~+5-8% at 16k/40k for pm4 and kb2 (X pool
-                                            # still helps since activations aren't reused
-                                            # across M-blocks). kernel has no pm/kb gate on
-                                            # _use_pool; this just makes them candidates.
-                                            _pvars = list(_pool_variants())
-                                            for ptag, pp in _pvars:
-                                                kernels[base_name + ktag + pmtag + ptag] = {
-                                                    **base_params,
-                                                    **kp,
-                                                    "persist_m": pm,
-                                                    **pp,
-                                                }
-                                                # persist_n (N-merge) variants:
-                                                # each WG sweeps `pn` consecutive
-                                                # N-tiles, reusing the M-block's X.
-                                                # Only for the plain pm==1/kb==1
-                                                # path; default env unset => no
-                                                # extra variants (candidate set
-                                                # unchanged). pn must divide the
-                                                # N-tile count (model_dim/tile_n)
-                                                # when the shape is known.
-                                                if pm == 1 and kb == 1:
-                                                    for pn in _persist_n_candidates():
-                                                        if (
-                                                            n_dim is not None
-                                                            and (n_dim // tn) % pn != 0
-                                                        ):
-                                                            continue
-                                                        kernels[
-                                                            base_name + ktag + pmtag + ptag + f"_pn{pn}"
-                                                        ] = {
-                                                            **base_params,
-                                                            **kp,
-                                                            "persist_m": pm,
-                                                            **pp,
-                                                            "persist_n": pn,
-                                                        }
+                                    # fp8 MFMA-ISA choice (16x16x128 scale vs
+                                    # 16x16x32) is a tuning dimension, gated per
+                                    # tile_k. Default env => auto only, so the
+                                    # candidate set is byte-identical unless widened
+                                    # via AITER_TUNE_MOE_MFMA.
+                                    for mvtag, mvp in _stage2_mfma_variants(
+                                        tk, a_dtype, b_dtype
+                                    ):
+                                        v_name = base_name + mvtag
+                                        v_params = {**base_params, **mvp}
+                                        # persist_m (workgroup-merge along M) is the
+                                        # inverse of split-K, so it only applies when
+                                        # k_batch==1. The tuner gates split-K vs persist
+                                        # by token count.
+                                        _pms = _persist_m_candidates() if kb == 1 else [1]
+                                        for ktag, kp in _moe_knob_variants(kb):
+                                            for pm in _pms:
+                                                pmtag = f"_pm{pm}" if pm != 1 else ""
+                                                # B/X prefetch pool applies to ALL stage2
+                                                # paths (default, persist_m>1, split-K): the
+                                                # pool is a compile-time ring over the same
+                                                # constexpr K-loop, which is emitted inside the
+                                                # persist-loop body and is split-K slice-aware
+                                                # (uses k_start/num_k_tiles_py). Measured gains
+                                                # ~+5-8% at 16k/40k for pm4 and kb2 (X pool
+                                                # still helps since activations aren't reused
+                                                # across M-blocks). kernel has no pm/kb gate on
+                                                # _use_pool; this just makes them candidates.
+                                                _pvars = list(_pool_variants())
+                                                for ptag, pp in _pvars:
+                                                    kernels[v_name + ktag + pmtag + ptag] = {
+                                                        **v_params,
+                                                        **kp,
+                                                        "persist_m": pm,
+                                                        **pp,
+                                                    }
+                                                    # persist_n (N-merge) variants:
+                                                    # each WG sweeps `pn` consecutive
+                                                    # N-tiles, reusing the M-block's X.
+                                                    # Only for the plain pm==1/kb==1
+                                                    # path; default env unset => no
+                                                    # extra variants (candidate set
+                                                    # unchanged). pn must divide the
+                                                    # N-tile count (model_dim/tile_n)
+                                                    # when the shape is known.
+                                                    if pm == 1 and kb == 1:
+                                                        for pn in _persist_n_candidates():
+                                                            if (
+                                                                n_dim is not None
+                                                                and (n_dim // tn) % pn != 0
+                                                            ):
+                                                                continue
+                                                            kernels[
+                                                                v_name + ktag + pmtag + ptag + f"_pn{pn}"
+                                                            ] = {
+                                                                **v_params,
+                                                                **kp,
+                                                                "persist_m": pm,
+                                                                **pp,
+                                                                "persist_n": pn,
+                                                            }
     return kernels
 
 
@@ -753,6 +814,7 @@ def compile_flydsl_moe_stage1(
     out_nt: Optional[int] = None,
     b_pool_depth: int = 0,
     x_pool_depth: int = 0,
+    mfma_variant: Optional[str] = None,
 ):
     """Compile stage1 kernel (cached via underlying lru_cache)."""
     if b_dtype == "fp4":
@@ -810,6 +872,7 @@ def compile_flydsl_moe_stage1(
             out_nt=out_nt,
             b_pool_depth=b_pool_depth,
             x_pool_depth=x_pool_depth,
+            mfma_variant=mfma_variant,
         )
 
 
@@ -892,6 +955,7 @@ def compile_flydsl_moe_stage2(
             b_pool_depth=b_pool_depth,
             x_pool_depth=x_pool_depth,
             persist_n=persist_n,
+            mfma_variant=mfma_variant,
         )
 
 
@@ -1115,6 +1179,7 @@ def flydsl_moe_stage1(
     out_nt: Optional[int] = None,
     b_pool_depth: int = 0,
     x_pool_depth: int = 0,
+    mfma_variant: Optional[str] = None,
 ):
     """Fused MOE stage1 GEMM.
 
@@ -1345,6 +1410,7 @@ def flydsl_moe_stage1(
         out_nt=out_nt,
         b_pool_depth=b_pool_depth,
         x_pool_depth=x_pool_depth,
+        mfma_variant=mfma_variant,
     )
     _run_compiled(exe, args)
 

@@ -1006,6 +1006,7 @@ def _flydsl_stage1_wrapper(
         gate_only=parsed.get("gate_only", False),
         b_pool_depth=parsed.get("b_pool_depth", 0),
         x_pool_depth=parsed.get("x_pool_depth", 0),
+        mfma_variant=parsed.get("mfma_variant", None),
     )
 
 
