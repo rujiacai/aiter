@@ -113,6 +113,21 @@ try:
     MOE_S2_BPOOL_DEPTH = int(os.environ.get("AITER_MOE_S2_BPOOL_DEPTH", "0") or "0")
 except ValueError:
     MOE_S2_BPOOL_DEPTH = 0
+# Stage1 depth-D B(weight) prefetch pool (env AITER_MOE_S1_BPOOL_DEPTH=N): same
+# ring-pool as stage2, but on the gate(+up) weight tiles. Front-loads N (gate,up)
+# tile-pairs so ~N weight loads stay in flight, matching the hand-tuned ASM's deep
+# prefetch prologue. Usually passed per-compile via the b_pool_depth kwarg (tuner).
+try:
+    MOE_S1_BPOOL_DEPTH = int(os.environ.get("AITER_MOE_S1_BPOOL_DEPTH", "0") or "0")
+except ValueError:
+    MOE_S1_BPOOL_DEPTH = 0
+# Stage1 depth-D X(activation) HBM prefetch pool (env AITER_MOE_S1_XPOOL_DEPTH=N):
+# same ring as stage2 -- front-load N X-tile HBM->reg loads; ds_write to LDS stays
+# 1-ahead (2-buffer ping-pong unchanged). Usually passed via the x_pool_depth kwarg.
+try:
+    MOE_S1_XPOOL_DEPTH = int(os.environ.get("AITER_MOE_S1_XPOOL_DEPTH", "0") or "0")
+except ValueError:
+    MOE_S1_XPOOL_DEPTH = 0
 # Stage2 depth-D X(activation) HBM prefetch pool (env AITER_MOE_S2_XPOOL_DEPTH=N):
 # front-load N X-tile HBM->reg loads into a ring; ds_write to LDS stays 1-ahead
 # (2-buffer ping-pong unchanged). Only the HBM load is deepened. X is the larger
@@ -415,6 +430,8 @@ def compile_moe_gemm1(
     x_nt: int | None = None,
     scale_nt: int | None = None,
     out_nt: int | None = None,
+    b_pool_depth: int = 0,
+    x_pool_depth: int = 0,
 ):
     """Compile stage1 kernel (`moe_gemm1`) and return the compiled executable.
 
@@ -1861,6 +1878,47 @@ def compile_moe_gemm1(
                     (k_start + fx.Index(_k_per_batch1)) if _is_splitk1 else k_in
                 )
 
+                # Deep B(weight)-prefetch pool (opt-in via b_pool_depth): front-load N
+                # (gate,up) tile-pairs so ~N weight loads stay in flight (match hand-tuned
+                # ASM's deep-prefetch prologue). Gated by _use_pool1 so the default
+                # (no-pool) path below is byte-identical.
+                _bp_depth1 = b_pool_depth if b_pool_depth else MOE_S1_BPOOL_DEPTH
+                _use_pool1 = (_bp_depth1 >= 2) and not use_async_copy
+
+                def _load_b_pair1(kk):
+                    return (
+                        load_b_tile(kk, n_blk_gate, n_intra_gate),
+                        load_b_tile(kk, n_blk_up, n_intra_up) if use_g1u1 else [],
+                    )
+
+                def _k_of1(t):
+                    _kk = arith.index(t * tile_k)
+                    return (k_start + _kk) if _is_splitk1 else _kk
+
+                _bpool1 = []
+                if _use_pool1:
+                    _pooln1 = min(_bp_depth1, total_tiles)
+                    _bpool1 = [(b_gate_cur, b_up_cur)] + [
+                        _load_b_pair1(_k_of1(t)) for t in range(1, _pooln1)
+                    ]
+                    if _pooln1 > 1:
+                        rocdl.sched_vmem(
+                            (_pooln1 - 1) * k_unroll * num_acc_n * 2 * (2 if use_g1u1 else 1)
+                        )
+
+                # X(activation) HBM prefetch pool: front-load tiles 1..depth into regs;
+                # ds_write to LDS stays 1-ahead (tile 0's X already stored in prologue).
+                _xp_depth1 = x_pool_depth if x_pool_depth else MOE_S1_XPOOL_DEPTH
+                _use_xpool1 = (_xp_depth1 >= 2) and not use_async_copy
+                _xpool1 = []
+                if _use_xpool1:
+                    _xpool1 = [
+                        load_x_tile(_k_of1(t))
+                        for t in range(1, min(_xp_depth1 + 1, total_tiles))
+                    ]
+                    if len(_xpool1) > 0:
+                        rocdl.sched_vmem(len(_xpool1) * num_x_loads)
+
                 for pair_i in range_constexpr(pair_iters):
                     k_iv = arith.index(pair_i * (tile_k * 2))
                     if _is_splitk1:
@@ -1869,16 +1927,28 @@ def compile_moe_gemm1(
                     next_k1 = k_iv + tile_k
                     if use_async_copy:
                         prefetch_x_to_lds(next_k1, lds_base_ping)
+                    elif _use_xpool1:
+                        x_regs_ping = _xpool1.pop(0)  # tile 2i+1
+                        _xtl0 = (2 * pair_i + 1) + _xp_depth1
+                        if _xtl0 < total_tiles:
+                            _xpool1.append(load_x_tile(_k_of1(_xtl0)))
                     else:
                         x_regs_ping = load_x_tile(next_k1)
-                    b_gate_ping = load_b_tile(next_k1, n_blk_gate, n_intra_gate)
-                    b_up_ping = load_b_tile(next_k1, n_blk_up, n_intra_up) if use_g1u1 else []
+                    if _use_pool1:
+                        _bg0, _bu0 = _bpool1.pop(0)
+                        _tl0 = 2 * pair_i + _bp_depth1
+                        if _tl0 < total_tiles:
+                            _bpool1.append(_load_b_pair1(_k_of1(_tl0)))
+                    else:
+                        b_gate_ping = load_b_tile(next_k1, n_blk_gate, n_intra_gate)
+                        b_up_ping = load_b_tile(next_k1, n_blk_up, n_intra_up) if use_g1u1 else []
+                        _bg0, _bu0 = b_gate_cur, b_up_cur
 
                     acc_gate, acc_up, _ = compute_tile(
                         acc_gate,
                         acc_up,
-                        b_gate_cur,
-                        b_up_cur,
+                        _bg0,
+                        _bu0,
                         lds_base_pong,
                         a0_prefetch=a0_prefetch_pong,
                         a1_prefetch=a1_prefetch_pong,
@@ -1907,16 +1977,28 @@ def compile_moe_gemm1(
                     next_k2 = k_iv + c2_tile_k
                     if use_async_copy:
                         prefetch_x_to_lds(next_k2, lds_base_pong)
+                    elif _use_xpool1:
+                        x_regs_pong = _xpool1.pop(0)  # tile 2i+2
+                        _xtl1 = (2 * pair_i + 2) + _xp_depth1
+                        if _xtl1 < total_tiles:
+                            _xpool1.append(load_x_tile(_k_of1(_xtl1)))
                     else:
                         x_regs_pong = load_x_tile(next_k2)
-                    b_gate_next = load_b_tile(next_k2, n_blk_gate, n_intra_gate)
-                    b_up_next = load_b_tile(next_k2, n_blk_up, n_intra_up) if use_g1u1 else []
+                    if _use_pool1:
+                        _bg1, _bu1 = _bpool1.pop(0)
+                        _tl1 = 2 * pair_i + 1 + _bp_depth1
+                        if _tl1 < total_tiles:
+                            _bpool1.append(_load_b_pair1(_k_of1(_tl1)))
+                    else:
+                        b_gate_next = load_b_tile(next_k2, n_blk_gate, n_intra_gate)
+                        b_up_next = load_b_tile(next_k2, n_blk_up, n_intra_up) if use_g1u1 else []
+                        _bg1, _bu1 = b_gate_ping, b_up_ping
 
                     acc_gate, acc_up, _ = compute_tile(
                         acc_gate,
                         acc_up,
-                        b_gate_ping,
-                        b_up_ping,
+                        _bg1,
+                        _bu1,
                         lds_base_ping,
                         a0_prefetch=a0_prefetch_ping,
                         a1_prefetch=a1_prefetch_ping,
@@ -1942,16 +2024,20 @@ def compile_moe_gemm1(
                     )
 
                     # Advance pong state to next_k2 for next iteration.
-                    b_gate_cur = b_gate_next
-                    b_up_cur = b_up_next
+                    if not _use_pool1:
+                        b_gate_cur = b_gate_next
+                        b_up_cur = b_up_next
 
                 # Tail: 2 remaining tiles at (k_end - 2*tile_k) and (k_end - tile_k),
                 # where k_end == k_in for the non-split-K path and the K-slice end otherwise.
                 # Rebuild prefetch in the current block: values produced inside the `range(...)`
                 # loop body may live in a child region and cannot be used here.
                 k_tail0 = _k_slice_end - c2_tile_k
-                b_gate_cur = load_b_tile(k_tail0, n_blk_gate, n_intra_gate)
-                b_up_cur = load_b_tile(k_tail0, n_blk_up, n_intra_up) if use_g1u1 else []
+                if _use_pool1:
+                    b_gate_cur, b_up_cur = _bpool1.pop(0)  # tile total_tiles-2
+                else:
+                    b_gate_cur = load_b_tile(k_tail0, n_blk_gate, n_intra_gate)
+                    b_up_cur = load_b_tile(k_tail0, n_blk_up, n_intra_up) if use_g1u1 else []
                 a0_prefetch_pong = lds_load_packs_k64(
                     row_a_lds, col_offset_base_bytes, lds_base_pong
                 )
@@ -1963,10 +2049,15 @@ def compile_moe_gemm1(
                 k_tail1 = _k_slice_end - tile_k
                 if use_async_copy:
                     prefetch_x_to_lds(k_tail1, lds_base_ping)
+                elif _use_xpool1:
+                    x_regs_ping = _xpool1.pop(0)  # last tile's X (held in pool)
                 else:
                     x_regs_ping = load_x_tile(k_tail1)
-                b_gate_ping = load_b_tile(k_tail1, n_blk_gate, n_intra_gate)
-                b_up_ping = load_b_tile(k_tail1, n_blk_up, n_intra_up) if use_g1u1 else []
+                if _use_pool1:
+                    b_gate_ping, b_up_ping = _bpool1.pop(0)  # tile total_tiles-1 (last)
+                else:
+                    b_gate_ping = load_b_tile(k_tail1, n_blk_gate, n_intra_gate)
+                    b_up_ping = load_b_tile(k_tail1, n_blk_up, n_intra_up) if use_g1u1 else []
 
                 acc_gate, acc_up, _ = compute_tile(
                     acc_gate,

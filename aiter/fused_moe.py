@@ -1004,6 +1004,8 @@ def _flydsl_stage1_wrapper(
         waves_per_eu=parsed.get("waves_per_eu", 3),
         b_nt=parsed.get("b_nt", 2),
         gate_only=parsed.get("gate_only", False),
+        b_pool_depth=parsed.get("b_pool_depth", 0),
+        x_pool_depth=parsed.get("x_pool_depth", 0),
     )
 
 
@@ -1053,6 +1055,8 @@ def _flydsl_stage2_wrapper(
         # For migrated old kernels (non `_persist` names), force legacy non-persistent path.
         persist=parsed.get("persist", False),
         persist_n=parsed.get("persist_n", 0),
+        b_pool_depth=parsed.get("b_pool_depth", 0),
+        x_pool_depth=parsed.get("x_pool_depth", 0),
         # reduce-mode scratch only needs zeroing when slots may be unwritten
         # (EP / variable dispatch); default True keeps direct callers safe.
         zero_intermediate=_kwargs.get("zero_intermediate", True),

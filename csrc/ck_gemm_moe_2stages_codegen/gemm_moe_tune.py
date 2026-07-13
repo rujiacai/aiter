@@ -499,6 +499,8 @@ class FmoeTuner(TunerCommon):
             x_nt=kparams.get("x_nt", None),
             scale_nt=kparams.get("scale_nt", None),
             out_nt=kparams.get("out_nt", None),
+            b_pool_depth=kparams.get("b_pool_depth", 0),
+            x_pool_depth=kparams.get("x_pool_depth", 0),
         )
         if isinstance(result, tuple):
             out_raw = result[0]

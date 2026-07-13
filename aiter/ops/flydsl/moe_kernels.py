@@ -529,6 +529,24 @@ def get_flydsl_stage1_kernels(
                                                 **kp,
                                                 "persist_m": pm,
                                             }
+                                        # B/X prefetch pool: reuse the shared
+                                        # `_pool_variants()` as tunable name tokens
+                                        # (`_bpN`/`_xpN`/`_bpNxpN`) exactly like stage2
+                                        # (driven by AITER_TUNE_MOE_POOL). Only for small N
+                                        # tiles (tile_n<=128) with register room -- gate+up
+                                        # doubles the accumulators, so large tiles spill.
+                                        # k_batch==1, persist_m==1. Skip "" (no-pool already
+                                        # emitted above).
+                                        if kb == 1 and tn <= 128:
+                                            for ptag, pp in _pool_variants():
+                                                if not pp:
+                                                    continue
+                                                kernels[name + ktag + ptag] = {
+                                                    **base,
+                                                    **kp,
+                                                    "persist_m": 1,
+                                                    **pp,
+                                                }
     return kernels
 
 
@@ -733,6 +751,8 @@ def compile_flydsl_moe_stage1(
     x_nt: Optional[int] = None,
     scale_nt: Optional[int] = None,
     out_nt: Optional[int] = None,
+    b_pool_depth: int = 0,
+    x_pool_depth: int = 0,
 ):
     """Compile stage1 kernel (cached via underlying lru_cache)."""
     if b_dtype == "fp4":
@@ -788,6 +808,8 @@ def compile_flydsl_moe_stage1(
             x_nt=x_nt,
             scale_nt=scale_nt,
             out_nt=out_nt,
+            b_pool_depth=b_pool_depth,
+            x_pool_depth=x_pool_depth,
         )
 
 
@@ -1091,6 +1113,8 @@ def flydsl_moe_stage1(
     x_nt: Optional[int] = None,
     scale_nt: Optional[int] = None,
     out_nt: Optional[int] = None,
+    b_pool_depth: int = 0,
+    x_pool_depth: int = 0,
 ):
     """Fused MOE stage1 GEMM.
 
@@ -1319,6 +1343,8 @@ def flydsl_moe_stage1(
         x_nt=x_nt,
         scale_nt=scale_nt,
         out_nt=out_nt,
+        b_pool_depth=b_pool_depth,
+        x_pool_depth=x_pool_depth,
     )
     _run_compiled(exe, args)
 
