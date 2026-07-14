@@ -21,6 +21,85 @@ def _get_dtypes():
     return dtypes
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Host-side weight/scale preparation for the FlyDSL a16w4 / a8w4 (CDNA3) paths.
+#
+# Both consume mxfp4 (e2m1 4-bit code + E8M0 per-32 scale) weights and reuse the
+# int4_bf16 preshuffle layout (shuffle_weight((16,16)) + pack_int8_to_packed_int4).
+#   - a16w4 (in_dtype=mxfp4_bf16): bf16 activation, weight packed as e2m1 codes,
+#     E8M0 decoded to a bf16 groupwise scale (shuffle_scale_for_int4 layout).
+#   - a8w4  (in_dtype=mxfp8):      fp8 activation, weight recast to fp8 with the
+#     per-pair E8M0 base folded into the fp8 exponent (lossless, powers of 2), and
+#     a per-pair-equal E8M0 scale applied post-MFMA.
+# These mirror the validated helpers in test_flydsl_moe_a16w4.py / test_a8w4_p0.py.
+# ─────────────────────────────────────────────────────────────────────────────
+_E2M1_CODEBOOK = (
+    0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+    0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+)
+
+
+def _mxfp4_codes_i8(wq_fp4x2, N, K):
+    """fp4x2 packed (E,N,K/2) -> e2m1 codes int8 (E,N,K), low nibble first."""
+    E = wq_fp4x2.shape[0]
+    u = wq_fp4x2.view(torch.uint8)
+    codes = torch.empty((E, N, K), dtype=torch.int8, device=wq_fp4x2.device)
+    codes[..., 0::2] = (u & 0x0F).to(torch.int8)
+    codes[..., 1::2] = ((u >> 4) & 0x0F).to(torch.int8)
+    return codes
+
+
+def prep_a16w4_weight(wq_fp4x2, N, K):
+    """mxfp4 fp4x2 weight (E,N,K/2) -> preshuffled packed-int4 codes for a16w4.
+
+    Byte layout is identical to the int4_bf16 path; only the code values are e2m1.
+    """
+    from aiter.ops.shuffle import shuffle_weight, pack_int8_to_packed_int4
+
+    dtypes = _get_dtypes()
+    E = wq_fp4x2.shape[0]
+    codes = _mxfp4_codes_i8(wq_fp4x2, N, K)
+    shuf = pack_int8_to_packed_int4(shuffle_weight(codes.view(dtypes.i8), (16, 16)))
+    return shuf.view(E, N, K // 2).view(dtypes.fp4x2)
+
+
+def prep_a16w4_scale(e8m0_scale, N, K, scale_mul=1.0):
+    """E8M0 per-32 scale -> bf16 groupwise scale (E,K/32,N) shuffled + flattened."""
+    from aiter.ops.shuffle import shuffle_scale_for_int4
+
+    E = e8m0_scale.view(torch.uint8).numel() // (N * (K // 32))
+    ws_u8 = e8m0_scale.view(torch.uint8).view(E, N, K // 32)
+    scale_f32 = torch.pow(2.0, ws_u8.float() - 127.0) * scale_mul
+    scale_bf16 = scale_f32.permute(0, 2, 1).contiguous().to(torch.bfloat16)  # (E,K/32,N)
+    return shuffle_scale_for_int4(scale_bf16, group_size=32).view(-1).contiguous()
+
+
+def prep_a8w4_weight_scale(wq_fp4x2, e8m0_scale, E, N, K):
+    """mxfp4 weight -> fp8 (per-group-pair base fold) + per-pair-equal E8M0 scale.
+
+    Exact: E8M0 scales are powers of 2, so folding the ratio 2^(exp_g - base) into the
+    e2m1 fp8 weight is an exact exponent shift; kernel then applies 2^base per pair.
+    Returns (w_fp8_shuffled[FP8], scale_shuffled[bf16 flat]) for b_dtype="mxfp8".
+    """
+    from aiter.ops.shuffle import shuffle_weight
+
+    dtypes = _get_dtypes()
+    FP8 = dtypes.fp8
+    G = K // 32
+    codes = _mxfp4_codes_i8(wq_fp4x2, N, K)                       # (E,N,K) int8 0..15
+    e2m1 = torch.tensor(_E2M1_CODEBOOK, dtype=torch.float32,
+                        device=wq_fp4x2.device)[codes.long()]     # (E,N,K) f32
+    u = e8m0_scale.view(torch.uint8).reshape(E, N, G).float()     # E8M0 exponent
+    up = u.reshape(E, N, G // 2, 2)
+    base = up.amax(dim=-1, keepdim=True)                          # per-pair common exponent
+    ratio_exp = (up - base).reshape(E, N, G)                      # <= 0, integer
+    wf = e2m1 * torch.exp2(ratio_exp.repeat_interleave(32, dim=2))  # exact power-of-2 shift
+    w_fp8_shuf = shuffle_weight(wf.to(FP8).view(torch.int8), layout=(16, 16)).view(FP8)
+    base_u8 = base.expand(E, N, G // 2, 2).reshape(E, N, G).to(torch.uint8)
+    scale_shuf = prep_a16w4_scale(base_u8, N, K, 1.0)
+    return w_fp8_shuf, scale_shuf
+
+
 _SUFFIX_RE = re.compile(
     r"(?:_kw(?P<kw>\d+))?(?P<fp4>_fp4)?(?P<fp8>_fp8)?(?:_sbm(?P<sbm>\d+))?$"
 )
@@ -366,7 +445,7 @@ def get_flydsl_stage2_kernels_mxfp4_bf16(out_dtype: str) -> Dict[str, Dict]:
     b_dtype = "mxfp4"
     tile_ks = [128, 256]
     tile_ms = [16, 32, 64, 128]
-    tile_ns = [128]
+    tile_ns = [128, 256]
     modes = ["atomic"]
 
     for tm in tile_ms:
@@ -396,6 +475,75 @@ def get_flydsl_stage2_kernels_mxfp4_bf16(out_dtype: str) -> Dict[str, Dict]:
     return kernels
 
 
+def get_flydsl_stage1_kernels_mxfp8(out_dtype: str) -> Dict[str, Dict]:
+    """Return {kernelName: params} for a8w4 (fp8 activation + mxfp4->fp8 weight) stage1."""
+    kernels = {}
+    a_dtype = "fp8"
+    b_dtype = "mxfp8"
+    tile_ks = [128, 256]
+    tile_ms = [16, 32, 64, 128]
+    tile_ns = [64, 128]
+    k_batches = [1, 2, 4, 7, 14]
+
+    for tm in tile_ms:
+        for tn in tile_ns:
+            for tk in tile_ks:
+                for kb in k_batches:
+                    name = flydsl_kernel_name(1, a_dtype, b_dtype, out_dtype, tm, tn, tk)
+                    if kb != 1:
+                        name += f"_kb{kb}"
+                    kernels[name] = {
+                        "stage": 1,
+                        "a_dtype": a_dtype,
+                        "b_dtype": b_dtype,
+                        "out_dtype": out_dtype,
+                        "tile_m": tm,
+                        "tile_n": tn,
+                        "tile_k": tk,
+                        "MPerBlock": tm,
+                        "in_dtype": "mxfp8",
+                        "k_batch": kb,
+                    }
+    return kernels
+
+
+def get_flydsl_stage2_kernels_mxfp8(out_dtype: str) -> Dict[str, Dict]:
+    """Return {kernelName: params} for a8w4 (fp8 activation + mxfp4->fp8 weight) stage2."""
+    kernels = {}
+    a_dtype = "fp8"
+    b_dtype = "mxfp8"
+    tile_ks = [128, 256]
+    tile_ms = [16, 32, 64, 128]
+    tile_ns = [128, 256]
+    modes = ["atomic"]
+
+    for tm in tile_ms:
+        for tn in tile_ns:
+            for tk in tile_ks:
+                for mode in modes:
+                    base_name = flydsl_kernel_name(
+                        2, a_dtype, b_dtype, out_dtype, tm, tn, tk, mode
+                    )
+                    base_params = {
+                        "stage": 2,
+                        "a_dtype": a_dtype,
+                        "b_dtype": b_dtype,
+                        "out_dtype": out_dtype,
+                        "tile_m": tm,
+                        "tile_n": tn,
+                        "tile_k": tk,
+                        "mode": mode,
+                        "MPerBlock": tm,
+                        "in_dtype": "mxfp8",
+                    }
+                    kernels[base_name] = base_params
+                    kernels[base_name + "_persist"] = {
+                        **base_params,
+                        "persist": True,
+                    }
+    return kernels
+
+
 def _register_all_configs():
     """Pre-populate _KERNEL_PARAMS with all supported configs at import time."""
     for a in ("fp8", "fp4", "fp16"):
@@ -415,6 +563,10 @@ def _register_all_configs():
     for out in ("bf16", "f16"):
         _KERNEL_PARAMS.update(get_flydsl_stage1_kernels_mxfp4_bf16(out))
         _KERNEL_PARAMS.update(get_flydsl_stage2_kernels_mxfp4_bf16(out))
+    # mxfp8 (a8w4: fp8 activation + mxfp4->fp8 recast weight, E8M0 per-32 scale)
+    for out in ("bf16", "f16"):
+        _KERNEL_PARAMS.update(get_flydsl_stage1_kernels_mxfp8(out))
+        _KERNEL_PARAMS.update(get_flydsl_stage2_kernels_mxfp8(out))
 
 
 _register_all_configs()
@@ -524,6 +676,30 @@ def compile_flydsl_moe_stage1(
             scale_is_bf16=True,
             k_batch=k_batch,
         )
+    elif a_dtype == "fp8" and b_dtype == "mxfp8":
+        # a8w4 Phase0 (CDNA3): fp8 activation x mxfp8 weight (fp8 e4m3fnuz codebook
+        # + E8M0 per-32 scale). Native fp8 MFMA; per-32 scale applied post-MFMA in f32.
+        # Reuses the a16w4 bf16 groupwise-scale layout.
+        from .kernels.moe_gemm_2stage import compile_moe_gemm1
+
+        _use_cshuffle = None if k_batch > 1 else False
+
+        return compile_moe_gemm1(
+            model_dim=model_dim,
+            inter_dim=inter_dim,
+            experts=experts,
+            topk=topk,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            tile_k=tile_k,
+            doweight_stage1=doweight_stage1,
+            in_dtype="mxfp8",
+            group_size=32,
+            out_dtype=out_dtype,
+            use_cshuffle_epilog=_use_cshuffle,
+            scale_is_bf16=True,
+            k_batch=k_batch,
+        )
     else:
         raise ValueError(
             f"Unsupported stage1 dtype combination: a_dtype={a_dtype}, b_dtype={b_dtype}"
@@ -621,6 +797,27 @@ def compile_flydsl_moe_stage2(
             tile_k=tile_k,
             doweight_stage2=doweight_stage2,
             in_dtype="mxfp4_bf16",
+            group_size=32,
+            out_dtype=out_dtype,
+            accumulate=accumulate,
+            scale_is_bf16=True,
+        )
+    elif a_dtype == "fp8" and b_dtype == "mxfp8":
+        # a8w4 Phase0 (CDNA3): fp8 activation x mxfp8 weight (fp8 e4m3fnuz codebook
+        # + E8M0 per-32 scale). Native fp8 MFMA; per-32 scale applied post-MFMA in f32.
+        # Reuses the a16w4 bf16 groupwise-scale layout.
+        from .kernels.moe_gemm_2stage import compile_moe_gemm2
+
+        return compile_moe_gemm2(
+            model_dim=model_dim,
+            inter_dim=inter_dim,
+            experts=experts,
+            topk=topk,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            tile_k=tile_k,
+            doweight_stage2=doweight_stage2,
+            in_dtype="mxfp8",
             group_size=32,
             out_dtype=out_dtype,
             accumulate=accumulate,
