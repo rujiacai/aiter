@@ -421,6 +421,14 @@ def fused_moe_(
     elif quant_type == QuantType.per_1x32 and q_dtype_w == dtypes.fp8:
         # mxfp8: both activation and weight are fp8 (per-1x32 e8m0 microscale).
         q_dtype_a = dtypes.fp8
+    elif (
+        quant_type == QuantType.per_1x32
+        and q_dtype_w == dtypes.fp4x2
+        and os.environ.get("AITER_FLYDSL_A16W4", "0") == "1"
+    ):
+        # a16w4 (FlyDSL CDNA3): bf16 activation x mxfp4 (e2m1) weight, E8M0 per-32
+        # scale pre-decoded to bf16. Reuses the int4_bf16 preshuffle pipeline.
+        q_dtype_a = dtypes.bf16
     elif quant_type == QuantType.per_1x32:
         if activation == ActivationType.Swiglu and gate_mode == GateMode.SEPARATED:
             q_dtype_a = dtypes.bf16 if M < _SWIGLU_MXFP4_BF16_BOUND else dtypes.fp4x2
@@ -1485,27 +1493,84 @@ def get_2stage_cfgs(
     )
     if (
         q_type == QuantType.per_1x32
-        and q_dtype_w == dtypes.i4x2
+        and q_dtype_w == dtypes.fp8
+        and os.environ.get("AITER_FLYDSL_A8W4", "0") == "1"
+        and is_flydsl_available()
+    ):
+        # a8w4 (FlyDSL CDNA3): fp8 activation x mxfp4->fp8 recast weight (per-pair
+        # E8M0 base folded into the fp8 exponent on host), native fp8 MFMA + per-32
+        # scale post-multiply. AITER_FLYDSL_A8W4=1. Weights/scales prepared by
+        # moe_kernels.prep_a8w4_weight_scale; activation quantized per-token to fp8.
+        _out_str = "bf16"
+        _tile_m = 16 if token < 2048 else 32 if token < 16384 else 64
+        _tile_k = 128
+        from aiter.ops.flydsl.moe_kernels import flydsl_kernel_name
+
+        kn1 = flydsl_kernel_name(1, "fp8", "mxfp8", _out_str, _tile_m, 128, _tile_k)
+        kn2 = flydsl_kernel_name(
+            2, "fp8", "mxfp8", _out_str, _tile_m, 256, _tile_k, "atomic"
+        )
+        return MOEMetadata(
+            functools.partial(
+                _flydsl_stage1_wrapper,
+                kernelName=kn1,
+                activation=activation,
+                inter_dim_pad=intermediate_pad,
+                model_dim_pad=hidden_pad,
+            ),
+            functools.partial(
+                _flydsl_stage2_wrapper,
+                kernelName=kn2,
+                inter_dim_pad=intermediate_pad,
+                model_dim_pad=hidden_pad,
+            ),
+            _tile_m,
+            1,  # no split-K (mxfp8 split-K path untested)
+            False,
+        )
+    _flydsl_a16w4 = (
+        q_dtype_w == dtypes.fp4x2
+        and os.environ.get("AITER_FLYDSL_A16W4", "0") == "1"
+    )
+    if (
+        q_type == QuantType.per_1x32
+        and (q_dtype_w == dtypes.i4x2 or _flydsl_a16w4)
         and is_flydsl_available()
     ):
         # Heuristic kernel dispatch for a16wi4 (bf16 activations, packed int4 weights
-        # with groupwise scale). Tile sizes and k-split are chosen based on problem
-        # dimensions to balance occupancy and memory bandwidth:
-        #   - _tile_m: scales with token count to improve utilization at larger batch sizes
+        # with groupwise scale) and a16w4 (mxfp4/e2m1 weights, same preshuffle
+        # pipeline; AITER_FLYDSL_A16W4=1). Tile sizes / k-split balance occupancy
+        # and bandwidth:
+        #   - _tile_m: scales with token count to improve utilization at larger batch
         #   - _tile_n/_tile_k: fixed at 128, tuned for int4 weight packing granularity
         #   - _ksplit: partitions the K dimension across workgroups for large reductions
+        _w = "mxfp4" if _flydsl_a16w4 else "int4"
         _out_str = "bf16"
-        _tile_m = 16 if token < 2048 else 32 if token < 16384 else 64
         _tile_n = 128
-        _tile_k = 128
-        _ksplit = get_ksplit(token, topk, expert, inter_dim, model_dim)
+        if _flydsl_a16w4:
+            # a16w4 (mxfp4): tokens-per-expert adaptive tile_m amortizes the heavy
+            # mxfp4->bf16 dequant VALU over more M rows (tile_m=128 needs tile_k=128
+            # for the LDS budget); no split-K. Matches the validated tuned config
+            # (docs/flydsl_a16w4_vs_triton_perf_analysis_cn.md); fixed tile_m=32 was
+            # ~2x slower because the dequant could not be amortized.
+            _tpe = max(1, (token * topk + expert - 1) // expert)
+            _tile_m = max(32, min(1 << max(0, (_tpe - 1).bit_length()), 128))
+            _tile_k = 256 if _tile_m <= 32 else 128
+            _ksplit = 1
+        else:
+            _tile_m = 16 if token < 2048 else 32 if token < 16384 else 64
+            _tile_k = 128
+            _ksplit = get_ksplit(token, topk, expert, inter_dim, model_dim)
         from aiter.ops.flydsl.moe_kernels import flydsl_kernel_name
 
-        kn1 = flydsl_kernel_name(1, "bf16", "int4", _out_str, _tile_m, _tile_n, _tile_k)
+        kn1 = flydsl_kernel_name(1, "bf16", _w, _out_str, _tile_m, _tile_n, _tile_k)
         if _ksplit > 1:
             kn1 += f"_kb{_ksplit}"
+        # a16w4 stage2 (down-proj, N=model_dim is wide) prefers tile_n=256: halves the
+        # N-tile count / workgroups. int4 keeps tile_n=128.
+        _s2_tile_n = 256 if (_flydsl_a16w4 and model_dim % 256 == 0) else _tile_n
         kn2 = flydsl_kernel_name(
-            2, "bf16", "int4", _out_str, _tile_m, _tile_n, _tile_k, "atomic"
+            2, "bf16", _w, _out_str, _tile_m, _s2_tile_n, _tile_k, "atomic"
         )
         return MOEMetadata(
             functools.partial(
@@ -1810,6 +1875,19 @@ def fused_moe_2stages(
         a1_scale = None
     elif (
         quant_type == QuantType.per_1x32
+        and w1.dtype == dtypes.fp8
+        and os.environ.get("AITER_FLYDSL_A8W4", "0") == "1"
+    ):
+        # a8w4 (FlyDSL): per-token fp8 activation quant (f32 scale, original token
+        # order; the kernel gathers rows by sorted_ids and applies scale per token).
+        from aiter.ops.quant import get_hip_quant
+
+        a1, _a1s = get_hip_quant(QuantType.per_Token)(
+            hidden_states, quant_dtype=dtypes.fp8
+        )
+        a1_scale = _a1s.view(-1).contiguous().float()
+    elif (
+        quant_type == QuantType.per_1x32
         and dtype in [dtypes.bf16, dtypes.fp16]
         and q_dtype_a == dtypes.fp8
         and w1.dtype in (dtypes.fp4x2, dtypes.fp8)
@@ -1835,8 +1913,15 @@ def fused_moe_2stages(
                 sorted_weights=sorted_weights,
             )
 
-    elif quant_type == QuantType.per_1x32 and w1.dtype == dtypes.i4x2:
-        # a16wi4: bf16 activations, int4 weights; no activation quantization needed
+    elif quant_type == QuantType.per_1x32 and (
+        w1.dtype == dtypes.i4x2
+        or (
+            w1.dtype == dtypes.fp4x2
+            and os.environ.get("AITER_FLYDSL_A16W4", "0") == "1"
+        )
+    ):
+        # a16wi4 / a16w4 (FlyDSL): bf16 activations, packed-int4/mxfp4 weights;
+        # no activation quantization needed.
         a1 = hidden_states.to(dtype)
         a1_scale = None
     elif quant_type == QuantType.per_1x32:
@@ -1952,6 +2037,20 @@ def fused_moe_2stages(
     ):
         a2_scale = None
     elif (
+        quant_type == QuantType.per_1x32
+        and w1.dtype == dtypes.fp8
+        and os.environ.get("AITER_FLYDSL_A8W4", "0") == "1"
+    ):
+        # a8w4 (FlyDSL): per-slot fp8 requant of the bf16 stage1 output
+        # (f32 scale [token*topk]); kernel gathers/scales per (token, slot).
+        from aiter.ops.quant import get_hip_quant
+
+        a2q, _a2s = get_hip_quant(QuantType.per_Token)(
+            a2.reshape(token_num * topk, inter_dim), quant_dtype=dtypes.fp8
+        )
+        a2 = a2q.view(token_num, topk, inter_dim)
+        a2_scale = _a2s.view(-1).contiguous().float()
+    elif (
         quant_type == aiter.QuantType.per_1x32
         and dtype in [dtypes.bf16, dtypes.fp16]
         and q_dtype_a == dtypes.fp8
@@ -1973,8 +2072,14 @@ def fused_moe_2stages(
         else:
             a2 = a2.to(dtypes.fp8)
             a2_scale = a1_scale
-    elif quant_type == QuantType.per_1x32 and w1.dtype == dtypes.i4x2:
-        # a16wi4: stage1 output is bf16, no inter-stage quantization
+    elif quant_type == QuantType.per_1x32 and (
+        w1.dtype == dtypes.i4x2
+        or (
+            w1.dtype == dtypes.fp4x2
+            and os.environ.get("AITER_FLYDSL_A16W4", "0") == "1"
+        )
+    ):
+        # a16wi4 / a16w4 (FlyDSL): stage1 output is bf16, no inter-stage quantization
         a2_scale = None
     elif quant_type == QuantType.per_1x32:
         a2 = a2.view(-1, inter_dim)
