@@ -56,6 +56,10 @@ if is_flydsl_available():
         flydsl_per_1x32_fp4_quant_block_rotation_mfma_sort,
     )
 
+    from .dyna_fused_topk_kernels import (
+        flydsl_dyna_fused_topk,
+    )
+
     __all__ += [
         "flydsl_preshuffle_gemm_a8",
         "flydsl_moe_stage1",
@@ -69,4 +73,5 @@ if is_flydsl_available():
         "flydsl_per_1x32_fp4_quant_block_rotation_mfma",
         "flydsl_per_1x32_fp4_quant_block_rotation_mfma_sort_inplace",
         "flydsl_per_1x32_fp4_quant_block_rotation_mfma_sort",
+        "flydsl_dyna_fused_topk",
     ]
