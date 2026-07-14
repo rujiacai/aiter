@@ -325,6 +325,77 @@ def get_flydsl_stage2_kernels_int4_bf16(out_dtype: str) -> Dict[str, Dict]:
     return kernels
 
 
+def get_flydsl_stage1_kernels_mxfp4_bf16(out_dtype: str) -> Dict[str, Dict]:
+    """Return {kernelName: params} for all supported mxfp4_bf16 (a16w4) stage1 configs."""
+    kernels = {}
+    a_dtype = "bf16"
+    b_dtype = "mxfp4"
+    tile_ks = [128, 256]
+    tile_ms = [16, 32, 64, 128]
+    tile_ns = [64, 128]
+    k_batches = [1, 2, 4, 7, 14]
+
+    for tm in tile_ms:
+        for tn in tile_ns:
+            for tk in tile_ks:
+                for kb in k_batches:
+                    name = flydsl_kernel_name(
+                        1, a_dtype, b_dtype, out_dtype, tm, tn, tk
+                    )
+                    if kb != 1:
+                        name += f"_kb{kb}"
+                    kernels[name] = {
+                        "stage": 1,
+                        "a_dtype": a_dtype,
+                        "b_dtype": b_dtype,
+                        "out_dtype": out_dtype,
+                        "tile_m": tm,
+                        "tile_n": tn,
+                        "tile_k": tk,
+                        "MPerBlock": tm,
+                        "in_dtype": "mxfp4_bf16",
+                        "k_batch": kb,
+                    }
+    return kernels
+
+
+def get_flydsl_stage2_kernels_mxfp4_bf16(out_dtype: str) -> Dict[str, Dict]:
+    """Return {kernelName: params} for all supported mxfp4_bf16 (a16w4) stage2 configs."""
+    kernels = {}
+    a_dtype = "bf16"
+    b_dtype = "mxfp4"
+    tile_ks = [128, 256]
+    tile_ms = [16, 32, 64, 128]
+    tile_ns = [128]
+    modes = ["atomic"]
+
+    for tm in tile_ms:
+        for tn in tile_ns:
+            for tk in tile_ks:
+                for mode in modes:
+                    base_name = flydsl_kernel_name(
+                        2, a_dtype, b_dtype, out_dtype, tm, tn, tk, mode
+                    )
+                    base_params = {
+                        "stage": 2,
+                        "a_dtype": a_dtype,
+                        "b_dtype": b_dtype,
+                        "out_dtype": out_dtype,
+                        "tile_m": tm,
+                        "tile_n": tn,
+                        "tile_k": tk,
+                        "mode": mode,
+                        "MPerBlock": tm,
+                        "in_dtype": "mxfp4_bf16",
+                    }
+                    kernels[base_name] = base_params
+                    kernels[base_name + "_persist"] = {
+                        **base_params,
+                        "persist": True,
+                    }
+    return kernels
+
+
 def _register_all_configs():
     """Pre-populate _KERNEL_PARAMS with all supported configs at import time."""
     for a in ("fp8", "fp4", "fp16"):
@@ -340,6 +411,10 @@ def _register_all_configs():
     for out in ("bf16", "f16"):
         _KERNEL_PARAMS.update(get_flydsl_stage1_kernels_int4_bf16(out))
         _KERNEL_PARAMS.update(get_flydsl_stage2_kernels_int4_bf16(out))
+    # mxfp4_bf16 (a16w4: bf16 activation + mxfp4/e2m1 weight, E8M0 per-32 scale)
+    for out in ("bf16", "f16"):
+        _KERNEL_PARAMS.update(get_flydsl_stage1_kernels_mxfp4_bf16(out))
+        _KERNEL_PARAMS.update(get_flydsl_stage2_kernels_mxfp4_bf16(out))
 
 
 _register_all_configs()
@@ -425,6 +500,30 @@ def compile_flydsl_moe_stage1(
             scale_is_bf16=True,
             k_batch=k_batch,
         )
+    elif a_dtype == "bf16" and b_dtype == "mxfp4":
+        # a16w4: bf16 activations, mxfp4 (e2m1) weights with E8M0 per-32 scale.
+        # E8M0 scale is pre-decoded to bf16 on host, reusing the groupwise bf16
+        # scale plumbing; only the in-kernel dequant differs (e2m1 codebook).
+        from .kernels.moe_gemm_2stage import compile_moe_gemm1
+
+        _use_cshuffle = None if k_batch > 1 else False
+
+        return compile_moe_gemm1(
+            model_dim=model_dim,
+            inter_dim=inter_dim,
+            experts=experts,
+            topk=topk,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            tile_k=tile_k,
+            doweight_stage1=doweight_stage1,
+            in_dtype="mxfp4_bf16",
+            group_size=32,
+            out_dtype=out_dtype,
+            use_cshuffle_epilog=_use_cshuffle,
+            scale_is_bf16=True,
+            k_batch=k_batch,
+        )
     else:
         raise ValueError(
             f"Unsupported stage1 dtype combination: a_dtype={a_dtype}, b_dtype={b_dtype}"
@@ -502,6 +601,26 @@ def compile_flydsl_moe_stage2(
             tile_k=tile_k,
             doweight_stage2=doweight_stage2,
             in_dtype="int4_bf16",
+            group_size=32,
+            out_dtype=out_dtype,
+            accumulate=accumulate,
+            scale_is_bf16=True,
+        )
+    elif a_dtype == "bf16" and b_dtype == "mxfp4":
+        # a16w4: bf16 activations, mxfp4 (e2m1) weights with E8M0 per-32 scale
+        # (pre-decoded to bf16 on host; reuses groupwise bf16 scale plumbing).
+        from .kernels.moe_gemm_2stage import compile_moe_gemm2
+
+        return compile_moe_gemm2(
+            model_dim=model_dim,
+            inter_dim=inter_dim,
+            experts=experts,
+            topk=topk,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            tile_k=tile_k,
+            doweight_stage2=doweight_stage2,
+            in_dtype="mxfp4_bf16",
             group_size=32,
             out_dtype=out_dtype,
             accumulate=accumulate,

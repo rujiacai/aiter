@@ -280,6 +280,89 @@ def _i8x4_in_i32_to_bf16x4_i64(val_i32, arith, vector, scale_val=None):
     return _pack_i32_pair_to_i64(i32_lo, i32_hi, vector)
 
 
+def _e2m1_byte_to_bf16_bits(code_i32, arith):
+    """Convert one i32 holding an e2m1 nibble code (0..15) to bf16 hi-bits (i32).
+
+    Pure integer bit-ops (validated against the e2m1 codebook
+    {0,±.5,±1,±1.5,±2,±3,±4,±6}). Layout of the 4-bit code: [sign|exp2|mant1].
+
+    normal (exp>=1):   bf16 = (sign<<15) | ((exp-1+127)<<7) | (mant<<6)
+    subnormal(exp==0): value = mant*0.5 -> (sign<<15) | (mant * 0x3F00)
+
+    Returns the low 16 bits (in an i32) representing the bf16 value.
+    """
+    c1 = fx.Int32(1)
+    c3 = fx.Int32(3)
+    c6 = fx.Int32(6)
+    c7 = fx.Int32(7)
+    c126 = fx.Int32(126)
+
+    s = (code_i32 >> c3) & c1
+    e = (code_i32 >> c1) & c3
+    m = code_i32 & c1
+
+    hi_normal = ((e + c126) << c7) | (m << c6)
+    hi_sub = m * fx.Int32(0x3F00)
+
+    is_e0 = _arith.cmpi(
+        _arith.CmpIPredicate.eq, _arith._to_raw(e), _arith._to_raw(fx.Int32(0))
+    )
+    hi = fx.Int32(
+        _arith.select(is_e0, _arith._to_raw(hi_sub), _arith._to_raw(hi_normal))
+    )
+    return (s << fx.Int32(15)) | hi
+
+
+def _e2m1x4_in_i32_to_bf16x4_i64(val_i32, arith, vector, scale_val=None):
+    """Convert one i32 (4 e2m1 nibble codes as 4 bytes) to 4 bf16 packed as i64.
+
+    Mirrors :func:`_i8x4_in_i32_to_bf16x4_i64` but decodes e2m1 (mxfp4) codes
+    instead of signed int8. When ``scale_val`` (an f32, e.g. decoded E8M0) is
+    provided, applies it via f32 multiply + shift-truncate to bf16.
+    """
+    v1 = vector.from_elements(T.vec(1, T.i32), [val_i32])
+    i8x4 = vector.bitcast(T.i8x4, v1)
+
+    if scale_val is None:
+        # No scale: build bf16 bits directly and pack.
+        bf16_his = []
+        for i in range(4):
+            byte_i8 = vector.extract(i8x4, static_position=[i], dynamic_position=[])
+            # zero-extend byte to i32 code (values 0..15 fit in low nibble)
+            code_i32 = _arith.extui(T.i32, _arith._to_raw(byte_i8))
+            bf16_his.append(_e2m1_byte_to_bf16_bits(fx.Int32(code_i32), arith))
+        c16 = fx.Int32(16)
+        c_ffff = fx.Int32(0xFFFF)
+        i32_lo = (bf16_his[0] & c_ffff) | (bf16_his[1] << c16)
+        i32_hi = (bf16_his[2] & c_ffff) | (bf16_his[3] << c16)
+        return _pack_i32_pair_to_i64(i32_lo, i32_hi, vector)
+
+    # Scaled path: e2m1 code -> bf16 bits -> f32 -> * scale -> bf16 (shift-trunc).
+    # Mirrors _i8x4_in_i32_to_bf16x4_i64's scaling structure (raw arith values).
+    f32_vals = []
+    for i in range(4):
+        byte_i8 = vector.extract(i8x4, static_position=[i], dynamic_position=[])
+        code_i32 = _arith.extui(T.i32, _arith._to_raw(byte_i8))
+        bf16_hi = _e2m1_byte_to_bf16_bits(fx.Int32(code_i32), arith)
+        # Widen bf16 bits into the high half of an i32, then bitcast to f32.
+        f32_bits = _arith._to_raw((bf16_hi << fx.Int32(16)))
+        v = arith.bitcast(T.f32, f32_bits)
+        if scale_val is not None:
+            v = v * scale_val
+        f32_vals.append(v)
+
+    c16 = fx.Int32(16)
+    c_ffff0000 = fx.Int32(0xFFFF0000)
+    # Match _i8x4_in_i32_to_bf16x4_i64 exactly: keep raw bitcast values so the
+    # right-shift lowers to a *logical* shift (shrui). Wrapping in fx.Int32 would
+    # emit an arithmetic shift and sign-extend negative bf16 values into the high
+    # half, corrupting the packed result (NaN/Inf).
+    bits = [arith.bitcast(T.i32, f) for f in f32_vals]
+    i32_lo = (bits[0] >> c16) | (bits[1] & c_ffff0000)
+    i32_hi = (bits[2] >> c16) | (bits[3] & c_ffff0000)
+    return _pack_i32_pair_to_i64(i32_lo, i32_hi, vector)
+
+
 def load_b_raw_w4a16(
     buffer_ops,
     arith,
@@ -430,6 +513,33 @@ def unpack_b_w4a16(
     even, odd = _unpack_int4_to_int8_pair(packed32)
     b0 = _i8x4_in_i32_to_bf16x4_i64(even, arith, vector, scale_val=scale_val)
     b1 = _i8x4_in_i32_to_bf16x4_i64(odd, arith, vector, scale_val=scale_val)
+    return (b0, b1)
+
+
+def _unpack_mxfp4_nibble_pair(packed32):
+    """Split packed mxfp4 (fp4x2) dword into two i32s of 4 nibble-codes each.
+
+    Unlike int4 (which sign-extends), mxfp4 codes are raw 4-bit patterns
+    (0..15) interpreted via the e2m1 codebook, so we only mask — no
+    sign extension.
+    """
+    c_0f = fx.Int32(0x0F0F0F0F)
+    c_4 = fx.Int32(4)
+    even = packed32 & c_0f
+    odd = (packed32 >> c_4) & c_0f
+    return even, odd
+
+
+def unpack_b_w4a16_mxfp4(packed32, arith, vector, scale_val=None):
+    """Phase 2 of W4A16 mxfp4 B load: unpack fp4x2 + e2m1 dequant to bf16.
+
+    Takes raw packed32 from :func:`load_b_raw_w4a16` and produces (b0, b1) --
+    two i64 values each containing 4 bf16 for one MFMA. ``scale_val`` (f32,
+    decoded from E8M0) is applied as a per-group multiply when provided.
+    """
+    even, odd = _unpack_mxfp4_nibble_pair(packed32)
+    b0 = _e2m1x4_in_i32_to_bf16x4_i64(even, arith, vector, scale_val=scale_val)
+    b1 = _e2m1x4_in_i32_to_bf16x4_i64(odd, arith, vector, scale_val=scale_val)
     return (b0, b1)
 
 
@@ -785,9 +895,12 @@ __all__ = [
     "load_b_pack_k32",
     "load_b_raw_w4a16",
     "unpack_b_w4a16",
+    "unpack_b_w4a16_mxfp4",
     "load_b_raw_w4a16_groupwise",
     "unpack_b_w4a16_groupwise",
+    "unpack_b_w4a16_mxfp4_groupwise",
     "extract_bf16_scale",
+    "e8m0_to_f32_scale",
     "split_row_major_2d",
     "swizzle_xor16",
     "tile_chunk_coord_i32",
@@ -941,3 +1054,23 @@ def unpack_b_w4a16_groupwise(packed32, scale_val, arith, vector, use_gfx950_cvt=
     return unpack_b_w4a16(
         packed32, arith, vector, scale_val=scale_val, use_gfx950_cvt=use_gfx950_cvt
     )
+
+
+def e8m0_to_f32_scale(arith, scale_raw_i32):
+    """Decode an E8M0 (uint8 exponent) scale to f32.
+
+    E8M0 stores a biased exponent ``u`` with value ``2^(u-127)``. The f32 with
+    that value has bits ``u << 23``. The raw dword may pack multiple E8M0 bytes;
+    caller must pass the byte already isolated in the low 8 bits.
+    """
+    u = fx.Int32(scale_raw_i32) & fx.Int32(0xFF)
+    f32_bits = u << fx.Int32(23)
+    return fx.Float32(arith.bitcast(T.f32, _arith._to_raw(f32_bits)))
+
+
+def unpack_b_w4a16_mxfp4_groupwise(packed32, scale_val, arith, vector):
+    """Phase 2 of W4A16 mxfp4 groupwise: unpack fp4x2 + e2m1 dequant + scale.
+
+    ``scale_val`` is the per-group f32 scale (already decoded from E8M0).
+    """
+    return unpack_b_w4a16_mxfp4(packed32, arith, vector, scale_val=scale_val)

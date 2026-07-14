@@ -54,6 +54,7 @@ from .mfma_preshuffle_pipeline import (
     load_b_pack_k32,
     load_b_raw_w4a16,
     unpack_b_w4a16,
+    unpack_b_w4a16_mxfp4,
     load_b_raw_w4a16_groupwise,
     extract_bf16_scale,
     tile_chunk_coord_i32,
@@ -130,12 +131,26 @@ def compile_moe_gemm1(
     allocator = SmemAllocator(None, arch=gpu_arch)
     _state = {}  # legacy; kept until stage2/reduction are migrated
 
-    _valid_dtypes = ("fp8", "fp16", "bf16", "int8", "int8smooth", "int4", "int4_bf16")
+    _valid_dtypes = (
+        "fp8",
+        "fp16",
+        "bf16",
+        "int8",
+        "int8smooth",
+        "int4",
+        "int4_bf16",
+        "mxfp4_bf16",
+    )
     if in_dtype not in _valid_dtypes:
         raise ValueError(f"in_dtype must be one of {_valid_dtypes}, got {in_dtype!r}")
+    # mxfp4_bf16 (W4A16 with e2m1 weights + E8M0 scale) shares the entire int4_bf16
+    # plumbing (byte layout, preshuffle, groupwise scale) and differs only in the
+    # in-kernel dequant: e2m1 codebook instead of signed-int4. is_mxfp4_bf16 gates
+    # that one difference; is_int4_bf16 stays True so all shared paths are reused.
+    is_mxfp4_bf16 = in_dtype == "mxfp4_bf16"
     is_int4_bf16 = (
-        in_dtype == "int4_bf16"
-    )  # W4A16: bf16 activations, packed int4 weights
+        in_dtype == "int4_bf16" or is_mxfp4_bf16
+    )  # W4A16: bf16 activations, packed 4-bit weights
     is_f16 = in_dtype == "fp16"
     is_bf16 = is_int4_bf16 or in_dtype == "bf16"
     is_f16_or_bf16 = is_f16 or is_bf16
@@ -185,7 +200,10 @@ def compile_moe_gemm1(
 
     _is_gfx950 = "gfx95" in get_hip_arch()
     _has_cvt_off_f32_i4 = hasattr(rocdl, "cvt_off_f32_i4")
-    use_gfx950_cvt = is_int4_bf16 and _is_gfx950 and _has_cvt_off_f32_i4
+    # gfx950 cvt_off_f32_i4 is signed-int4 specific; mxfp4 always uses the bit-op path.
+    use_gfx950_cvt = (
+        is_int4_bf16 and not is_mxfp4_bf16 and _is_gfx950 and _has_cvt_off_f32_i4
+    )
 
     # Split-K validation
     _is_splitk = k_batch > 1
@@ -1103,6 +1121,25 @@ def compile_moe_gemm1(
                                             tmp_u,
                                             sc_g,
                                             sc_u,
+                                        )
+                                    elif const_expr(is_mxfp4_bf16):
+                                        bg0, bg1 = unpack_b_w4a16_mxfp4(
+                                            packed_g,
+                                            arith,
+                                            vector,
+                                            scale_val=sc_g,
+                                        )
+                                        gate_list[acc_idx] = mfma_k64(
+                                            gate_list[acc_idx], a0, a1, bg0, bg1
+                                        )
+                                        bu0, bu1 = unpack_b_w4a16_mxfp4(
+                                            packed_u,
+                                            arith,
+                                            vector,
+                                            scale_val=sc_u,
+                                        )
+                                        up_list[acc_idx] = mfma_k64(
+                                            up_list[acc_idx], a0, a1, bu0, bu1
                                         )
                                     else:
                                         bg0, bg1 = unpack_b_w4a16(
@@ -2043,12 +2080,26 @@ def compile_moe_gemm2(
     allocator = SmemAllocator(None, arch=gpu_arch)
     _state = {}
 
-    _valid_dtypes = ("fp8", "fp16", "bf16", "int8", "int8smooth", "int4", "int4_bf16")
+    _valid_dtypes = (
+        "fp8",
+        "fp16",
+        "bf16",
+        "int8",
+        "int8smooth",
+        "int4",
+        "int4_bf16",
+        "mxfp4_bf16",
+    )
     if in_dtype not in _valid_dtypes:
         raise ValueError(f"in_dtype must be one of {_valid_dtypes}, got {in_dtype!r}")
+    # mxfp4_bf16 (W4A16 with e2m1 weights + E8M0 scale) shares the entire int4_bf16
+    # plumbing (byte layout, preshuffle, groupwise scale) and differs only in the
+    # in-kernel dequant: e2m1 codebook instead of signed-int4. is_mxfp4_bf16 gates
+    # that one difference; is_int4_bf16 stays True so all shared paths are reused.
+    is_mxfp4_bf16 = in_dtype == "mxfp4_bf16"
     is_int4_bf16 = (
-        in_dtype == "int4_bf16"
-    )  # W4A16: bf16 activations, packed int4 weights
+        in_dtype == "int4_bf16" or is_mxfp4_bf16
+    )  # W4A16: bf16 activations, packed 4-bit weights
     is_f16 = in_dtype == "fp16"
     is_bf16 = is_int4_bf16 or in_dtype == "bf16"
     is_f16_or_bf16 = is_f16 or is_bf16
@@ -2087,7 +2138,10 @@ def compile_moe_gemm2(
 
     _is_gfx950 = "gfx95" in get_hip_arch()
     _has_cvt_off_f32_i4 = hasattr(rocdl, "cvt_off_f32_i4")
-    use_gfx950_cvt = is_int4_bf16 and _is_gfx950 and _has_cvt_off_f32_i4
+    # gfx950 cvt_off_f32_i4 is signed-int4 specific; mxfp4 always uses the bit-op path.
+    use_gfx950_cvt = (
+        is_int4_bf16 and not is_mxfp4_bf16 and _is_gfx950 and _has_cvt_off_f32_i4
+    )
 
     mfma_i32_k32 = None
     if is_int8:
@@ -2939,6 +2993,16 @@ def compile_moe_gemm2(
                                                 acc_list[p_idx], p_tmp, p_sc
                                             )
                                         _pending_acc = (acc_idx, tmp, sc)
+                                    elif const_expr(is_mxfp4_bf16):
+                                        b0, b1 = unpack_b_w4a16_mxfp4(
+                                            packed,
+                                            arith,
+                                            vector,
+                                            scale_val=sc,
+                                        )
+                                        acc_list[acc_idx] = mfma_k64(
+                                            acc_list[acc_idx], a0, a1, b0, b1
+                                        )
                                     else:
                                         b0, b1 = unpack_b_w4a16(
                                             packed,
