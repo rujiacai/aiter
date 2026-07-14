@@ -24,11 +24,13 @@ if is_flydsl_available():
         flydsl_per_1x32_fp4_quant_block_rotation_mfma,
         flydsl_per_1x32_fp4_quant_block_rotation_mfma_sort,
         flydsl_per_1x32_fp4_quant_block_rotation_mfma_sort_inplace,
+        flydsl_dyna_fused_topk,
     )
 else:  # noqa: E501
     flydsl_per_1x32_fp4_quant_block_rotation_mfma = None  # type: ignore[assignment]
     flydsl_per_1x32_fp4_quant_block_rotation_mfma_sort = None  # type: ignore[assignment]
     flydsl_per_1x32_fp4_quant_block_rotation_mfma_sort_inplace = None  # type: ignore[assignment]
+    flydsl_dyna_fused_topk = None  # type: ignore[assignment]
 
 BLOCK_SIZE_M = 32
 
@@ -2460,8 +2462,42 @@ def fused_topk(
     renormalize: bool,
     topk_ids: Optional[torch.Tensor] = None,
     topk_weights: Optional[torch.Tensor] = None,
+    dyna_k: Optional[torch.Tensor] = None,
+    scoring_func: str = "softmax",
 ):
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
+
+    if scoring_func not in ("softmax", "sigmoid"):
+        raise ValueError(
+            f"scoring_func must be 'softmax' or 'sigmoid', got {scoring_func!r}"
+        )
+    # Only the dynamic top-k path (dyna_topk, selected by ``dyna_k``) implements
+    # sigmoid scoring. The static path's CK (``topk_softmax``) and ASM
+    # (``topk_softmax_asm``) kernels are softmax-only, so a non-softmax request
+    # without ``dyna_k`` would be silently ignored -- reject it explicitly.
+    if scoring_func != "softmax" and dyna_k is None:
+        raise ValueError(
+            f"fused_topk scoring_func={scoring_func!r} is only supported on the "
+            "dynamic top-k path; pass dyna_k=... to use it. The static CK/ASM "
+            "top-k kernels support 'softmax' only."
+        )
+
+    # When a per-token ``dyna_k`` tensor is supplied, route to the dynamic
+    # top-k router (same call site / output contract as the static path). The
+    # returned (topk_weights, topk_ids) flow into moe_sorting -> fused_moe
+    # unchanged: the dropped tail uses the moe_sorting-skipped sentinel
+    # ``pad_id == num_experts`` with zeroed weights. ``scoring_func`` selects the
+    # per-expert score ("softmax" row-normalized probs, or "sigmoid").
+    if dyna_k is not None:
+        return dyna_fused_topk(
+            gating_output,
+            dyna_k,
+            max_topk=topk,
+            renormalize=renormalize,
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+            scoring_func=scoring_func,
+        )
 
     M, _ = hidden_states.shape
     expert = gating_output.shape[1]
@@ -2524,3 +2560,159 @@ def fused_topk(
     #     topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
 
     return topk_weights, topk_ids
+
+
+def _dyna_fused_topk_torch(
+    gating_output: torch.Tensor,
+    dyna_k: torch.Tensor,
+    max_topk: int,
+    renormalize: bool = True,
+    pad_id: Optional[int] = None,
+    scoring_func: str = "softmax",
+):
+    """Reference (eager-torch) implementation of dynamic top-k routing.
+
+    Kept as the portable fallback for ``dyna_fused_topk`` when the FlyDSL
+    kernel is unavailable, and as the ground truth for the op test.
+
+    ``scoring_func`` selects the per-expert score: ``"softmax"`` (row-normalized
+    probabilities) or ``"sigmoid"`` (per-expert ``1/(1+e^-x)``). Selection is
+    identical (both monotonic in the logit); only the weights / renormalize
+    denominator differ.
+
+    Ties are broken by **smaller expert id** (matching the FlyDSL kernel): plain
+    ``torch.topk`` does not guarantee this on
+    equal probabilities, so we sort on a key ``prob - id*eps`` that orders exact
+    ties by ascending id while leaving distinct probs untouched. This makes the
+    reference id selection bit-match the kernel for low-precision inputs (where
+    quantised logits routinely produce exact ties).
+    """
+    E = int(gating_output.shape[1])
+    if pad_id is None:
+        pad_id = E  # moe_sorting-skipped sentinel (== num_experts)
+    if scoring_func not in ("softmax", "sigmoid"):
+        raise ValueError(
+            f"scoring_func must be 'softmax' or 'sigmoid', got {scoring_func!r}"
+        )
+
+    if scoring_func == "sigmoid":
+        probs = torch.sigmoid(gating_output.float())
+    else:
+        probs = torch.softmax(gating_output.float(), dim=-1)
+    # Smaller-id tie-break: subtract a tiny id-proportional penalty in f64 so
+    # exact-tie probs sort by ascending id; the penalty (<= E*1e-12) is far
+    # below any gap between distinct f32 probs, so real ordering is preserved.
+    ar_e = torch.arange(E, device=gating_output.device, dtype=torch.float64)
+    keyed = probs.double() - ar_e.unsqueeze(0) * 1e-12
+    idx = torch.topk(keyed, max_topk, dim=-1).indices  # descending, min-id ties
+    w = torch.gather(probs, 1, idx)
+
+    # Clamp k to [1, max_topk] to match the kernel (keep >=1 expert, cap at the
+    # padded width), so kernel and reference agree for any out-of-range dyna_k.
+    k_clamped = dyna_k.to(torch.long).clamp(1, max_topk)
+    ar = torch.arange(max_topk, device=gating_output.device)
+    valid = ar.unsqueeze(0) < k_clamped.unsqueeze(1)  # [T, max_topk]
+
+    if renormalize:
+        # Normalize the kept weights to sum to 1.
+        kept_sum = torch.where(valid, w, torch.zeros_like(w)).sum(
+            dim=-1, keepdim=True
+        )
+        out_w = torch.where(
+            valid, w / kept_sum.clamp_min(torch.finfo(w.dtype).tiny),
+            torch.zeros_like(w),
+        )
+    else:
+        out_w = torch.where(valid, w, torch.zeros_like(w))
+
+    # Mark the dropped tail with the moe_sorting-skipped sentinel.
+    out_id = idx.to(torch.int32)
+    out_id = torch.where(
+        valid, out_id, torch.full_like(out_id, pad_id, dtype=torch.int32)
+    )
+    return out_w.to(torch.float32).contiguous(), out_id.contiguous()
+
+
+def dyna_fused_topk(
+    gating_output: torch.Tensor,
+    dyna_k: torch.Tensor,
+    max_topk: int,
+    renormalize: bool = True,
+    pad_id: Optional[int] = None,
+    *,
+    scoring_func: str = "softmax",
+    topk_ids: Optional[torch.Tensor] = None,
+    topk_weights: Optional[torch.Tensor] = None,
+    use_flydsl: Optional[bool] = None,
+):
+    """Per-token *dynamic* top-k router.
+
+    Computes ``softmax -> top-max_topk``, keeps the first ``dyna_k[t]`` experts
+    per token, (optionally) renormalizes the kept weights to sum to 1, and emits
+    a fixed ``max_topk``-wide row. The dropped tail (``j >= dyna_k[t]``) always
+    has ``topk_weights == 0`` and its id slot set to ``pad_id``.
+
+    ``moe_sorting`` already drops the ``pad_id`` sentinel (its histogram has a
+    ``num_experts + 1`` padding column and the block-emit loop only iterates
+    ``0..num_experts-1``), so the skipped experts are *not* routed and
+    stage-1/stage-2 compute is saved -- the same mechanism expert-parallel
+    padding uses, no sort-kernel change needed.
+
+    Parameters
+    ----------
+    gating_output : ``(T, E)`` router logits, ``float32`` / ``bfloat16`` /
+        ``float16`` (non-f32 is up-cast to f32 for the kernel).
+    dyna_k : ``(T,)`` integer tensor of per-token k (clamped to ``[1, max_topk]``).
+    max_topk : padded top-k width (``1 <= max_topk <= E``).
+    renormalize : if True, normalize the kept weights to sum to 1; if False,
+        keep raw scores (kept sum < 1).
+    scoring_func : {"softmax", "sigmoid"}, per-expert scoring. ``"softmax"`` uses
+        row-normalized probabilities; ``"sigmoid"`` uses per-expert
+        ``1/(1+e^-x)``. Selection is identical; only the weights differ.
+    pad_id : id-tail sentinel for the dropped experts; defaults to
+        ``num_experts`` (the value ``moe_sorting`` skips).
+    topk_ids, topk_weights : optional preallocated ``(T, max_topk)`` ``int32`` /
+        ``float32`` output buffers (only used by the FlyDSL path).
+    use_flydsl : force on/off the FlyDSL kernel. ``None`` -> auto (use FlyDSL
+        when available and inputs are on CUDA/HIP, f32/bf16/fp16).
+
+    Returns
+    -------
+    (topk_weights, topk_ids) : ``(T, max_topk)`` ``float32`` / ``int32``.
+    """
+    assert gating_output.shape[0] == dyna_k.numel(), "token count mismatch"
+
+    can_flydsl = (
+        is_flydsl_available()
+        and flydsl_dyna_fused_topk is not None
+        and gating_output.is_cuda
+        and gating_output.dtype in (dtypes.fp32, dtypes.bf16, dtypes.fp16)
+    )
+    if use_flydsl is None:
+        use_flydsl = can_flydsl
+    elif use_flydsl and not can_flydsl:
+        raise RuntimeError(
+            "dyna_fused_topk(use_flydsl=True) requires the flydsl package and a "
+            "CUDA/HIP f32/bf16/fp16 gating_output."
+        )
+
+    if use_flydsl:
+        return flydsl_dyna_fused_topk(
+            gating_output,
+            dyna_k,
+            max_topk,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            renormalize=renormalize,
+            pad_id=pad_id,
+            scoring_func=scoring_func,
+        )
+
+    return _dyna_fused_topk_torch(
+        gating_output,
+        dyna_k,
+        max_topk,
+        renormalize=renormalize,
+        pad_id=pad_id,
+        scoring_func=scoring_func,
+    )
