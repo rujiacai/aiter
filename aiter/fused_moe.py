@@ -1484,6 +1484,35 @@ def get_2stage_cfgs(
         if get_flydsl_kernel_params(kn2) is None:
             kn2 = _base_kn2
 
+        # Non-256-aligned inter_dim (e.g. dsv4 TP8 = 384) cannot use the default
+        # tile_k=256 FP4 stage2 path: num_k_tiles = inter_dim // 256 truncates
+        # and drops the K tail. Route these to the MFMA32x32x64 tile_k=128 path,
+        # which tiles inter_dim by 128 exactly (valid for both a4w4 and a8w4).
+        # The MFMA32 kernel only exists for tile_m in {32, 64}; when the sorting
+        # block_m (_tile_m) is larger, keep tile_m=64 and carry the larger
+        # sort_block_m via the `_sbm{N}` suffix so stage2 tiling stays consistent
+        # with moe_sorting.
+        if (inter_dim % 256) != 0 and (inter_dim % 128) == 0:
+            _mfma_tm = _tile_m if _tile_m in (32, 64) else 64
+            _kn2_mfma = flydsl_kernel_name(
+                2, _a_type, "fp4", _out_type, _mfma_tm, 128, 128, "reduce"
+            )
+            _kn2_mfma += "_mfma32k64"
+            if _tile_m != _mfma_tm:
+                _kn2_mfma += f"_sbm{_tile_m}"
+            if get_flydsl_kernel_params(_kn2_mfma) is not None:
+                kn2 = _kn2_mfma
+
+        # Dev-only knob: force the stage1/stage2 kernel names so a harness can
+        # A/B different stage2 kernels (e.g. mfma32k64 vs 16x16x128) on the
+        # exact same problem. Ignored in production (env unset).
+        _force_kn1 = os.environ.get("AITER_FLYDSL_FORCE_STAGE1_KN")
+        _force_kn2 = os.environ.get("AITER_FLYDSL_FORCE_STAGE2_KN")
+        if _force_kn1 and get_flydsl_kernel_params(_force_kn1) is not None:
+            kn1 = _force_kn1
+        if _force_kn2 and get_flydsl_kernel_params(_force_kn2) is not None:
+            kn2 = _force_kn2
+
         logger.warning(
             f"[fused_moe] no tuned FlyDSL config for {keys}, "
             f"using heuristic FlyDSL fallback ({kn1=}, {kn2=})"

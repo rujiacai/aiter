@@ -3038,7 +3038,7 @@ def compile_mixed_moe_gemm2(
     module_name = (
         f"mfma_moe2_a{a_dtype}_w{b_dtype}_{out_s}_{epilog_tag}"
         f"_t{tile_m}x{tile_n}x{tile_k}"
-        f"{_mfma_variant_tag}_vscale_fix3{_pm_tag}{_sbm_tag}{_xcd_tag}"
+        f"{_mfma_variant_tag}_vscale_fix5{_pm_tag}{_sbm_tag}{_xcd_tag}"
     ).replace("-", "_")
     # -- LDS sizing (pure Python; no MLIR Context needed) ---------------------
     # Ping-pong A2 tiles via separate allocators (like stage1).
@@ -3433,10 +3433,12 @@ def compile_mixed_moe_gemm2(
                         )
                     x_load_bytes = 16
                 else:
+                    # NOTE: the GMEM->LDS DMA (raw_ptr_buffer_load_lds) only lowers
+                    # for 4B (dword) and 16B (dwordx4) widths, not 8B. Skipping the
+                    # 8B option keeps num_x_loads consistent with the DMA's
+                    # _num_dma_loads for small (fp4 MFMA32x32x64) tiles.
                     if const_expr(bytes_per_thread_x % 16 == 0):
                         x_load_bytes = 16
-                    elif const_expr(bytes_per_thread_x % 8 == 0):
-                        x_load_bytes = 8
                     elif const_expr(bytes_per_thread_x % 4 == 0):
                         x_load_bytes = 4
                     else:
@@ -4124,17 +4126,6 @@ def compile_mixed_moe_gemm2(
                                         curr_row_a_lds = row_a_lds + arith.constant(
                                             mi * 32, index=True
                                         )
-                                        if const_expr(
-                                            (a0_prefetch is not None)
-                                            and (ku128 == 0)
-                                            and (ikxdl == 0)
-                                            and (mi == 0)
-                                        ):
-                                            a0, a1 = a0_prefetch
-                                        else:
-                                            a0, a1 = lds_load_packs_k64(
-                                                curr_row_a_lds, col_base, lds_buffer
-                                            )
                                         if const_expr(is_f8_a):
                                             # fp8 A: lane provides 32 K as two
                                             # 16-element blocks. The block stride
@@ -4142,6 +4133,17 @@ def compile_mixed_moe_gemm2(
                                             # 16x16x128 path (4 groups) uses +64,
                                             # so MFMA32x32x64 (2 groups -> lane_div_32)
                                             # uses +32. VERIFY on hardware.
+                                            if const_expr(
+                                                (a0_prefetch is not None)
+                                                and (ku128 == 0)
+                                                and (ikxdl == 0)
+                                                and (mi == 0)
+                                            ):
+                                                a0, a1 = a0_prefetch
+                                            else:
+                                                a0, a1 = lds_load_packs_k64(
+                                                    curr_row_a_lds, col_base, lds_buffer
+                                                )
                                             a2, a3 = lds_load_packs_k64(
                                                 curr_row_a_lds,
                                                 col_base + 32,
@@ -4149,6 +4151,17 @@ def compile_mixed_moe_gemm2(
                                             )
                                             a128 = pack_i64x4_to_i32x8(a0, a1, a2, a3)
                                         else:
+                                            if const_expr(
+                                                (a0_prefetch is not None)
+                                                and (ku128 == 0)
+                                                and (ikxdl == 0)
+                                                and (mi == 0)
+                                            ):
+                                                a0, a1 = a0_prefetch
+                                            else:
+                                                a0, a1 = lds_load_packs_k64(
+                                                    curr_row_a_lds, col_base, lds_buffer
+                                                )
                                             a128 = pack_i64x4_to_i32x8(
                                                 a0, a1, c0_i64, c0_i64
                                             )
@@ -4289,11 +4302,18 @@ def compile_mixed_moe_gemm2(
 
                 # ---------------- 2-stage pipeline (ping-pong LDS + B tile prefetch) ----------------
                 # ---- Async DMA: GMEM -> LDS (bypasses VGPR, like stage1) ----
-                _dma_bytes = 16
                 _wave_size = 64
                 _eff_bytes_per_buffer = (
                     int(tile_m) * int(_eff_lds_stride) * int(a_elem_bytes)
                 )
+                # Per-thread DMA width: normally a 16B dwordx4, but cap it so
+                # small tiles are not over-loaded. For the fp4-A MFMA32x32x64
+                # path the packed tile is only 8B/thread (tile_m*tile_k/2/256);
+                # using 16B here would DMA 2x the buffer and corrupt the
+                # activation tile. buffer_load_lds only lowers for 4B/16B, so
+                # fall back to 4B (dword) loads when the tile is <16B/thread.
+                _per_thread_bytes = _eff_bytes_per_buffer // total_threads
+                _dma_bytes = 16 if (_per_thread_bytes % 16 == 0) else 4
                 _num_dma_loads = max(
                     1, _eff_bytes_per_buffer // (total_threads * _dma_bytes)
                 )

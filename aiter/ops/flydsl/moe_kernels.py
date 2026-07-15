@@ -204,35 +204,39 @@ def get_flydsl_stage2_kernels(
                             }
     # tile_k=128 candidates run on the dedicated MFMA32x32x64 f8f6f4 path, which
     # avoids K padding for FP4 weights (e.g. inter_dim=384). Supported for fp4
-    # and fp8 activations, reduce mode only, tile_m in (32, 64), tile_n == 128.
-    # Always offered for FP4 weights (the in-kernel MFMA32x32x64 path is
-    # implemented and validated).
+    # and fp8 activations, tile_m in (32, 64), tile_n == 128.
+    # Both reduce and atomic epilogues are offered: the shared CShuffle epilogue
+    # (`store_pair` in mixed_moe_gemm_2stage.py) implements both the global-store
+    # (reduce, needs a separate topk reduction kernel) and the 64-bit global
+    # atomic-fadd (atomic, accumulates topk directly -> no reduction kernel) for
+    # the mfma32k64 path.
     if is_fp4 and _stage2_mfma_variant_tag(128, a_dtype, b_dtype):
         for tm in (32, 64):
-            for bnt in b_nts:
-                for xcd in xcd_swizzles:
-                    base_name = flydsl_kernel_name(
-                        2, a_dtype, b_dtype, out_dtype, tm, 128, 128, "reduce"
-                    )
-                    base_name += "_mfma32k64"
-                    if bnt != 0:
-                        base_name += f"_bnt{bnt}"
-                    if xcd > 0:
-                        base_name += f"_xcd{xcd}"
-                    kernels[base_name] = {
-                        "stage": 2,
-                        "a_dtype": a_dtype,
-                        "b_dtype": b_dtype,
-                        "out_dtype": out_dtype,
-                        "tile_m": tm,
-                        "tile_n": 128,
-                        "tile_k": 128,
-                        "mode": "reduce",
-                        "MPerBlock": tm,
-                        "b_nt": bnt,
-                        "xcd_swizzle": xcd,
-                        "mfma_variant": "mfma32k64",
-                    }
+            for mode in ("reduce", "atomic"):
+                for bnt in b_nts:
+                    for xcd in xcd_swizzles:
+                        base_name = flydsl_kernel_name(
+                            2, a_dtype, b_dtype, out_dtype, tm, 128, 128, mode
+                        )
+                        base_name += "_mfma32k64"
+                        if bnt != 0:
+                            base_name += f"_bnt{bnt}"
+                        if xcd > 0:
+                            base_name += f"_xcd{xcd}"
+                        kernels[base_name] = {
+                            "stage": 2,
+                            "a_dtype": a_dtype,
+                            "b_dtype": b_dtype,
+                            "out_dtype": out_dtype,
+                            "tile_m": tm,
+                            "tile_n": 128,
+                            "tile_k": 128,
+                            "mode": mode,
+                            "MPerBlock": tm,
+                            "b_nt": bnt,
+                            "xcd_swizzle": xcd,
+                            "mfma_variant": "mfma32k64",
+                        }
     return kernels
 
 
@@ -1180,10 +1184,17 @@ def flydsl_moe_stage2(
     if a_dtype == "fp8":
         _persist_m = 1
 
-    # The MFMA32x32x64 tile_k=128 path is validated only with the non-persistent
-    # (persist_m=1) schedule.
+    # The MFMA32x32x64 tile_k=128 path was originally validated only with the
+    # non-persistent (persist_m=1) schedule. For the atomic epilogue the
+    # persistent round-robin schedule (X reuse across N-tiles + W2 prefetch) can
+    # hide W2 read latency; gate it behind an env flag until fully validated.
     if mfma_variant == "mfma32k64":
-        _persist_m = 1
+        _allow_persist = (
+            mode == "atomic"
+            and os.environ.get("AITER_FLYDSL_MFMA32_PERSIST", "0") == "1"
+        )
+        if not _allow_persist:
+            _persist_m = 1
 
     if bias is not None and bias.dtype != torch.float32:
         bias = bias.to(torch.float32)

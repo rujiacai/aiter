@@ -2624,6 +2624,14 @@ class FmoeTuner(TunerCommon):
             for kname, kparams in flydsl_s1_kernels.items():
                 is_splitk = kparams.get("k_batch", 1) > 1
 
+                # Hardening: split-K stage1 (k_batch>1) accumulates the K-slices
+                # via global atomic-add and is inaccurate at very small M for
+                # a4w4 (e.g. token=2 -> e2e cos ~0.55). Its perf niche (fill the
+                # GPU when M is tiny) is exactly where it is unreliable, so do
+                # not offer it as a tuner candidate for small tokens.
+                if is_splitk and a_dtype_str == "fp4" and token < 16:
+                    continue
+
                 # (kernel_name, kparams, is_fp4, is_fp8)
                 # out_dtype encodes fused quant type: "fp4" or "fp8"
                 #   a8w4 (a_dtype_str="fp8"): stage2 expects fp8 activations -> out_dtype="fp8"
@@ -2745,6 +2753,18 @@ class FmoeTuner(TunerCommon):
             for kname, kparams in flydsl_s2_kernels.items():
                 s2_tile_m = kparams["tile_m"]
                 if blockM % s2_tile_m != 0:
+                    continue
+                # Hardening: the tile_k=256 fp4 stage2 pads K (and the per-32
+                # fp4 scale tensor) up to a multiple of 256 (e.g. 384 -> 512).
+                # That padded path is inaccurate for non-256-aligned inter_dim
+                # (token=8 -> e2e cos ~0.84). The mfma32k64 (tile_k=128) path
+                # tiles K=inter_dim exactly and is correct, so drop the padded
+                # tile_k=256 candidate whenever inter_dim is not 256-aligned.
+                if (
+                    b_dtype_str == "fp4"
+                    and int(kparams.get("tile_k", 0)) == 256
+                    and inter_dim % 256 != 0
+                ):
                     continue
                 # Only try matched (tile_m==blockM) and one smaller (blockM/2) to limit candidates
                 if s2_tile_m != blockM and s2_tile_m != blockM // 2:
