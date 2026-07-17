@@ -159,7 +159,7 @@ def get_flydsl_stage2_kernels(
     """Return {kernelName: params} for all supported stage2 configs."""
     kernels = {}
     is_fp4 = b_dtype == "fp4"
-    tile_ns = [128, 256] if is_fp4 else [128]
+    tile_ns = [64, 128, 256] if is_fp4 else [128]
     # fp4 stage2 supports tile_k=128 (pack_K=1 scale sub-group shift path) as
     # well as 256.  tile_k=128 cleanly tiles K=inter_dim for TP-sharded shapes
     # whose inter_dim is a multiple of 128 but not 256 (e.g. MiniMax TP4=384).
@@ -204,7 +204,8 @@ def get_flydsl_stage2_kernels(
                             }
     # tile_k=128 candidates run on the dedicated MFMA32x32x64 f8f6f4 path, which
     # avoids K padding for FP4 weights (e.g. inter_dim=384). Supported for fp4
-    # and fp8 activations, tile_m in (32, 64), tile_n == 128.
+    # and fp8 activations, tile_m in (32, 64), tile_n in (64, 128). tile_n=64
+    # uses 2 waves (128 threads) per block; tile_n=128 keeps 4 waves (256).
     # Both reduce and atomic epilogues are offered: the shared CShuffle epilogue
     # (`store_pair` in mixed_moe_gemm_2stage.py) implements both the global-store
     # (reduce, needs a separate topk reduction kernel) and the 64-bit global
@@ -212,31 +213,32 @@ def get_flydsl_stage2_kernels(
     # the mfma32k64 path.
     if is_fp4 and _stage2_mfma_variant_tag(128, a_dtype, b_dtype):
         for tm in (32, 64):
-            for mode in ("reduce", "atomic"):
-                for bnt in b_nts:
-                    for xcd in xcd_swizzles:
-                        base_name = flydsl_kernel_name(
-                            2, a_dtype, b_dtype, out_dtype, tm, 128, 128, mode
-                        )
-                        base_name += "_mfma32k64"
-                        if bnt != 0:
-                            base_name += f"_bnt{bnt}"
-                        if xcd > 0:
-                            base_name += f"_xcd{xcd}"
-                        kernels[base_name] = {
-                            "stage": 2,
-                            "a_dtype": a_dtype,
-                            "b_dtype": b_dtype,
-                            "out_dtype": out_dtype,
-                            "tile_m": tm,
-                            "tile_n": 128,
-                            "tile_k": 128,
-                            "mode": mode,
-                            "MPerBlock": tm,
-                            "b_nt": bnt,
-                            "xcd_swizzle": xcd,
-                            "mfma_variant": "mfma32k64",
-                        }
+            for tn in (64, 128):
+                for mode in ("reduce", "atomic"):
+                    for bnt in b_nts:
+                        for xcd in xcd_swizzles:
+                            base_name = flydsl_kernel_name(
+                                2, a_dtype, b_dtype, out_dtype, tm, tn, 128, mode
+                            )
+                            base_name += "_mfma32k64"
+                            if bnt != 0:
+                                base_name += f"_bnt{bnt}"
+                            if xcd > 0:
+                                base_name += f"_xcd{xcd}"
+                            kernels[base_name] = {
+                                "stage": 2,
+                                "a_dtype": a_dtype,
+                                "b_dtype": b_dtype,
+                                "out_dtype": out_dtype,
+                                "tile_m": tm,
+                                "tile_n": tn,
+                                "tile_k": 128,
+                                "mode": mode,
+                                "MPerBlock": tm,
+                                "b_nt": bnt,
+                                "xcd_swizzle": xcd,
+                                "mfma_variant": "mfma32k64",
+                            }
     return kernels
 
 

@@ -2948,7 +2948,12 @@ def compile_mixed_moe_gemm2(
     def _scale_elem_type():
         return T.i32
 
-    total_threads = 256
+    # N is split across waves; each wave owns one MFMA-N tile (mfma_n columns).
+    # tile_n=64 -> 2 waves (128 threads); tile_n in {128,256} -> 4 waves (256
+    # threads), identical to the historical hard-coded value (zero regression).
+    _mfma_n_for_waves = 32 if use_mfma32_k64 else 16
+    num_waves = max(1, min(4, int(tile_n) // _mfma_n_for_waves))
+    total_threads = num_waves * 64
     # For the fp4-A MFMA32 path the LDS stores K already vec-packed (2 fp4/byte),
     # so the per-row K storage shrinks by a_elem_vec_pack. For fp8-A this is a
     # no-op (a_elem_vec_pack == 1).
@@ -3192,7 +3197,7 @@ def compile_mixed_moe_gemm2(
 
             # XOR16 swizzle parameter (in bytes; constant, power-of-two in our configs).
             k_blocks16 = arith.constant(_eff_tile_k_bytes // 16, index=True)
-            layout_tx_wave_lane = fx.make_layout((4, 64), stride=(64, 1))
+            layout_tx_wave_lane = fx.make_layout((num_waves, 64), stride=(64, 1))
             layout_lane16 = fx.make_layout((4, 16), stride=(16, 1))
             layout_lane32 = fx.make_layout((2, 32), stride=(32, 1))
 
@@ -3579,13 +3584,14 @@ def compile_mixed_moe_gemm2(
                     lane_div_32 if use_mfma32_k64 else lane_div_16
                 ) * arith.constant(16, index=True)
 
-                # Dynamic N tiling within block.
-                num_waves = 4
+                # Dynamic N tiling within block. num_waves is derived from tile_n
+                # at function scope (tile_n=64 -> 2 waves); each wave owns one
+                # MFMA-N tile.
                 n_per_wave = tile_n // num_waves
                 num_acc_n = n_per_wave // mfma_n
                 c_n_per_wave = arith.constant(n_per_wave, index=True)
-                wave_mod_4 = _mod_pow2(wave_id, 4)
-                n_tile_base = wave_mod_4 * c_n_per_wave
+                wave_mod_n = _mod_pow2(wave_id, num_waves)
+                n_tile_base = wave_mod_n * c_n_per_wave
 
                 by_n = by * arith.constant(tile_n, index=True)
 
@@ -4802,6 +4808,10 @@ def compile_mixed_moe_gemm2(
                     tile_m=tile_m,
                     tile_n=tile_n,
                     e_vec=_e_vec,
+                    # block_size must match the launch thread count; tile_n=64 uses
+                    # 128 threads (2 waves), not the default 256, or the LDS->global
+                    # read phase only covers half the M rows.
+                    block_size=total_threads,
                     m_repeat=m_repeat,
                     num_acc_n=num_acc_n,
                     tx=tx,
@@ -4928,7 +4938,7 @@ def compile_mixed_moe_gemm2(
             i32_size_expert_ids_in,
         ).launch(
             grid=(gx, gy, 1),
-            block=(256, 1, 1),
+            block=(total_threads, 1, 1),
             stream=stream,
         )
 
