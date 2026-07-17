@@ -112,9 +112,17 @@ def _parse_flydsl_kernel_name(name: str) -> Optional[Dict]:
         "b_nt": 2,
     }
     if stage == 1:
-        params.update({"k_batch": 1, "gate_only": False})
+        params.update({"k_batch": 1, "gate_only": False, "persist_m": 1})
     else:
-        params.update({"mode": "atomic", "sort_block_m": 0, "persist": False})
+        params.update(
+            {
+                "mode": "atomic",
+                "sort_block_m": 0,
+                "persist": False,
+                "k_batch": 1,
+                "persist_m": 1,
+            }
+        )
 
     for token in (match.group("rest") or "").split("_"):
         if not token:
@@ -123,24 +131,47 @@ def _parse_flydsl_kernel_name(name: str) -> Optional[Dict]:
             params["use_async_copy"] = True
         elif stage == 2 and token in ("atomic", "reduce"):
             params["mode"] = token
-        elif token in ("mfma16k128", "mfma32k64"):
+        elif token in ("mfma16k128", "mfma32k64", "mfma16k32"):
             params["mfma_variant"] = token
         elif token.startswith("w") and token[1:].isdigit():
             params["waves_per_eu"] = int(token[1:])
         elif token.startswith("bnt") and token[3:].isdigit():
             params["b_nt"] = int(token[3:])
-        elif stage == 1 and token.startswith("kb") and token[2:].isdigit():
+        elif token.startswith("kb") and token[2:].isdigit():
             params["k_batch"] = int(token[2:])
+        elif token.startswith("pm") and token[2:].isdigit():
+            params["persist_m"] = int(token[2:])
+        elif token.startswith("bp") and token[2:].isdigit():
+            params["b_pool_depth"] = int(token[2:])
+        elif token.startswith("xp") and token[2:].isdigit():
+            params["x_pool_depth"] = int(token[2:])
         elif stage == 1 and token == "go":
             params["gate_only"] = True
         elif stage == 1 and token == "fq":
             params["fuse_fp4_quant"] = True
         elif stage == 2 and token == "persist":
             params["persist"] = True
+        elif stage == 2 and token.startswith("pn") and token[2:].isdigit():
+            # persist_n: number of consecutive N-tiles each workgroup serially
+            # sweeps (per-WG N-loop length), reusing the M-block's activation X
+            # across them. See compile_moe_gemm2.
+            params["persist_n"] = int(token[2:])
         elif token.startswith("sbm") and token[3:].isdigit():
             params["sort_block_m"] = int(token[3:])
         elif token == "fq":
             params["fuse_fp4_quant"] = True
+        elif token == "rgx":
+            params["remap"] = "gx"
+        elif token == "roff":
+            params["remap"] = "off"
+        elif token == "axy":
+            params["splitk_axis"] = "y"
+        elif token == "xnt":
+            params["x_nt"] = 2
+        elif token == "snt":
+            params["scale_nt"] = 2
+        elif token == "ont":
+            params["out_nt"] = 2
         else:
             return None
     return params
@@ -196,6 +227,177 @@ def _device_lds_limit_bytes() -> int:
     return _LDS_LIMIT_BYTES_BY_GFX[gfx]
 
 
+def _tune_csv(env_name: str, default: list[str]) -> list[str]:
+    """Read a comma-separated tuning candidate list from env (else default)."""
+    raw = os.environ.get(env_name, "")
+    if not raw.strip():
+        return default
+    return [tok.strip() for tok in raw.split(",") if tok.strip()]
+
+
+def _moe_knob_variants(kb: int):
+    """Yield (name_tag, params) for the dispatch/cache tuning knobs.
+
+    Defaults keep a single canonical variant (empty tag, no params) so the tuned
+    candidate set is byte-identical unless widened via env:
+      AITER_TUNE_MOE_REMAP=gy,gx,off   AITER_TUNE_MOE_SPLITK_AXIS=z,y
+      AITER_TUNE_MOE_X_NT=0,2          AITER_TUNE_MOE_SCALE_NT=0,2
+      AITER_TUNE_MOE_OUT_NT=0,2
+    """
+    remaps = _tune_csv("AITER_TUNE_MOE_REMAP", ["gy"])
+    axes = _tune_csv("AITER_TUNE_MOE_SPLITK_AXIS", ["z"])
+    xnts = _tune_csv("AITER_TUNE_MOE_X_NT", ["0"])
+    snts = _tune_csv("AITER_TUNE_MOE_SCALE_NT", ["0"])
+    onts = _tune_csv("AITER_TUNE_MOE_OUT_NT", ["0"])
+    seen = set()
+    for rm in remaps:
+        for ax in axes:
+            # splitk_axis only changes the grid when kb>1; collapse to "z" otherwise
+            # to avoid emitting duplicate kernels under different names.
+            eff_ax = ax if kb > 1 else "z"
+            for xn in xnts:
+                for sn in snts:
+                    for on in onts:
+                        tag, p = "", {}
+                        if rm == "gx":
+                            tag += "_rgx"; p["remap"] = "gx"
+                        elif rm == "off":
+                            tag += "_roff"; p["remap"] = "off"
+                        if eff_ax == "y":
+                            tag += "_axy"; p["splitk_axis"] = "y"
+                        if int(xn):
+                            tag += "_xnt"; p["x_nt"] = 2
+                        if int(sn):
+                            tag += "_snt"; p["scale_nt"] = 2
+                        if int(on):
+                            tag += "_ont"; p["out_nt"] = 2
+                        if tag in seen:
+                            continue
+                        seen.add(tag)
+                        yield tag, p
+
+
+def _pool_variants():
+    """Yield (name_tag, params) for stage1/stage2 B/X weight/activation prefetch-pool depths.
+
+    Default candidate set = no-pool + the bp3/xp3 double pool (the tuned winner:
+    ~-3 to -5.5% at mid/large tokens). Widen/override via env, e.g.
+      AITER_TUNE_MOE_POOL=0,bp3,xp3,bp3xp3,bp4xp4
+    Tokens: "0" (none), "bp{N}", "xp{N}", "bp{N}xp{M}". Tag order matches the
+    kernel module_name (_bp{N} before _xp{N}).
+    """
+    import re as _re
+    specs = _tune_csv("AITER_TUNE_MOE_POOL", ["0", "bp3xp3"])
+    seen = set()
+    for s in specs:
+        tag = ""
+        p: Dict = {}
+        mb = _re.search(r"bp(\d+)", s)
+        if mb and int(mb.group(1)) >= 2:
+            p["b_pool_depth"] = int(mb.group(1))
+            tag += f"_bp{mb.group(1)}"
+        mx = _re.search(r"xp(\d+)", s)
+        if mx and int(mx.group(1)) >= 2:
+            p["x_pool_depth"] = int(mx.group(1))
+            tag += f"_xp{mx.group(1)}"
+        if tag in seen:
+            continue
+        seen.add(tag)
+        yield tag, p
+
+
+def _persist_m_candidates() -> list[int]:
+    """Yield persist_m tuning candidates (workgroup-merge along M).
+
+    persist_m is the inverse of split-K: each WG serially sweeps persist_m
+    M-blocks (fewer, heavier WGs). Defaults to a small set so large-token configs
+    can be tuned out of the box; override via env, e.g.
+      AITER_TUNE_MOE_PERSIST_M=1,2,4,8
+    """
+    vals = _tune_csv("AITER_TUNE_MOE_PERSIST_M", ["1", "2", "4", "8"])
+    out: list[int] = []
+    for v in vals:
+        try:
+            iv = int(v)
+        except ValueError:
+            continue
+        if iv >= 1 and iv not in out:
+            out.append(iv)
+    return out or [1]
+
+
+def _persist_n_candidates() -> list[int]:
+    """Yield persist_n tuning candidates (N-merge along the output/model_dim).
+
+    persist_n = how many consecutive N-tiles each WG serially sweeps, reusing
+    the M-block's activation X across them (X is independent of the output dim).
+    Default OFF: returns [] so the candidate set is byte-identical unless widened
+    via env, e.g.
+      AITER_TUNE_MOE_PERSIST_N=1,2,4,8,16
+    Only values > 1 emit extra `_pn{n}` variants; per-shape divisibility (n must
+    divide model_dim/tile_n) is checked by the caller when the shape is known.
+    """
+    vals = _tune_csv("AITER_TUNE_MOE_PERSIST_N", ["0"])
+    out: list[int] = []
+    for v in vals:
+        try:
+            iv = int(v)
+        except ValueError:
+            continue
+        if iv > 1 and iv not in out:
+            out.append(iv)
+    return out
+
+
+def _stage2_mfma_variants(tk: int, a_dtype: str, b_dtype: str):
+    """Yield (name_tag, params-overlay) for the fp8 stage2 MFMA-ISA choice.
+
+    For a given tile_k, several MFMA instructions are valid; this exposes that as
+    a tuning dimension so the tuner can pick the best-latency ISA per shape:
+      - auto / 16x16x128 : the wide `mfma_scale_f32_16x16x128_f8f6f4` when
+                           tk % 128 == 0 (else the kernel falls back to 16x16x32).
+      - 16x16x32         : force `mfma_f32_16x16x32_fp8_fp8` even at tk % 128 == 0.
+                           Finer-grained -> lets pooling/soft-pipeline hide more of
+                           the VALU->MFMA dependency stall (anti-starvation).
+
+    Default (env unset) yields only the auto variant, so the candidate set stays
+    byte-identical unless widened via AITER_TUNE_MOE_MFMA=auto,16x16x32. Only ISA
+    valid for the given tile_k (and platform, gfx950 for the wide scale MFMA) are
+    emitted.
+    """
+    if b_dtype == "fp4":
+        # fp4 keeps its dedicated MFMA path (see _stage2_mfma_variant_tag).
+        yield "", {}
+        return
+    specs = _tune_csv("AITER_TUNE_MOE_MFMA", ["auto"])
+    seen: set[str] = set()
+    for s in specs:
+        s = s.strip().lower()
+        if s in ("", "auto", "16x16x128", "mfma16k128"):
+            key = "auto"
+        elif s in ("16x16x32", "mfma16k32"):
+            # Only meaningful where auto would pick the wide 16x16x128 (tk % 128
+            # == 0); at tk % 128 != 0 auto already emits 16x16x32, so forcing it
+            # would just duplicate that candidate.
+            if (tk % 128) != 0:
+                continue
+            key = "mfma16k32"
+        else:
+            raise ValueError(
+                "AITER_TUNE_MOE_MFMA tokens must be in "
+                "{auto,16x16x128,16x16x32}, got " + repr(s)
+            )
+        if key in seen:
+            continue
+        seen.add(key)
+        if key == "auto":
+            yield "", {}
+        else:
+            yield f"_{key}", {"mfma_variant": key}
+    if not seen:
+        yield "", {}
+
+
 def _async_copy_candidates() -> list[bool]:
     gfx = _current_gfx()
     if gfx == "gfx942":
@@ -248,7 +450,12 @@ def get_flydsl_stage1_kernels(
     tile_ks = [256] if is_fp4 else [128, 256]
     tile_ms = [16, 32, 64, 128] if is_fp4 else [32, 64, 128]
     waves_per_eus = [1, 2, 3, 4] if is_fp4 else [0, 1, 2, 3, 4]
-    k_batches = [1, 2, 4, 8, 16] if is_fp4 else [1]
+    # Non-fp4 split-K is supported by moe_gemm_2stage.compile_moe_gemm1 (the GEMM
+    # writes raw gate/up partials with atomic-add; silu/mul is deferred to the
+    # post-kernel reduction). It requires the CShuffle epilogue (tile_n % 128 == 0),
+    # guarded below. The autotuner only picks these when they win, so the default
+    # (best) performance is preserved.
+    k_batches = [1, 2, 4, 8, 16] if is_fp4 else [1, 2, 4]
     b_nts = [0, 2] if is_fp4 else [0, 2]
     async_copies = _async_copy_candidates()
     for tm in tile_ms:
@@ -291,6 +498,13 @@ def get_flydsl_stage1_kernels(
                                     continue
                                 if tn // 32 * 64 > 256:
                                     continue
+                            elif kb > 1:
+                                # Non-fp4 split-K stage1 requires the CShuffle epilogue
+                                # (raw partials are shuffled to contiguous half2 frags
+                                # for packed atomic-add). It is only enabled when
+                                # tile_n % 128 == 0 (use_cshuffle_epilog resolves True).
+                                if tn % 128 != 0:
+                                    continue
                             # Split-K stage1 requires:
                             #   model_dim % k_batch == 0 and
                             #   (model_dim // k_batch) % tile_k == 0
@@ -299,7 +513,10 @@ def get_flydsl_stage1_kernels(
                             if model_dim is not None and kb > 1:
                                 if model_dim % kb != 0:
                                     continue
-                                if (model_dim // kb) % tk != 0:
+                                # The stage1 ping-pong loop has a fixed 2-tile
+                                # tail, so the per-slice tile count must be even
+                                # (an odd count silently drops the middle tile).
+                                if (model_dim // kb) % (2 * tk) != 0:
                                     continue
                             gate_onlys = [False, True] if kb > 1 and is_fp4 else [False]
                             for bnt in b_nts:
@@ -319,7 +536,7 @@ def get_flydsl_stage1_kernels(
                                         name += f"_bnt{bnt}"
                                     if go:
                                         name += "_go"
-                                    kernels[name] = {
+                                    base = {
                                         "stage": 1,
                                         "a_dtype": a_dtype,
                                         "b_dtype": b_dtype,
@@ -335,6 +552,52 @@ def get_flydsl_stage1_kernels(
                                         "b_nt": bnt,
                                         "gate_only": go,
                                     }
+                                    # fp4 stage1 goes through the mixed kernel, which
+                                    # does not take the dispatch/cache knobs.
+                                    if is_fp4:
+                                        kernels[name] = base
+                                        continue
+                                    # fp8 MFMA-ISA choice (16x16x128 scale vs
+                                    # 16x16x32) is a tuning dimension, gated per
+                                    # tile_k. Default env => auto only, so the
+                                    # candidate set is byte-identical unless widened
+                                    # via AITER_TUNE_MOE_MFMA (shared with stage2).
+                                    for mvtag, mvp in _stage2_mfma_variants(
+                                        tk, a_dtype, b_dtype
+                                    ):
+                                        v_name = name + mvtag
+                                        v_base = {**base, **mvp}
+                                        # persist_m (workgroup-merge along M) is the
+                                        # inverse of split-K, so it only applies when
+                                        # k_batch==1. The tuner gates split-K vs persist
+                                        # by token count.
+                                        _pms = _persist_m_candidates() if kb == 1 else [1]
+                                        for ktag, kp in _moe_knob_variants(kb):
+                                            for pm in _pms:
+                                                pmtag = f"_pm{pm}" if pm != 1 else ""
+                                                kernels[v_name + ktag + pmtag] = {
+                                                    **v_base,
+                                                    **kp,
+                                                    "persist_m": pm,
+                                                }
+                                            # B/X prefetch pool: reuse the shared
+                                            # `_pool_variants()` as tunable name tokens
+                                            # (`_bpN`/`_xpN`/`_bpNxpN`) exactly like stage2
+                                            # (driven by AITER_TUNE_MOE_POOL). Only for small N
+                                            # tiles (tile_n<=128) with register room -- gate+up
+                                            # doubles the accumulators, so large tiles spill.
+                                            # k_batch==1, persist_m==1. Skip "" (no-pool already
+                                            # emitted above).
+                                            if kb == 1 and tn <= 128:
+                                                for ptag, pp in _pool_variants():
+                                                    if not pp:
+                                                        continue
+                                                    kernels[v_name + ktag + ptag] = {
+                                                        **v_base,
+                                                        **kp,
+                                                        "persist_m": 1,
+                                                        **pp,
+                                                    }
     return kernels
 
 
@@ -382,43 +645,125 @@ def get_flydsl_stage2_kernels(
                             ):
                                 continue
                             for bnt in b_nts:
-                                base_name = flydsl_kernel_name(
-                                    2,
-                                    a_dtype,
-                                    b_dtype,
-                                    out_dtype,
-                                    tm,
-                                    tn,
-                                    tk,
-                                    mode,
-                                )
-                                if async_copy:
-                                    base_name += "_async"
-                                if mfma_variant_tag:
-                                    base_name += f"_{mfma_variant_tag}"
-                                if is_fp4 and wpe != 1:
-                                    base_name += f"_w{wpe}"
-                                elif not is_fp4 and wpe > 0:
-                                    base_name += f"_w{wpe}"
-                                if bnt != 2:
-                                    base_name += f"_bnt{bnt}"
-                                base_params = {
-                                    "stage": 2,
-                                    "a_dtype": a_dtype,
-                                    "b_dtype": b_dtype,
-                                    "out_dtype": out_dtype,
-                                    "tile_m": tm,
-                                    "tile_n": tn,
-                                    "tile_k": tk,
-                                    "mode": mode,
-                                    "MPerBlock": tm,
-                                    "use_async_copy": async_copy,
-                                    "waves_per_eu": wpe,
-                                    "b_nt": bnt,
-                                }
-                                if mfma_variant_tag:
-                                    base_params["mfma_variant"] = mfma_variant_tag
-                                kernels[base_name] = base_params
+                                # Non-fp4 split-K stage2: K=inter_dim is partitioned
+                                # across k_batch workgroups that atomic-accumulate
+                                # their partials (requires atomic mode). Only valid
+                                # when inter_dim (k_dim) is divisible appropriately.
+                                if (not is_fp4) and mode == "atomic" and wpe == 3:
+                                    _stage2_kbs = [1, 2, 4]
+                                else:
+                                    _stage2_kbs = [1]
+                                for kb in _stage2_kbs:
+                                    if kb > 1 and k_dim is not None:
+                                        if k_dim % kb != 0:
+                                            continue
+                                        if (k_dim // kb) % tk != 0:
+                                            continue
+                                    base_name = flydsl_kernel_name(
+                                        2,
+                                        a_dtype,
+                                        b_dtype,
+                                        out_dtype,
+                                        tm,
+                                        tn,
+                                        tk,
+                                        mode,
+                                    )
+                                    if async_copy:
+                                        base_name += "_async"
+                                    if mfma_variant_tag:
+                                        base_name += f"_{mfma_variant_tag}"
+                                    if is_fp4 and wpe != 1:
+                                        base_name += f"_w{wpe}"
+                                    elif not is_fp4 and wpe > 0:
+                                        base_name += f"_w{wpe}"
+                                    if bnt != 2:
+                                        base_name += f"_bnt{bnt}"
+                                    if kb != 1:
+                                        base_name += f"_kb{kb}"
+                                    base_params = {
+                                        "stage": 2,
+                                        "a_dtype": a_dtype,
+                                        "b_dtype": b_dtype,
+                                        "out_dtype": out_dtype,
+                                        "tile_m": tm,
+                                        "tile_n": tn,
+                                        "tile_k": tk,
+                                        "mode": mode,
+                                        "MPerBlock": tm,
+                                        "use_async_copy": async_copy,
+                                        "waves_per_eu": wpe,
+                                        "b_nt": bnt,
+                                        "k_batch": kb,
+                                    }
+                                    if mfma_variant_tag:
+                                        base_params["mfma_variant"] = mfma_variant_tag
+                                    # fp4 stage2 goes through the mixed kernel, which
+                                    # does not take the dispatch/cache knobs.
+                                    if is_fp4:
+                                        kernels[base_name] = base_params
+                                        continue
+                                    # fp8 MFMA-ISA choice (16x16x128 scale vs
+                                    # 16x16x32) is a tuning dimension, gated per
+                                    # tile_k. Default env => auto only, so the
+                                    # candidate set is byte-identical unless widened
+                                    # via AITER_TUNE_MOE_MFMA.
+                                    for mvtag, mvp in _stage2_mfma_variants(
+                                        tk, a_dtype, b_dtype
+                                    ):
+                                        v_name = base_name + mvtag
+                                        v_params = {**base_params, **mvp}
+                                        # persist_m (workgroup-merge along M) is the
+                                        # inverse of split-K, so it only applies when
+                                        # k_batch==1. The tuner gates split-K vs persist
+                                        # by token count.
+                                        _pms = _persist_m_candidates() if kb == 1 else [1]
+                                        for ktag, kp in _moe_knob_variants(kb):
+                                            for pm in _pms:
+                                                pmtag = f"_pm{pm}" if pm != 1 else ""
+                                                # B/X prefetch pool applies to ALL stage2
+                                                # paths (default, persist_m>1, split-K): the
+                                                # pool is a compile-time ring over the same
+                                                # constexpr K-loop, which is emitted inside the
+                                                # persist-loop body and is split-K slice-aware
+                                                # (uses k_start/num_k_tiles_py). Measured gains
+                                                # ~+5-8% at 16k/40k for pm4 and kb2 (X pool
+                                                # still helps since activations aren't reused
+                                                # across M-blocks). kernel has no pm/kb gate on
+                                                # _use_pool; this just makes them candidates.
+                                                _pvars = list(_pool_variants())
+                                                for ptag, pp in _pvars:
+                                                    kernels[v_name + ktag + pmtag + ptag] = {
+                                                        **v_params,
+                                                        **kp,
+                                                        "persist_m": pm,
+                                                        **pp,
+                                                    }
+                                                    # persist_n (N-merge) variants:
+                                                    # each WG sweeps `pn` consecutive
+                                                    # N-tiles, reusing the M-block's X.
+                                                    # Only for the plain pm==1/kb==1
+                                                    # path; default env unset => no
+                                                    # extra variants (candidate set
+                                                    # unchanged). pn must divide the
+                                                    # N-tile count (model_dim/tile_n)
+                                                    # when the shape is known.
+                                                    if pm == 1 and kb == 1:
+                                                        for pn in _persist_n_candidates():
+                                                            if (
+                                                                n_dim is not None
+                                                                and (n_dim // tn) % pn != 0
+                                                            ):
+                                                                continue
+                                                            kernels[
+                                                                v_name + ktag + pmtag + ptag + f"_pn{pn}"
+                                                            ] = {
+                                                                **v_params,
+                                                                **kp,
+                                                                "persist_m": pm,
+                                                                **pp,
+                                                                "persist_n": pn,
+                                                            }
     return kernels
 
 
@@ -462,6 +807,14 @@ def compile_flydsl_moe_stage1(
     waves_per_eu: int = 3,
     b_nt: int = 2,
     gate_only: bool = False,
+    remap: Optional[str] = None,
+    splitk_axis: Optional[str] = None,
+    x_nt: Optional[int] = None,
+    scale_nt: Optional[int] = None,
+    out_nt: Optional[int] = None,
+    b_pool_depth: int = 0,
+    x_pool_depth: int = 0,
+    mfma_variant: Optional[str] = None,
 ):
     """Compile stage1 kernel (cached via underlying lru_cache)."""
     if b_dtype == "fp4":
@@ -510,6 +863,16 @@ def compile_flydsl_moe_stage1(
             use_async_copy=use_async_copy,
             waves_per_eu=waves_per_eu,
             b_nt=b_nt,
+            k_batch=k_batch,
+            persist_m=persist_m,
+            remap=remap,
+            splitk_axis=splitk_axis,
+            x_nt=x_nt,
+            scale_nt=scale_nt,
+            out_nt=out_nt,
+            b_pool_depth=b_pool_depth,
+            x_pool_depth=x_pool_depth,
+            mfma_variant=mfma_variant,
         )
 
 
@@ -532,6 +895,15 @@ def compile_flydsl_moe_stage2(
     waves_per_eu: int = 3,
     b_nt: int = 2,
     mfma_variant: Optional[str] = None,
+    k_batch: int = 1,
+    remap: Optional[str] = None,
+    splitk_axis: Optional[str] = None,
+    x_nt: Optional[int] = None,
+    scale_nt: Optional[int] = None,
+    out_nt: Optional[int] = None,
+    b_pool_depth: int = 0,
+    x_pool_depth: int = 0,
+    persist_n: int = 0,
 ):
     """Compile stage2 kernel (cached via underlying lru_cache)."""
     if b_dtype == "fp4":
@@ -573,6 +945,17 @@ def compile_flydsl_moe_stage2(
             use_async_copy=use_async_copy,
             waves_per_eu=waves_per_eu,
             b_nt=b_nt,
+            k_batch=k_batch,
+            persist_m=persist_m,
+            remap=remap,
+            splitk_axis=splitk_axis,
+            x_nt=x_nt,
+            scale_nt=scale_nt,
+            out_nt=out_nt,
+            b_pool_depth=b_pool_depth,
+            x_pool_depth=x_pool_depth,
+            persist_n=persist_n,
+            mfma_variant=mfma_variant,
         )
 
 
@@ -789,6 +1172,14 @@ def flydsl_moe_stage1(
     waves_per_eu: int = 3,
     b_nt: int = 2,
     gate_only: bool = False,
+    remap: Optional[str] = None,
+    splitk_axis: Optional[str] = None,
+    x_nt: Optional[int] = None,
+    scale_nt: Optional[int] = None,
+    out_nt: Optional[int] = None,
+    b_pool_depth: int = 0,
+    x_pool_depth: int = 0,
+    mfma_variant: Optional[str] = None,
 ):
     """Fused MOE stage1 GEMM.
 
@@ -1012,6 +1403,14 @@ def flydsl_moe_stage1(
         waves_per_eu=waves_per_eu,
         b_nt=b_nt,
         gate_only=gate_only,
+        remap=remap,
+        splitk_axis=splitk_axis,
+        x_nt=x_nt,
+        scale_nt=scale_nt,
+        out_nt=out_nt,
+        b_pool_depth=b_pool_depth,
+        x_pool_depth=x_pool_depth,
+        mfma_variant=mfma_variant,
     )
     _run_compiled(exe, args)
 
@@ -1091,8 +1490,22 @@ def flydsl_moe_stage2(
     b_nt: int = 2,
     mfma_variant: Optional[str] = None,
     zero_intermediate: bool = True,
+    k_batch: int = 1,
+    persist_m: int = 1,
+    remap: Optional[str] = None,
+    splitk_axis: Optional[str] = None,
+    x_nt: Optional[int] = None,
+    scale_nt: Optional[int] = None,
+    out_nt: Optional[int] = None,
+    b_pool_depth: int = 0,
+    x_pool_depth: int = 0,
+    persist_n: int = 0,
 ) -> torch.Tensor:
     """Down-projection GEMM (MOE stage2). Supports atomic/reduce modes.
+
+    When k_batch>1 (split-K), the K=inter_dim contraction is partitioned across
+    k_batch workgroups (grid.z) that atomic-accumulate their partials into the
+    output. Requires atomic mode (mode != "reduce").
 
     a: (token_num, topk, inter_dim), w1: (E, model_dim, inter_dim) pre-shuffled.
     Returns (token_num, model_dim).
@@ -1147,7 +1560,7 @@ def flydsl_moe_stage2(
     #     _persist_m = 1  # _persist_m = 1 is better for g1u0
     # else:
     #     _persist_m = -1 if m_blocks > 256 else 1
-    _persist_m = 1
+    _persist_m = persist_m if persist_m and persist_m > 0 else 1
 
     is_fp4 = b_dtype == "fp4"
     _n_in = model_dim
@@ -1222,6 +1635,15 @@ def flydsl_moe_stage2(
         waves_per_eu=waves_per_eu,
         b_nt=b_nt,
         mfma_variant=mfma_variant,
+        k_batch=k_batch,
+        remap=remap,
+        splitk_axis=splitk_axis,
+        x_nt=x_nt,
+        scale_nt=scale_nt,
+        out_nt=out_nt,
+        b_pool_depth=b_pool_depth,
+        x_pool_depth=x_pool_depth,
+        persist_n=persist_n,
     )
     _run_compiled(exe, args)
 

@@ -488,11 +488,20 @@ class FmoeTuner(TunerCommon):
             use_async_copy=kparams.get("use_async_copy", False),
             use_cshuffle_epilog=kparams.get("use_cshuffle_epilog", None),
             k_batch=kparams.get("k_batch", 1),
+            persist_m=kparams.get("persist_m", 1),
             waves_per_eu=kparams.get("waves_per_eu", 3),
             b_nt=kparams.get("b_nt", 2),
             gate_only=kparams.get("gate_only", False),
             fuse_fp4_quant=fuse_fq,
             fuse_sort_scale=fuse_fq,
+            remap=kparams.get("remap", None),
+            splitk_axis=kparams.get("splitk_axis", None),
+            x_nt=kparams.get("x_nt", None),
+            scale_nt=kparams.get("scale_nt", None),
+            out_nt=kparams.get("out_nt", None),
+            b_pool_depth=kparams.get("b_pool_depth", 0),
+            x_pool_depth=kparams.get("x_pool_depth", 0),
+            mfma_variant=kparams.get("mfma_variant", None),
         )
         if isinstance(result, tuple):
             out_raw = result[0]
@@ -559,6 +568,16 @@ class FmoeTuner(TunerCommon):
             b_nt=kparams.get("b_nt", 2),
             mfma_variant=kparams.get("mfma_variant", None),
             zero_intermediate=zero_intermediate,
+            k_batch=kparams.get("k_batch", 1),
+            persist_m=kparams.get("persist_m", 1),
+            remap=kparams.get("remap", None),
+            splitk_axis=kparams.get("splitk_axis", None),
+            x_nt=kparams.get("x_nt", None),
+            scale_nt=kparams.get("scale_nt", None),
+            out_nt=kparams.get("out_nt", None),
+            b_pool_depth=kparams.get("b_pool_depth", 0),
+            x_pool_depth=kparams.get("x_pool_depth", 0),
+            persist_n=kparams.get("persist_n", 0),
         )
 
     @staticmethod
@@ -2342,6 +2361,21 @@ class FmoeTuner(TunerCommon):
 
                 is_splitk = kparams.get("k_batch", 1) > 1
 
+                # split-K and persist_m are opposite concurrency trade-offs (split
+                # more WGs vs. merge WGs). Gate by token count: >threshold tokens
+                # only tune persist_m, otherwise only tune split-K. The baseline
+                # (k_batch==1, persist_m==1) is always considered in both regimes.
+                _persist_thr = int(
+                    os.getenv("AITER_FMOE_PERSIST_TOKEN_THRESHOLD", "16384")
+                )
+                _is_persist = kparams.get("persist_m", 1) > 1
+                if token > _persist_thr:
+                    if is_splitk:
+                        continue
+                else:
+                    if _is_persist:
+                        continue
+
                 if kparams.get("gate_only", False) and not use_g1u1 and b_dtype_s1 == "fp4":
                     continue
                     
@@ -2410,6 +2444,19 @@ class FmoeTuner(TunerCommon):
                     )
 
             for kname, kparams in flydsl_s2_kernels.items():
+                # split-K vs persist_m token gate (see stage1 comment above).
+                _s2_persist_thr = int(
+                    os.getenv("AITER_FMOE_PERSIST_TOKEN_THRESHOLD", "16384")
+                )
+                _s2_is_splitk = kparams.get("k_batch", 1) > 1
+                _s2_is_persist = kparams.get("persist_m", 1) > 1
+                if token > _s2_persist_thr:
+                    if _s2_is_splitk:
+                        continue
+                else:
+                    if _s2_is_persist:
+                        continue
+
                 if b_dtype_s2 != "fp4":
                     if kparams["tile_m"] != blockM:
                         continue

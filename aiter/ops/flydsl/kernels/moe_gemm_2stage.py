@@ -39,6 +39,7 @@ except ImportError:
 
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm, scf, memref
+from flydsl._mlir.dialects import gpu as _gpu_mlir
 from flydsl.expr.typing import T
 
 
@@ -56,6 +57,183 @@ from .mfma_preshuffle_pipeline import (
     crd2idx,
 )
 from .mfma_epilogues import c_shuffle_epilog, default_epilog, mfma_epilog
+
+
+# ── XCD-locality grid remap ────────────────────────────────────────────────
+# The default 2D launch is grid=(gx=n_tiles, gy=expert_blocks) walked X-fast.
+# Under multi-XCD chunked dispatch with TG_CHUNK_SIZE==1, consecutive workgroups
+# round-robin across the XCDs. With the default layout a single expert-block (one
+# gy row) spans the whole X axis, so that expert's n_tiles scatter across all
+# XCDs and every XCD pulls the same expert weights into its own L2 (zero reuse).
+#
+# Remap to a 3D grid (NUM_XCD, gx, ceil(gy/NUM_XCD)):
+#   block_id.x -> xcd   (0..NUM_XCD-1, one per XCD via chunk=1)
+#   block_id.y -> n_tile  (walks the full original gx)
+#   block_id.z -> expert-block group
+#   expert_block = z*NUM_XCD + xcd
+# X-fast walk then sends (x=0..7,y=0) to XCD0..7, (x=*,y=1) again to XCD0..7, ...
+# so each XCD completes ALL n_tiles of one expert before advancing to the next
+# expert (z+1) -> that expert's weights stay resident in the XCD's L2.
+# gy need not be a multiple of NUM_XCD: trailing blocks (expert_block >= gy) are
+# dropped by the existing blk_valid guard (bx_m >= max_token/num_valid).
+MOE_XCD_REMAP = os.environ.get("AITER_MOE_XCD_REMAP", "1") not in ("0", "false", "False")
+# XCD remap axis selector (only meaningful when MOE_XCD_REMAP is on).
+#   default (gy-first): split the sorted-M / expert-block axis (gy) across XCDs ->
+#     grid=(NUM_XCD, gx, ceil(gy/NUM_XCD)). Each XCD owns a token-block slice and
+#     sweeps all n_tiles per block => input-activation (token) stays L2-resident.
+#   AITER_MOE_XCD_GX=1 (gx-first): split the N / n_tile axis (gx) across XCDs ->
+#     grid=(NUM_XCD, gy, ceil(gx/NUM_XCD)). Each XCD owns an n_tile slice and sweeps
+#     all M blocks per n_tile => expert-weight (B) stays L2-resident.
+# In gx-first the rounding overruns the N (by) axis instead of the M (bx) axis, so
+# the out-of-range guard is on by < n_tiles (folded into blk_valid) and bx is always
+# in range.
+MOE_XCD_REMAP_GX = os.environ.get("AITER_MOE_XCD_GX", "0") not in ("0", "false", "False")
+MOE_NUM_XCD = int(os.environ.get("AITER_MOE_NUM_XCD", "8"))
+# Split-K dispatch axis (experiment): where the k_batch factor is folded into the
+# launch grid (only the gy-first remap branch honors this; other modes use "z").
+#   "z" (default): grid=(NUM_XCD, gx, ceil(gy/NUM_XCD)*k_batch); blockIdx.z encodes
+#       group*k_batch+kz. The kz partials of one output tile dispatch ~8*gx apart
+#       (separate rounds) -> the shared atomic output tile is evicted from L2
+#       between partial writes.
+#   "y": grid=(NUM_XCD, gx*k_batch, ceil(gy/NUM_XCD)); blockIdx.y encodes
+#       n_tile*k_batch+kz so a tile's kz partials are adjacent in dispatch order
+#       -> the atomic output tile stays L2-resident across its accumulation.
+MOE_SPLITK_AXIS = os.environ.get("AITER_MOE_SPLITK_AXIS", "z")
+# Debug probe: when set, each workgroup's leader thread prints the
+# (block.x, block.y, block.z) -> (expert_block bx, n_tile by, hw XCD id) mapping
+# via gpu.printf so the real-kernel (x,y,z)<->XCD correspondence can be inspected.
+MOE_XCD_DEBUG = os.environ.get("AITER_MOE_XCD_DEBUG", "0") not in ("0", "false", "False")
+# Stage2 depth-D B(weight) prefetch pool (env AITER_MOE_S2_BPOOL_DEPTH=N): keep a
+# ring of N in-flight weight tiles. Prologue front-loads N load_b results; each
+# consume pops the pool head and issues the tail's next load_b (N tiles ahead), so
+# N weight loads stay in flight (emitted early in program order -> in flight across
+# the VMEM-non-draining LDS barriers -> higher MLP). Usually passed per-compile via
+# the b_pool_depth kwarg (tuner); the env is a manual override. Default off.
+try:
+    MOE_S2_BPOOL_DEPTH = int(os.environ.get("AITER_MOE_S2_BPOOL_DEPTH", "0") or "0")
+except ValueError:
+    MOE_S2_BPOOL_DEPTH = 0
+# Stage1 depth-D B(weight) prefetch pool (env AITER_MOE_S1_BPOOL_DEPTH=N): same
+# ring-pool as stage2, but on the gate(+up) weight tiles. Front-loads N (gate,up)
+# tile-pairs so ~N weight loads stay in flight, matching the hand-tuned ASM's deep
+# prefetch prologue. Usually passed per-compile via the b_pool_depth kwarg (tuner).
+try:
+    MOE_S1_BPOOL_DEPTH = int(os.environ.get("AITER_MOE_S1_BPOOL_DEPTH", "0") or "0")
+except ValueError:
+    MOE_S1_BPOOL_DEPTH = 0
+# Stage1 depth-D X(activation) HBM prefetch pool (env AITER_MOE_S1_XPOOL_DEPTH=N):
+# same ring as stage2 -- front-load N X-tile HBM->reg loads; ds_write to LDS stays
+# 1-ahead (2-buffer ping-pong unchanged). Usually passed via the x_pool_depth kwarg.
+try:
+    MOE_S1_XPOOL_DEPTH = int(os.environ.get("AITER_MOE_S1_XPOOL_DEPTH", "0") or "0")
+except ValueError:
+    MOE_S1_XPOOL_DEPTH = 0
+# Stage2 depth-D X(activation) HBM prefetch pool (env AITER_MOE_S2_XPOOL_DEPTH=N):
+# front-load N X-tile HBM->reg loads into a ring; ds_write to LDS stays 1-ahead
+# (2-buffer ping-pong unchanged). Only the HBM load is deepened. X is the larger
+# load cost at long token (weights are L2-cached there), so this targets long token.
+try:
+    MOE_S2_XPOOL_DEPTH = int(os.environ.get("AITER_MOE_S2_XPOOL_DEPTH", "0") or "0")
+except ValueError:
+    MOE_S2_XPOOL_DEPTH = 0
+# Stage2 output bypass-L2 experiment. Stage2 has two output paths -- in-kernel
+# atomic accumulation (accumulate=True) and per-(token,slot) store + a separate
+# reduction kernel (accumulate=False). The final MoE output has no intra-XCD
+# reuse under XCD remap (a token's topk partials land on different XCDs), so
+# caching it mostly pollutes L2. When AITER_MOE_OUT_NT is set, mark both output
+# paths non-temporal so they stream past L2 instead of allocating lines.
+#   _OUT_ATOMIC_AUX : raw buffer-atomic cachepolicy bits. Use SLC=2 only (stream /
+#     no-L2-allocate). Do NOT set GLC for the no-return fadd -- GLC flips it to the
+#     return-value variant and faults (hipErrorIllegalAddress).
+#   _OUT_STORE_CM   : buffer_ops cache_modifier (0 = normal, 2 = non-temporal)
+MOE_OUT_NT = os.environ.get("AITER_MOE_OUT_NT", "0") not in ("0", "false", "False")
+_OUT_ATOMIC_AUX = 2 if MOE_OUT_NT else 0
+_OUT_STORE_CM = 2 if MOE_OUT_NT else 0
+# Input-activation (token) bypass-L2 experiment. When AITER_MOE_X_NT is set, the
+# X (stage1) / a2 (stage2) activation loads are marked non-temporal so they stream
+# past L2. Diagnostic: if remap's L2 gain comes from activation reuse, bypassing X
+# should collapse the L2 hit rate.
+#   _X_CM     : buffer_ops cache_modifier (0 = normal, 2 = non-temporal)
+#   _X_DMA_AUX: raw_ptr_buffer_load_lds aux (SLC=2) for the async-copy path
+MOE_X_NT = os.environ.get("AITER_MOE_X_NT", "0") not in ("0", "false", "False")
+_X_CM = 2 if MOE_X_NT else 0
+_X_DMA_AUX = 2 if MOE_X_NT else 0
+# Weight (B) cache-policy override. The per-kernel `b_nt` is parsed from the tuned
+# kernel name (b_nt=2 => weights non-temporal/bypass-L2, the default for most
+# configs; only `_bnt0` names use b_nt=0 => weights cached). Set AITER_MOE_B_NT to
+# force a single value across ALL flydsl moe kernels (e.g. 0 = force weights into
+# L2) for clean L2 diagnosis. Empty = keep each kernel's own b_nt.
+_MOE_B_NT_OVERRIDE = os.environ.get("AITER_MOE_B_NT", "")
+# Scale + index/metadata bypass-L2 experiment. The quant scales (scale_x per token,
+# scale_w per expert) and the routing metadata (sorted_token_ids / expert_ids /
+# sorted_weights / max_token_id) are small but very hot -- they stay in L2 and
+# nearly always hit, so they dominate the residual L2 hit rate even when X/B/OUT
+# are all bypassed. When AITER_MOE_SCALE_NT is set, mark these loads non-temporal
+# too, to confirm they are the source of the leftover hits.
+#   _SCALE_CM: buffer_ops cache_modifier (0 = normal, 2 = non-temporal)
+MOE_SCALE_NT = os.environ.get("AITER_MOE_SCALE_NT", "0") not in ("0", "false", "False")
+_SCALE_CM = 2 if MOE_SCALE_NT else 0
+
+
+def _eff_b_nt(b_nt):
+    """Effective weight cache_modifier: env override wins when set."""
+    return int(_MOE_B_NT_OVERRIDE) if _MOE_B_NT_OVERRIDE != "" else b_nt
+
+
+# Canonical default knobs (the env-derived module globals above are the defaults).
+# The dispatch/remap/cache knobs used to be process-wide env globals; they are now
+# per-compile tuning parameters. compile_moe_gemm{1,2} resolve them into LOCALS that
+# shadow the module globals of the same name, so every reference inside the kernel
+# builders (closures) automatically picks up the per-call value.
+def _resolve_moe_knobs(remap, splitk_axis, x_nt, scale_nt, out_nt):
+    """Resolve per-compile dispatch/cache knobs.
+
+    Each arg is None => fall back to the env-derived module default.
+      remap       : "gy" | "gx" | "off"  (XCD remap axis; gy is the canonical default)
+      splitk_axis : "z"  | "y"           (split-K grid fold axis)
+      x_nt        : 0 | 2                 (input-activation load cache_modifier)
+      scale_nt    : 0 | 2                 (scale + routing-metadata cache_modifier)
+      out_nt      : 0 | 2                 (output atomic/store cache_modifier)
+    Returns: (xcd_remap, xcd_remap_gx, splitk_axis,
+              x_cm, x_dma_aux, scale_cm, out_atomic_aux, out_store_cm)
+    """
+    if remap is None:
+        rmp, rgx = MOE_XCD_REMAP, MOE_XCD_REMAP_GX
+    elif remap == "gy":
+        rmp, rgx = True, False
+    elif remap == "gx":
+        rmp, rgx = True, True
+    elif remap == "off":
+        rmp, rgx = False, False
+    else:
+        raise ValueError(f"remap must be 'gy'|'gx'|'off'|None, got {remap!r}")
+    axis = MOE_SPLITK_AXIS if splitk_axis is None else splitk_axis
+    if axis not in ("z", "y"):
+        raise ValueError(f"splitk_axis must be 'z'|'y'|None, got {splitk_axis!r}")
+    x_cm = _X_CM if x_nt is None else (2 if x_nt else 0)
+    x_aux = _X_DMA_AUX if x_nt is None else (2 if x_nt else 0)
+    sc_cm = _SCALE_CM if scale_nt is None else (2 if scale_nt else 0)
+    o_aux = _OUT_ATOMIC_AUX if out_nt is None else (2 if out_nt else 0)
+    o_cm = _OUT_STORE_CM if out_nt is None else (2 if out_nt else 0)
+    return rmp, rgx, axis, x_cm, x_aux, sc_cm, o_aux, o_cm
+
+
+def _moe_knob_tags(xcd_remap, xcd_remap_gx, x_cm, scale_cm, out_aux):
+    """Kernel-name suffix for the resolved knobs. Canonical defaults (remap=gy and
+    all caches normal) produce an EMPTY tag so existing tuned-kernel names and their
+    cached artifacts are byte-identical."""
+    if not xcd_remap:
+        remap_tag = "_roff"
+    elif xcd_remap_gx:
+        remap_tag = "_rgx"
+    else:
+        remap_tag = ""  # gy (canonical default)
+    return (
+        remap_tag
+        + ("_xnt" if x_cm else "")
+        + ("_snt" if scale_cm else "")
+        + ("_ont" if out_aux else "")
+    )
 
 
 def _barrier(vmcnt=63, lgkmcnt=63):
@@ -109,6 +287,49 @@ def _s_nop(count=1):
     )
 
 
+def _get_xcc_id():
+    """Read the hardware XCC/XCD id via inline asm (HW_REG_XCC_ID==20, field [3:0]).
+
+    Mirrors get_xcc_id() in xcd_chunk_probe3d.hip:
+        s_getreg_b32 %0, hwreg(20, 0, 4)
+    Returns an i32 holding the XCD index of the executing workgroup.
+    """
+    return llvm.InlineAsmOp(
+        T.i32,
+        [],
+        "s_getreg_b32 $0, hwreg(20, 0, 4)",
+        "=s",
+        has_side_effects=True,
+    ).result
+
+
+def _xcd_debug_print(stage, bx, by):
+    """Leader-thread gpu.printf of (block.x,y,z) -> (bx, by, hw XCD).
+
+    No-op unless AITER_MOE_XCD_DEBUG is set. `bx` is the expert-block id and
+    `by` the n-tile id as computed by the kernel (remap or default layout), so
+    the printout shows the real launch->XCD correspondence on hardware.
+    """
+    if not MOE_XCD_DEBUG:
+        return
+    tx = gpu.thread_id("x")
+    is_leader = arith.cmpi(arith.CmpIPredicate.eq, tx, fx.Index(0))
+    _dbg_if = scf.IfOp(is_leader)
+    with _if_then(_dbg_if):
+        raw = arith._to_raw
+        bidx = arith.index_cast(T.i32, gpu.block_id("x"))
+        bidy = arith.index_cast(T.i32, gpu.block_id("y"))
+        bidz = arith.index_cast(T.i32, gpu.block_id("z"))
+        bx_i = arith.index_cast(T.i32, bx)
+        by_i = arith.index_cast(T.i32, by)
+        xcd = _get_xcc_id()
+        # flydsl gpu.printf is variadic: printf(format, v0, v1, ...) -- spread args.
+        _gpu_mlir.printf(
+            f"XCDDBG s{stage} blk=(%d,%d,%d) bx=%d by=%d -> xcd=%d\n",
+            raw(bidx), raw(bidy), raw(bidz), raw(bx_i), raw(by_i), raw(xcd),
+        )
+
+
 def _mfma_i32_16x16x64_i8(a_v4i32, b_v4i32, acc_v4i32):
     """v_mfma_i32_16x16x64_i8 via inline asm (gfx950 only).
 
@@ -156,6 +377,31 @@ def _if_else(if_op):
                 scf.YieldOp([])
 
 
+def _persist_anti_licm_tx(tx, mi):
+    """Defeat LICM register bloat inside the persist_m loop.
+
+    Without this, every tid-derived LDS address is loop-invariant, so LLVM
+    hoists the whole address book above the persist loop and pins ~19 VGPRs live
+    across the loop body (occupancy loss, e.g. stage2 VGPR 124->162). We fold an
+    induction-variable-dependent opaque zero into the thread id: ``opaque(mi)``
+    is an inline-asm identity the optimizer cannot see through, so
+    ``opaque(mi) - mi`` is provably 0 at runtime (results unchanged) yet appears
+    loop-variant to the compiler. The address chain is then recomputed (and
+    recycled) each iteration instead of being held live. Returns the perturbed
+    ``tx``; call once right after entering the persist loop body.
+    """
+    mi_i32 = arith.index_cast(T.i32, mi)
+    opaque_iv = llvm.InlineAsmOp(
+        res=ir.IntegerType.get_signless(32),
+        operands_=[mi_i32],
+        asm_string="",
+        constraints="=v,0",
+        has_side_effects=False,
+        is_align_stack=False,
+    ).result
+    return tx + arith.index_cast(T.index, arith.subi(opaque_iv, mi_i32))
+
+
 @functools.lru_cache(maxsize=1024)
 def compile_moe_gemm1(
     *,
@@ -177,8 +423,23 @@ def compile_moe_gemm1(
     use_async_copy: bool = False,
     waves_per_eu: int = 3,
     b_nt: int = 2,
+    k_batch: int = 1,
+    persist_m: int = 1,
+    remap: str | None = None,
+    splitk_axis: str | None = None,
+    x_nt: int | None = None,
+    scale_nt: int | None = None,
+    out_nt: int | None = None,
+    b_pool_depth: int = 0,
+    x_pool_depth: int = 0,
+    mfma_variant: str | None = None,
 ):
     """Compile stage1 kernel (`moe_gemm1`) and return the compiled executable.
+
+    mfma_variant selects the fp8 MFMA ISA (tunable; must be valid for tile_k):
+      - None / "16x16x128" : mfma_scale_f32_16x16x128_f8f6f4 (needs tile_k%128==0),
+                             else falls back to 16x16x32.
+      - "16x16x32"         : force mfma_f32_16x16x32_fp8_fp8 (needs tile_k%32==0).
 
     in_dtype:
       - "fp8": X/W are fp8
@@ -200,7 +461,31 @@ def compile_moe_gemm1(
     b_nt:
       Non-temporal cache modifier for B (weight) buffer loads.
       0 = normal caching, 2 = non-temporal (GLC+SLC).
+
+    remap / splitk_axis / x_nt / scale_nt / out_nt:
+      Per-compile dispatch & cache-policy knobs (None => env default). They shadow
+      the module globals of the same name so the kernel builder picks up per-call
+      values; see _resolve_moe_knobs / _moe_knob_tags.
     """
+    b_nt = _eff_b_nt(b_nt)
+    # Resolve dispatch/cache knobs into LOCALS that shadow the module globals; all
+    # references inside the nested moe_gemm1 builder resolve to these.
+    (
+        MOE_XCD_REMAP,
+        MOE_XCD_REMAP_GX,
+        MOE_SPLITK_AXIS,
+        _X_CM,
+        _X_DMA_AUX,
+        _SCALE_CM,
+        _OUT_ATOMIC_AUX,
+        _OUT_STORE_CM,
+    ) = _resolve_moe_knobs(remap, splitk_axis, x_nt, scale_nt, out_nt)
+    # persist_m (workgroup merge along M) is the inverse of split-K; mutually exclusive.
+    persist_m = int(persist_m)
+    if persist_m > 1 and k_batch > 1:
+        raise ValueError(
+            f"persist_m={persist_m} and k_batch={k_batch} are mutually exclusive"
+        )
 
     gpu_arch = get_hip_arch()
     allocator = SmemAllocator(None, arch=gpu_arch)
@@ -246,11 +531,60 @@ def compile_moe_gemm1(
     # "int8smooth" still uses int8 MFMA, but X/scale_x are provided per (token,slot).
     is_int8 = is_int8 or x_is_token_slot
 
+    # ── Split-K (partition the GEMM K=model_dim across `k_batch` workgroups) ──
+    # When k_batch>1 each CTA computes a K-slice [kz*K_per_batch, (kz+1)*K_per_batch)
+    # and the silu/mul activation is deferred to a post-kernel reduction step
+    # (see moe_kernels.py: tmp_out -> silu_and_mul). The kernel therefore writes
+    # *raw* gate/up partials into a 2*inter_dim buffer via atomic-add.
+    # k_batch==1 keeps the original (activation-fused, direct-store) path untouched.
+    _is_splitk1 = int(k_batch) > 1
+    if _is_splitk1:
+        if int(model_dim) % int(k_batch) != 0:
+            raise ValueError(
+                f"split-K: model_dim={model_dim} not divisible by k_batch={k_batch}"
+            )
+        _k_per_batch1 = int(model_dim) // int(k_batch)
+        if _k_per_batch1 % int(tile_k) != 0:
+            raise ValueError(
+                f"split-K: K_per_batch={_k_per_batch1} not divisible by tile_k={tile_k}"
+            )
+        if (_k_per_batch1 // int(tile_k)) < 2:
+            raise ValueError(
+                "split-K: K_per_batch must be >= 2*tile_k (pipeline needs >=2 tail tiles)"
+            )
+        # The stage1 main loop is a ping-pong pipeline that processes tiles in
+        # pairs and then a fixed 2-tile tail (pair_iters = (total_tiles-2)//2).
+        # That requires an EVEN number of K-tiles per slice; an odd count drops
+        # the unpaired middle tile (silently wrong output). Split-K shrinks the
+        # per-slice K, so reject k_batch values that make it odd.
+        if (_k_per_batch1 // int(tile_k)) % 2 != 0:
+            raise ValueError(
+                f"split-K: K_per_batch/tile_k={_k_per_batch1 // int(tile_k)} must be "
+                f"even (model_dim={model_dim}, k_batch={k_batch}, tile_k={tile_k}); "
+                "the stage1 ping-pong loop has a fixed 2-tile tail."
+            )
+    else:
+        _k_per_batch1 = int(model_dim)
+    # Encode the split-K dispatch axis in the kernel tag so the y-axis variant does
+    # not collide with the z-axis artifact in the (name-keyed) flydsl/disk cache.
+    _sk_axis_tag1 = (
+        "y"
+        if (_is_splitk1 and MOE_SPLITK_AXIS == "y" and MOE_XCD_REMAP and not MOE_XCD_REMAP_GX)
+        else ""
+    )
+    _sk_tag1 = f"_sk{k_batch}{_sk_axis_tag1}" if _is_splitk1 else ""
+
     _is_gfx950 = str(gpu_arch).startswith("gfx950")
     _use_k64_mfma = _is_gfx950 and is_int8
+    # mfma_variant tuning knob (same as stage2): force 16x16x32 when requested,
+    # else auto (wide 16x16x128 scale MFMA whenever tile_k allows).
+    if mfma_variant in ("32x32x16", "mfma32k16"):
+        raise ValueError(f"mfma_variant={mfma_variant!r} (32x32x16) not wired in compile_moe_gemm1")
+    _force_16x16x32 = mfma_variant in ("16x16x32", "mfma16k32")
     _use_k128_mfma_fp8 = (
         _is_gfx950 and not is_int8 and not is_f16_or_bf16
         and (tile_k_bytes % 128) == 0
+        and not _force_16x16x32
     )
 
     mfma_i32_k32 = None
@@ -337,9 +671,14 @@ def compile_moe_gemm1(
     _use_wptr64 = _w_nbytes_static >= (1 << 31)
     _wptr64_tag = "_wptr64" if _use_wptr64 else ""
 
+    _knob_tag = _moe_knob_tags(
+        MOE_XCD_REMAP, MOE_XCD_REMAP_GX, _X_CM, _SCALE_CM, _OUT_ATOMIC_AUX
+    )
+    _pm_tag = f"_pm{persist_m}" if persist_m != 1 else ""
+    _mfma_tag = f"_mi{mfma_variant}" if mfma_variant else ""
     module_name = (
         f"mfma_moe1_{g1u_tag}_{in_dtype}_{out_dtype}_{epilog_tag}"
-        f"_t{tile_m}x{tile_n}x{tile_k}{_async_tag}{_wpe_tag}{_bnt_tag}{_wptr64_tag}"
+        f"_t{tile_m}x{tile_n}x{tile_k}{_async_tag}{_wpe_tag}{_bnt_tag}{_wptr64_tag}{_sk_tag1}{_knob_tag}{_pm_tag}{_mfma_tag}"
         f"_abi6_wptr64gate"  # ABI bumped: optional 64-bit W load path gated by static size check
     ).replace("-", "_")
 
@@ -504,25 +843,151 @@ def compile_moe_gemm1(
             layout_lds = fx.make_layout(shape_lds, stride_lds)
 
             tx = gpu.thread_id("x")
+            # Split-K dispatch axis (see MOE_SPLITK_AXIS). "y" only applies to the
+            # gy-first remap branch; kz/k_start are then derived from blockIdx.y
+            # inside that branch. Otherwise blockIdx.z encodes group*k_batch+kz.
+            _sk_axis_y1 = (
+                _is_splitk1
+                and MOE_SPLITK_AXIS == "y"
+                and MOE_XCD_REMAP
+                and not MOE_XCD_REMAP_GX
+            )
+            if _is_splitk1 and not _sk_axis_y1:
+                _bidz_sk = gpu.block_id("z")
+                kz_sk = _bidz_sk % fx.Index(k_batch)
+                _sk_group_z = _bidz_sk // fx.Index(k_batch)
+                k_start = kz_sk * fx.Index(_k_per_batch1)
+            else:
+                _sk_group_z = None
+                k_start = None
+            # persist_m loop: each WG serially sweeps persist_m M-blocks (inverse of
+            # split-K). persist follows M (see launch grid): remap=gy folds into the
+            # group (z) index, remap=gx / no-remap into the M index (block_id.y).
+            _persist1 = persist_m > 1
+            if _persist1:
+                _c_pm1 = arith.constant(persist_m, index=True)
+                _for_persist1 = scf.ForOp(
+                    arith.constant(0, index=True),
+                    _c_pm1,
+                    arith.constant(1, index=True),
+                )
+                _for_ip1 = ir.InsertionPoint(_for_persist1.body)
+                _for_ip1.__enter__()
+                _mi1 = _for_persist1.induction_variable
+                # Anti-LICM: keep tid-derived LDS addresses loop-variant so they
+                # are recomputed (not hoisted + pinned) each persist iteration.
+                tx = _persist_anti_licm_tx(tx, _mi1)
+
+            def _pm_fold1(v):
+                return (v * _c_pm1 + _mi1) if _persist1 else v
+
             # Align with Aiter launch mapping (NSwizzle==false):
             # - blockIdx.x -> N dimension (tile along inter_dim)
             # - blockIdx.y -> expert-block id / M dimension (tile along sorted M)
-            by = gpu.block_id("x")  # tile along inter_dim
-            bx = gpu.block_id("y")  # tile along sorted M
-
-            # Block validity: compute as early as possible so invalid blocks skip all buffer-resource
-            # setup, LDS pointer math, and gmem prefetch work.
-            bx_m = bx * fx.Index(tile_m)
-            maxids_rsrc = buffer_ops.create_buffer_resource(
-                arg_max_token_ids,
-                max_size=False,
-                num_records_bytes=fx.Index(4),
-            )
-            max_token_id_i32 = buffer_ops.buffer_load(
-                maxids_rsrc, fx.Index(0), vec_width=1, dtype=T.i32
-            )
-            bx_m_i32 = arith.index_cast(T.i32, bx_m)
-            blk_valid = arith.cmpi(arith.CmpIPredicate.ult, bx_m_i32, max_token_id_i32)
+            if MOE_XCD_REMAP and MOE_XCD_REMAP_GX:
+                # gx-first: grid=(NUM_XCD, gy, ceil(gx/NUM_XCD)). N (n_tile) is split
+                # across XCDs; bx (sorted M) walks the full gy on block_id.y so it is
+                # always in range. The rounding now overruns by (n_tile), so guard
+                # by < n_tiles and fold it into blk_valid.
+                _xcd = gpu.block_id("x")  # 0..NUM_XCD-1 (one per XCD, chunk=1)
+                bx = _pm_fold1(gpu.block_id("y"))  # tile along sorted M (full range)
+                _bz = _sk_group_z if _is_splitk1 else gpu.block_id("z")  # n_tile group
+                by = _bz * fx.Index(MOE_NUM_XCD) + _xcd  # tile along inter_dim (n-tile)
+                bx_m = bx * fx.Index(tile_m)
+                bx_m_i32 = arith.index_cast(T.i32, bx_m)
+                # n_tiles must match the launcher's gx = inter_in // tile_n.
+                n_tiles_i32 = arith.index_cast(T.i32, inter_in // fx.Index(tile_n))
+                by_in_range = arith.cmpi(
+                    arith.CmpIPredicate.ult, arith.index_cast(T.i32, by), n_tiles_i32
+                )
+                # Only in-range (by) blocks load max_token_id and run the token check;
+                # padding blocks (by >= n_tiles) skip the load and yield invalid directly.
+                _rng_if = scf.IfOp(by_in_range, [ir.IntegerType.get_signless(1)], has_else=True)
+                with _if_then(_rng_if):
+                    maxids_rsrc = buffer_ops.create_buffer_resource(
+                        arg_max_token_ids,
+                        max_size=False,
+                        num_records_bytes=fx.Index(4),
+                    )
+                    max_token_id_i32 = buffer_ops.buffer_load(
+                        maxids_rsrc, fx.Index(0), vec_width=1, dtype=T.i32
+                    )
+                    tok_ok = arith.cmpi(
+                        arith.CmpIPredicate.ult, bx_m_i32, max_token_id_i32
+                    )
+                    scf.YieldOp([tok_ok])
+                with _if_else(_rng_if):
+                    scf.YieldOp([arith.constant(0, type=ir.IntegerType.get_signless(1))])
+                blk_valid = _rng_if.results[0]
+            elif MOE_XCD_REMAP:
+                # grid=(NUM_XCD, gx, ceil(gy/NUM_XCD)); see MOE_XCD_REMAP note.
+                _xcd = gpu.block_id("x")  # 0..NUM_XCD-1 (one per XCD, chunk=1)
+                if _sk_axis_y1:
+                    # Split-K on the -2 axis: blockIdx.y = n_tile*k_batch + kz, so a
+                    # tile's kz partials are adjacent in dispatch order. blockIdx.z is
+                    # the pure expert-block group.
+                    _bycomb = gpu.block_id("y")
+                    by = _bycomb // fx.Index(k_batch)  # tile along inter_dim (n-tile)
+                    kz_sk = _bycomb % fx.Index(k_batch)
+                    k_start = kz_sk * fx.Index(_k_per_batch1)
+                    _bz = gpu.block_id("z")  # expert-block group
+                else:
+                    by = gpu.block_id("y")  # tile along inter_dim (n-tile)
+                    _bz = (
+                        _sk_group_z
+                        if _is_splitk1
+                        else _pm_fold1(gpu.block_id("z"))
+                    )  # expert-block group (persist folds into the group dim)
+                bx = _bz * fx.Index(MOE_NUM_XCD) + _xcd  # tile along sorted M
+                # The XCD remap rounds the grid up, so bx can run past the real
+                # number of expert blocks (size_expert_ids). Flag those pure-padding
+                # blocks here and fold into blk_valid below so they exit via the
+                # whole-kernel gate (no OOB, no wasted buffer/gmem work).
+                bx_in_range = arith.cmpi(
+                    arith.CmpIPredicate.ult,
+                    arith.index_cast(T.i32, bx),
+                    i32_size_expert_ids_in,
+                )
+                # Keep bx_m / bx_m_i32 in the enclosing scope so the gated body below can
+                # use bx_m (sorted_row, _tid_row, etc.) -- they must dominate that region.
+                bx_m = bx * fx.Index(tile_m)
+                bx_m_i32 = arith.index_cast(T.i32, bx_m)
+                # Only in-range blocks load max_token_id and run the token check; padding
+                # blocks (bx >= size_expert_ids) skip the load and yield invalid directly.
+                _rng_if = scf.IfOp(bx_in_range, [ir.IntegerType.get_signless(1)], has_else=True)
+                with _if_then(_rng_if):
+                    maxids_rsrc = buffer_ops.create_buffer_resource(
+                        arg_max_token_ids,
+                        max_size=False,
+                        num_records_bytes=fx.Index(4),
+                    )
+                    max_token_id_i32 = buffer_ops.buffer_load(
+                        maxids_rsrc, fx.Index(0), vec_width=1, dtype=T.i32
+                    )
+                    tok_ok = arith.cmpi(
+                        arith.CmpIPredicate.ult, bx_m_i32, max_token_id_i32
+                    )
+                    scf.YieldOp([tok_ok])
+                with _if_else(_rng_if):
+                    scf.YieldOp([arith.constant(0, type=ir.IntegerType.get_signless(1))])
+                blk_valid = _rng_if.results[0]
+            else:
+                by = gpu.block_id("x")  # tile along inter_dim
+                bx = _pm_fold1(gpu.block_id("y"))  # tile along sorted M
+                # Block validity: compute as early as possible so invalid blocks skip all buffer-resource
+                # setup, LDS pointer math, and gmem prefetch work.
+                bx_m = bx * fx.Index(tile_m)
+                maxids_rsrc = buffer_ops.create_buffer_resource(
+                    arg_max_token_ids,
+                    max_size=False,
+                    num_records_bytes=fx.Index(4),
+                )
+                max_token_id_i32 = buffer_ops.buffer_load(
+                    maxids_rsrc, fx.Index(0), vec_width=1, dtype=T.i32
+                )
+                bx_m_i32 = arith.index_cast(T.i32, bx_m)
+                blk_valid = arith.cmpi(arith.CmpIPredicate.ult, bx_m_i32, max_token_id_i32)
+            _xcd_debug_print(1, bx, by)
             # Common constants/atoms (hoisted): keep IR small like GEMM.
             # XOR16 swizzle parameter (in bytes; constant, power-of-two in our configs).
             k_blocks16 = arith.index(tile_k_bytes // 16)
@@ -600,8 +1065,16 @@ def compile_moe_gemm1(
 
                 # OUT: [tokens, topk, inter] f16/bf16 -> bytes = tokens*topk*inter*out_elem_bytes
                 out_elem_bytes = 2  # f16/bf16
+                # Split-K (g1u1) writes 2*inter_dim raw gate/up partial columns, so the
+                # output buffer-resource must cover the wider stride or the up-partial
+                # atomics (cols >= inter_dim) would be dropped as OOB.
+                _out_cols_in = (
+                    (inter_in * fx.Index(2))
+                    if (_is_splitk1 and use_g1u1)
+                    else inter_in
+                )
                 out_nbytes_idx = (
-                    tokens_in * c_topk * inter_in * fx.Index(out_elem_bytes)
+                    tokens_in * c_topk * _out_cols_in * fx.Index(out_elem_bytes)
                 )
                 out_rsrc = buffer_ops.create_buffer_resource(
                     arg_out, max_size=False, num_records_bytes=out_nbytes_idx
@@ -744,14 +1217,17 @@ def compile_moe_gemm1(
                             rsrc=x_rsrc,
                             vec_elems=vec16_elems,
                             elem_bytes=elem_bytes,
+                            cache_modifier=_X_CM,
                         )
                     # For 8B/4B, load raw i32 dwords directly.
                     if x_load_bytes == 8:
                         return buffer_ops.buffer_load(
-                            x_rsrc, idx_i32, vec_width=2, dtype=T.i32
+                            x_rsrc, idx_i32, vec_width=2, dtype=T.i32,
+                            cache_modifier=_X_CM,
                         )
                     return buffer_ops.buffer_load(
-                        x_rsrc, idx_i32, vec_width=1, dtype=T.i32
+                        x_rsrc, idx_i32, vec_width=1, dtype=T.i32,
+                        cache_modifier=_X_CM,
                     )
 
                 def load_x_tile(base_k):
@@ -1079,7 +1555,7 @@ def compile_moe_gemm1(
                                 global_offset,
                                 arith.constant(0, type=T.i32),
                                 arith.constant(0, type=T.i32),
-                                arith.constant(0, type=T.i32),
+                                arith.constant(_X_DMA_AUX, type=T.i32),
                             )
 
                     def prefetch_x_to_lds(base_k, lds_base):
@@ -1149,7 +1625,7 @@ def compile_moe_gemm1(
                                 fx.Float32(1.0)
                                 if not needs_scale_w
                                 else buffer_ops.buffer_load(
-                                    sw_rsrc, row_gate_idx, vec_width=1, dtype=T.f32
+                                    sw_rsrc, row_gate_idx, vec_width=1, dtype=T.f32, cache_modifier=_SCALE_CM
                                 )
                             )
                             if use_g1u1:
@@ -1158,7 +1634,7 @@ def compile_moe_gemm1(
                                     fx.Float32(1.0)
                                     if not needs_scale_w
                                     else buffer_ops.buffer_load(
-                                        sw_rsrc, row_up_idx, vec_width=1, dtype=T.f32
+                                        sw_rsrc, row_up_idx, vec_width=1, dtype=T.f32, cache_modifier=_SCALE_CM
                                     )
                                 )
                         epilogue_pf = (sw_gate_pf, sw_up_pf)
@@ -1370,7 +1846,8 @@ def compile_moe_gemm1(
                     vector.store(_tid_vec1, lds_tid, [tx])
 
                 # Prologue: prefetch tile0, store to LDS(cur), sync.
-                k0 = fx.Index(0)
+                # Split-K: start at this CTA's K-slice base (k_start); == 0 otherwise.
+                k0 = k_start if _is_splitk1 else fx.Index(0)
                 if use_async_copy:
                     prefetch_x_to_lds(k0, lds_base_cur)
                     b_gate_cur = load_b_tile(k0, n_blk_gate, n_intra_gate)
@@ -1406,25 +1883,85 @@ def compile_moe_gemm1(
                 # Keep this as constexpr expansion to avoid SCF child-region dominance issues
                 # when carrying MFMA accumulators/prefetch values into the tail section.
                 c2_tile_k = arith.index(tile_k * 2)
-                total_tiles = int(model_dim) // int(tile_k)
+                # Split-K: each CTA sweeps only its K-slice [k_start, k_start+K_per_batch).
+                total_tiles = int(_k_per_batch1) // int(tile_k)
                 pair_iters = max((total_tiles - 2) // 2, 0)
+                # End of this CTA's K-slice (== k_in when not split-K, so IR is identical).
+                _k_slice_end = (
+                    (k_start + fx.Index(_k_per_batch1)) if _is_splitk1 else k_in
+                )
+
+                # Deep B(weight)-prefetch pool (opt-in via b_pool_depth): front-load N
+                # (gate,up) tile-pairs so ~N weight loads stay in flight (match hand-tuned
+                # ASM's deep-prefetch prologue). Gated by _use_pool1 so the default
+                # (no-pool) path below is byte-identical.
+                _bp_depth1 = b_pool_depth if b_pool_depth else MOE_S1_BPOOL_DEPTH
+                _use_pool1 = (_bp_depth1 >= 2) and not use_async_copy
+
+                def _load_b_pair1(kk):
+                    return (
+                        load_b_tile(kk, n_blk_gate, n_intra_gate),
+                        load_b_tile(kk, n_blk_up, n_intra_up) if use_g1u1 else [],
+                    )
+
+                def _k_of1(t):
+                    _kk = arith.index(t * tile_k)
+                    return (k_start + _kk) if _is_splitk1 else _kk
+
+                _bpool1 = []
+                if _use_pool1:
+                    _pooln1 = min(_bp_depth1, total_tiles)
+                    _bpool1 = [(b_gate_cur, b_up_cur)] + [
+                        _load_b_pair1(_k_of1(t)) for t in range(1, _pooln1)
+                    ]
+                    if _pooln1 > 1:
+                        rocdl.sched_vmem(
+                            (_pooln1 - 1) * k_unroll * num_acc_n * 2 * (2 if use_g1u1 else 1)
+                        )
+
+                # X(activation) HBM prefetch pool: front-load tiles 1..depth into regs;
+                # ds_write to LDS stays 1-ahead (tile 0's X already stored in prologue).
+                _xp_depth1 = x_pool_depth if x_pool_depth else MOE_S1_XPOOL_DEPTH
+                _use_xpool1 = (_xp_depth1 >= 2) and not use_async_copy
+                _xpool1 = []
+                if _use_xpool1:
+                    _xpool1 = [
+                        load_x_tile(_k_of1(t))
+                        for t in range(1, min(_xp_depth1 + 1, total_tiles))
+                    ]
+                    if len(_xpool1) > 0:
+                        rocdl.sched_vmem(len(_xpool1) * num_x_loads)
 
                 for pair_i in range_constexpr(pair_iters):
                     k_iv = arith.index(pair_i * (tile_k * 2))
+                    if _is_splitk1:
+                        k_iv = k_start + k_iv
                     # ---- stage 0: prefetch+store ping, compute pong ----
                     next_k1 = k_iv + tile_k
                     if use_async_copy:
                         prefetch_x_to_lds(next_k1, lds_base_ping)
+                    elif _use_xpool1:
+                        x_regs_ping = _xpool1.pop(0)  # tile 2i+1
+                        _xtl0 = (2 * pair_i + 1) + _xp_depth1
+                        if _xtl0 < total_tiles:
+                            _xpool1.append(load_x_tile(_k_of1(_xtl0)))
                     else:
                         x_regs_ping = load_x_tile(next_k1)
-                    b_gate_ping = load_b_tile(next_k1, n_blk_gate, n_intra_gate)
-                    b_up_ping = load_b_tile(next_k1, n_blk_up, n_intra_up) if use_g1u1 else []
+                    if _use_pool1:
+                        _bg0, _bu0 = _bpool1.pop(0)
+                        _tl0 = 2 * pair_i + _bp_depth1
+                        if _tl0 < total_tiles:
+                            _bpool1.append(_load_b_pair1(_k_of1(_tl0)))
+                    else:
+                        b_gate_ping = load_b_tile(next_k1, n_blk_gate, n_intra_gate)
+                        b_up_ping = load_b_tile(next_k1, n_blk_up, n_intra_up) if use_g1u1 else []
+                        _bg0, _bu0 = b_gate_cur, b_up_cur
 
                     acc_gate, acc_up, _ = compute_tile(
                         acc_gate,
                         acc_up,
-                        b_gate_cur,
-                        b_up_cur,
+                        _bg0,
+                        _bu0,
                         lds_base_pong,
                         a0_prefetch=a0_prefetch_pong,
                         a1_prefetch=a1_prefetch_pong,
@@ -1453,16 +1990,28 @@ def compile_moe_gemm1(
                     next_k2 = k_iv + c2_tile_k
                     if use_async_copy:
                         prefetch_x_to_lds(next_k2, lds_base_pong)
+                    elif _use_xpool1:
+                        x_regs_pong = _xpool1.pop(0)  # tile 2i+2
+                        _xtl1 = (2 * pair_i + 2) + _xp_depth1
+                        if _xtl1 < total_tiles:
+                            _xpool1.append(load_x_tile(_k_of1(_xtl1)))
                     else:
                         x_regs_pong = load_x_tile(next_k2)
-                    b_gate_next = load_b_tile(next_k2, n_blk_gate, n_intra_gate)
-                    b_up_next = load_b_tile(next_k2, n_blk_up, n_intra_up) if use_g1u1 else []
+                    if _use_pool1:
+                        _bg1, _bu1 = _bpool1.pop(0)
+                        _tl1 = 2 * pair_i + 1 + _bp_depth1
+                        if _tl1 < total_tiles:
+                            _bpool1.append(_load_b_pair1(_k_of1(_tl1)))
+                    else:
+                        b_gate_next = load_b_tile(next_k2, n_blk_gate, n_intra_gate)
+                        b_up_next = load_b_tile(next_k2, n_blk_up, n_intra_up) if use_g1u1 else []
+                        _bg1, _bu1 = b_gate_ping, b_up_ping
 
                     acc_gate, acc_up, _ = compute_tile(
                         acc_gate,
                         acc_up,
-                        b_gate_ping,
-                        b_up_ping,
+                        _bg1,
+                        _bu1,
                         lds_base_ping,
                         a0_prefetch=a0_prefetch_ping,
                         a1_prefetch=a1_prefetch_ping,
@@ -1488,15 +2037,20 @@ def compile_moe_gemm1(
                     )
 
                     # Advance pong state to next_k2 for next iteration.
-                    b_gate_cur = b_gate_next
-                    b_up_cur = b_up_next
+                    if not _use_pool1:
+                        b_gate_cur = b_gate_next
+                        b_up_cur = b_up_next
 
-                # Tail: 2 remaining tiles at (k_in - 2*tile_k) and (k_in - tile_k).
+                # Tail: 2 remaining tiles at (k_end - 2*tile_k) and (k_end - tile_k),
+                # where k_end == k_in for the non-split-K path and the K-slice end otherwise.
                 # Rebuild prefetch in the current block: values produced inside the `range(...)`
                 # loop body may live in a child region and cannot be used here.
-                k_tail0 = k_in - c2_tile_k
-                b_gate_cur = load_b_tile(k_tail0, n_blk_gate, n_intra_gate)
-                b_up_cur = load_b_tile(k_tail0, n_blk_up, n_intra_up) if use_g1u1 else []
+                k_tail0 = _k_slice_end - c2_tile_k
+                if _use_pool1:
+                    b_gate_cur, b_up_cur = _bpool1.pop(0)  # tile total_tiles-2
+                else:
+                    b_gate_cur = load_b_tile(k_tail0, n_blk_gate, n_intra_gate)
+                    b_up_cur = load_b_tile(k_tail0, n_blk_up, n_intra_up) if use_g1u1 else []
                 a0_prefetch_pong = lds_load_packs_k64(
                     row_a_lds, col_offset_base_bytes, lds_base_pong
                 )
@@ -1505,13 +2059,18 @@ def compile_moe_gemm1(
                     if k_unroll >= 2
                     else None
                 )
-                k_tail1 = k_in - tile_k
+                k_tail1 = _k_slice_end - tile_k
                 if use_async_copy:
                     prefetch_x_to_lds(k_tail1, lds_base_ping)
+                elif _use_xpool1:
+                    x_regs_ping = _xpool1.pop(0)  # last tile's X (held in pool)
                 else:
                     x_regs_ping = load_x_tile(k_tail1)
-                b_gate_ping = load_b_tile(k_tail1, n_blk_gate, n_intra_gate)
-                b_up_ping = load_b_tile(k_tail1, n_blk_up, n_intra_up) if use_g1u1 else []
+                if _use_pool1:
+                    b_gate_ping, b_up_ping = _bpool1.pop(0)  # tile total_tiles-1 (last)
+                else:
+                    b_gate_ping = load_b_tile(k_tail1, n_blk_gate, n_intra_gate)
+                    b_up_ping = load_b_tile(k_tail1, n_blk_up, n_intra_up) if use_g1u1 else []
 
                 acc_gate, acc_up, _ = compute_tile(
                     acc_gate,
@@ -1574,7 +2133,7 @@ def compile_moe_gemm1(
                             fx.Float32(1.0)
                             if not needs_scale_w
                             else buffer_ops.buffer_load(
-                                sw_rsrc, row_gate_idx, vec_width=1, dtype=T.f32
+                                sw_rsrc, row_gate_idx, vec_width=1, dtype=T.f32, cache_modifier=_SCALE_CM
                             )
                         )
                         if use_g1u1:
@@ -1582,7 +2141,7 @@ def compile_moe_gemm1(
                                 fx.Float32(1.0)
                                 if not needs_scale_w
                                 else buffer_ops.buffer_load(
-                                    sw_rsrc, row_up_idx, vec_width=1, dtype=T.f32
+                                    sw_rsrc, row_up_idx, vec_width=1, dtype=T.f32, cache_modifier=_SCALE_CM
                                 )
                             )
                         else:
@@ -1594,6 +2153,159 @@ def compile_moe_gemm1(
                     col_i32_list.append(arith.index_cast(T.i32, col_g_list[ni]))
 
                 inter_i32_local = inter_i32_v
+
+                if _is_splitk1:
+                    # ---- Split-K epilogue: atomic-accumulate RAW gate/up partials ----
+                    # Each kz CTA owns a K-slice and contributes a partial sum. The
+                    # silu/mul activation (and routing weight) is deferred to the
+                    # post-kernel reduction (moe_kernels.py -> silu_and_mul), so here
+                    # we write the *pre-activation* gate/up values (scaled by sx/sw)
+                    # into a [tokens*topk, 2*inter_dim] buffer with atomic-add.
+                    # Two passes share the CShuffle LDS scratch (gate, then up),
+                    # each producing contiguous EVec=2 fragments for packed atomics.
+                    if lds_out is None:
+                        raise RuntimeError(
+                            "split-K stage1 requires the CShuffle LDS buffer (lds_out); "
+                            "do not disable use_cshuffle_epilog for k_batch>1."
+                        )
+                    _sk_out_cols = (2 * inter_dim) if use_g1u1 else inter_dim
+                    _sk_out_cols_i32 = fx.Int32(_sk_out_cols)
+                    _sk_evec = 2
+                    _sk_nlane = min(32, tile_n // _sk_evec)
+                    _sk_zero_i32 = fx.Int32(0)
+                    _sk_aux_i32 = fx.Int32(_OUT_ATOMIC_AUX)
+                    _sk_c2_i32 = fx.Int32(2)  # 2 bytes per f16/bf16 element
+                    _sk_mask_even = fx.Int32(0xFFFFFFFE)
+                    _sk_frag_ty = T.bf16 if out_dtype == "bf16" else T.f16
+                    _sk_state = {"acc": None, "sw": None, "noff": 0}
+
+                    def _sk_atomic_add_x2(val_x2, byte_off_i32):
+                        rocdl.raw_ptr_buffer_atomic_fadd(
+                            val_x2,
+                            out_rsrc,
+                            byte_off_i32,
+                            _sk_zero_i32,
+                            _sk_aux_i32,
+                        )
+
+                    def _sk_write_row(
+                        *,
+                        mi: int,
+                        ii: int,
+                        row_in_tile,
+                        row,
+                        row_base_lds,
+                        col_base_local,
+                        num_acc_n: int,
+                        lds_out,
+                    ):
+                        fused2 = memref.load(lds_tid, [row_in_tile])
+                        t2 = fused2 & mask24_i32
+                        s2 = fused2 >> 24
+                        t_valid = arith.cmpi(
+                            arith.CmpIPredicate.ult, t2, tokens_i32_v
+                        )
+                        if x_is_token_slot:
+                            ts2 = s2 * tokens_i32_v + t2
+                            sx = (
+                                fx.Float32(1.0)
+                                if is_f16_or_bf16
+                                else arith.select(
+                                    t_valid,
+                                    buffer_ops.buffer_load(
+                                        sx_rsrc, ts2, vec_width=1, dtype=T.f32, cache_modifier=_SCALE_CM
+                                    ),
+                                    fx.Float32(0.0),
+                                )
+                            )
+                        else:
+                            sx = (
+                                fx.Float32(1.0)
+                                if is_f16_or_bf16
+                                else arith.select(
+                                    t_valid,
+                                    buffer_ops.buffer_load(
+                                        sx_rsrc, t2, vec_width=1, dtype=T.f32, cache_modifier=_SCALE_CM
+                                    ),
+                                    fx.Float32(0.0),
+                                )
+                            )
+                        _acc = _sk_state["acc"]
+                        _sw = _sk_state["sw"]
+                        for ni in range_constexpr(num_acc_n):
+                            col_local = col_base_local + (ni * 16)
+                            sw = _sw[ni]
+                            acc_idx = mi * num_acc_n + ni
+                            v = vector.extract(
+                                _acc[acc_idx],
+                                static_position=[ii],
+                                dynamic_position=[],
+                            )
+                            if is_int8:
+                                v = arith.sitofp(T.f32, v)
+                            v = v * sx * sw
+                            v_out = arith.trunc_f(_out_elem_type(), v)
+                            lds_idx = row_base_lds + col_local
+                            v1 = vector.from_elements(_out_vec_type(), [v_out])
+                            vector.store(v1, lds_out, [lds_idx], alignment=2)
+
+                    def _sk_precompute_row(*, row_local, row):
+                        fused2 = memref.load(lds_tid, [row_local])
+                        t2 = fused2 & mask24_i32
+                        s2 = fused2 >> 24
+                        t_valid = arith.cmpi(
+                            arith.CmpIPredicate.ult, t2, tokens_i32_v
+                        )
+                        ts = t2 * topk_i32_v + s2
+                        row_base_elem = ts * _sk_out_cols_i32
+                        return (row_base_elem, t_valid)
+
+                    def _sk_store_pair(
+                        *, row_local, row, row_ctx, col_pair0, col_g0, frag
+                    ):
+                        row_base_elem = row_ctx
+                        col_i32 = arith.index_cast(T.i32, col_g0)
+                        idx_elem = row_base_elem + col_i32 + fx.Int32(_sk_state["noff"])
+                        idx_elem_even = idx_elem & _sk_mask_even
+                        byte_off = idx_elem_even * _sk_c2_i32
+                        _sk_atomic_add_x2(frag, byte_off)
+
+                    def _sk_run_pass(acc, sw_vals, noff):
+                        _sk_state["acc"] = acc
+                        _sk_state["sw"] = sw_vals
+                        _sk_state["noff"] = noff
+                        c_shuffle_epilog(
+                            arith=arith,
+                            vector=vector,
+                            gpu=gpu,
+                            scf=scf,
+                            range_constexpr=range_constexpr,
+                            tile_m=tile_m,
+                            tile_n=tile_n,
+                            e_vec=_sk_evec,
+                            cshuffle_nlane=_sk_nlane,
+                            block_size=total_threads,
+                            m_repeat=m_repeat,
+                            num_acc_n=num_acc_n,
+                            tx=tx,
+                            lane_div_16=lane_div_16,
+                            lane_mod_16=lane_mod_16,
+                            bx_m=bx_m,
+                            by_n=by_n,
+                            n_tile_base=n_tile_base,
+                            lds_out=lds_out,
+                            frag_elem_type=_sk_frag_ty,
+                            write_row_to_lds=_sk_write_row,
+                            precompute_row=_sk_precompute_row,
+                            store_pair=_sk_store_pair,
+                        )
+
+                    # Pass 1: gate partials -> columns [0, inter_dim)
+                    _sk_run_pass(acc_gate, sw_gate_vals, 0)
+                    # Pass 2: up partials -> columns [inter_dim, 2*inter_dim)
+                    if use_g1u1:
+                        _sk_run_pass(acc_up, sw_up_vals, inter_dim)
+                    return
 
                 # Uses EVec=4 (buffer store "x4" of fp16 elements).
                 use_cshuffle_epilog_flag = _use_cshuffle_epilog
@@ -1630,7 +2342,7 @@ def compile_moe_gemm1(
                                 else arith.select(
                                     t_valid,
                                     buffer_ops.buffer_load(
-                                        sx_rsrc, ts2, vec_width=1, dtype=T.f32
+                                        sx_rsrc, ts2, vec_width=1, dtype=T.f32, cache_modifier=_SCALE_CM
                                     ),
                                     fx.Float32(0.0),
                                 )
@@ -1642,7 +2354,7 @@ def compile_moe_gemm1(
                                 else arith.select(
                                     t_valid,
                                     buffer_ops.buffer_load(
-                                        sx_rsrc, t2, vec_width=1, dtype=T.f32
+                                        sx_rsrc, t2, vec_width=1, dtype=T.f32, cache_modifier=_SCALE_CM
                                     ),
                                     fx.Float32(0.0),
                                 )
@@ -1742,7 +2454,10 @@ def compile_moe_gemm1(
                         store_pair=store_pair,
                         frag_elem_type=_out_elem_type(),
                     )
-                    return
+                    # NOTE: no early `return` here. An early return would skip the
+                    # persist_m loop close (scf.YieldOp + InsertionPoint exit) emitted
+                    # at the end of the kernel body, leaving the scf.for region open.
+                    # The default-epilog path below is gated on use_cshuffle instead.
 
                 def _stage1_store_row(*, mi: int, ii: int, row_in_tile, row):
                     fused2 = memref.load(lds_tid, [row_in_tile])
@@ -1762,7 +2477,7 @@ def compile_moe_gemm1(
                             else arith.select(
                                 t_valid,
                                 buffer_ops.buffer_load(
-                                    sx_rsrc, ts2, vec_width=1, dtype=T.f32
+                                    sx_rsrc, ts2, vec_width=1, dtype=T.f32, cache_modifier=_SCALE_CM
                                 ),
                                 fx.Float32(0.0),
                             )
@@ -1774,7 +2489,7 @@ def compile_moe_gemm1(
                             else arith.select(
                                 t_valid,
                                 buffer_ops.buffer_load(
-                                    sx_rsrc, t2, vec_width=1, dtype=T.f32
+                                    sx_rsrc, t2, vec_width=1, dtype=T.f32, cache_modifier=_SCALE_CM
                                 ),
                                 fx.Float32(0.0),
                             )
@@ -1836,15 +2551,23 @@ def compile_moe_gemm1(
                             idx_out0 = idx0 + col_i32
                             buffer_ops.buffer_store(y, out_rsrc, idx_out0)
 
-                mfma_epilog(
-                    use_cshuffle=False,
-                    arith=arith,
-                    range_constexpr=range_constexpr,
-                    m_repeat=m_repeat,
-                    lane_div_16=lane_div_16,
-                    bx_m=bx_m,
-                    body_row=_stage1_store_row,
-                )
+                if not use_cshuffle_epilog_flag:
+                    mfma_epilog(
+                        use_cshuffle=False,
+                        arith=arith,
+                        range_constexpr=range_constexpr,
+                        m_repeat=m_repeat,
+                        lane_div_16=lane_div_16,
+                        bx_m=bx_m,
+                        body_row=_stage1_store_row,
+                    )
+
+            if _persist1:
+                # barrier so LDS from this M-block is fully consumed before the next
+                # persist iteration reuses it; then close the persist loop.
+                gpu.barrier()
+                scf.YieldOp([])
+                _for_ip1.__exit__(None, None, None)
 
     # ── Host launcher (flyc.jit + .launch) ────────────────────────────────
     @flyc.jit
@@ -1873,6 +2596,39 @@ def compile_moe_gemm1(
         size_expert_ids_in = arith.index_cast(T.index, i32_size_expert_ids_in)
         gx = inter_in // fx.Index(tile_n)
         gy = size_expert_ids_in
+        # Split-K multiplies the launch z-dim by k_batch. The kernel decodes
+        # blockIdx.z as (group * k_batch + kz); k_batch==1 leaves the grid intact.
+        _sk_kb = fx.Index(k_batch)
+
+        # persist_m (>1) divides the M-carrying grid dim so each WG serially sweeps
+        # persist_m M-blocks. persist follows M: remap=gy -> group (z) dim; remap=gx /
+        # no-remap -> M dim (block_id.y).
+        def _pm_ceil(dim):
+            if persist_m == 1:
+                return dim
+            return (dim + fx.Index(persist_m - 1)) // fx.Index(persist_m)
+
+        if MOE_XCD_REMAP:
+            if MOE_XCD_REMAP_GX:
+                # (NUM_XCD, expert_blocks, ceil(n_tiles/NUM_XCD)): split N across XCDs
+                # so each XCD keeps its weight n_tile slice L2-resident.
+                gz = (gx + fx.Index(MOE_NUM_XCD - 1)) // fx.Index(MOE_NUM_XCD)
+                gz = gz * _sk_kb if _is_splitk1 else gz
+                grid_dims = (fx.Index(MOE_NUM_XCD), _pm_ceil(gy), gz)
+            else:
+                # (NUM_XCD, n_tiles, ceil(expert_blocks/NUM_XCD)) for XCD L2 locality
+                gz = (gy + fx.Index(MOE_NUM_XCD - 1)) // fx.Index(MOE_NUM_XCD)
+                if _is_splitk1 and MOE_SPLITK_AXIS == "y":
+                    # Split-K on the -2 axis: fold k_batch into the n_tile dim so a
+                    # tile's kz partials dispatch adjacently (output stays L2-hot).
+                    grid_dims = (fx.Index(MOE_NUM_XCD), gx * _sk_kb, gz)
+                else:
+                    gz = gz * _sk_kb if _is_splitk1 else gz
+                    grid_dims = (fx.Index(MOE_NUM_XCD), gx, _pm_ceil(gz))
+        else:
+            grid_dims = (
+                (gx, gy, _sk_kb) if _is_splitk1 else (gx, _pm_ceil(gy), 1)
+            )
 
         moe_gemm1(
             arg_out,
@@ -1889,7 +2645,7 @@ def compile_moe_gemm1(
             i32_k_in,
             i32_size_expert_ids_in,
         ).launch(
-            grid=(gx, gy, 1),
+            grid=grid_dims,
             block=(total_threads, 1, 1),
             stream=stream,
         )
@@ -1916,8 +2672,25 @@ def compile_moe_gemm2(
     use_async_copy: bool = False,
     waves_per_eu: int = 3,
     b_nt: int = 2,
+    k_batch: int = 1,
+    persist_m: int = 1,
+    remap: str | None = None,
+    splitk_axis: str | None = None,
+    x_nt: int | None = None,
+    scale_nt: int | None = None,
+    out_nt: int | None = None,
+    b_pool_depth: int = 0,
+    x_pool_depth: int = 0,
+    persist_n: int = 0,
+    mfma_variant: str | None = None,
 ):
     """Compile stage2 kernel (`moe_gemm2`) and return the compiled executable.
+
+    mfma_variant selects the fp8 MFMA ISA (tunable; must be valid for tile_k):
+      - None / "16x16x128" : mfma_scale_f32_16x16x128_f8f6f4 (needs tile_k%128==0),
+                             else falls back to 16x16x32.
+      - "16x16x32"         : mfma_f32_16x16x32_fp8_fp8 (needs tile_k%32==0).
+    (32x32x16 not yet wired in this kernel.)
 
     in_dtype:
       - "fp8": A2/W are fp8
@@ -1940,7 +2713,61 @@ def compile_moe_gemm2(
     b_nt:
       Non-temporal cache modifier for B (weight) buffer loads.
       0 = normal caching, 2 = non-temporal (GLC+SLC).
+
+    remap / splitk_axis / x_nt / scale_nt / out_nt:
+      Per-compile dispatch & cache-policy knobs (None => env default); see
+      _resolve_moe_knobs / _moe_knob_tags.
     """
+    b_nt = _eff_b_nt(b_nt)
+    (
+        MOE_XCD_REMAP,
+        MOE_XCD_REMAP_GX,
+        MOE_SPLITK_AXIS,
+        _X_CM,
+        _X_DMA_AUX,
+        _SCALE_CM,
+        _OUT_ATOMIC_AUX,
+        _OUT_STORE_CM,
+    ) = _resolve_moe_knobs(remap, splitk_axis, x_nt, scale_nt, out_nt)
+    # persist_m (workgroup merge along M) is the inverse of split-K; the two are
+    # mutually exclusive. Each WG serially sweeps persist_m M-blocks.
+    persist_m = int(persist_m)
+    if persist_m > 1 and k_batch > 1:
+        raise ValueError(
+            f"persist_m={persist_m} and k_batch={k_batch} are mutually exclusive"
+        )
+
+    # ── persist_n: N-merge factor (analogous to persist_m along M) ───────────
+    # persist_n = how many consecutive N-tiles (output/model_dim tiles) each
+    # workgroup serially sweeps. The N tiles of a given M-block share the SAME
+    # stage2 activation X (X depends only on M/inter_dim, not on the output
+    # dim), so folding several N-tiles into one WG lets X stay L2-resident and
+    # reused across them, and shrinks the launch N-grid dim by persist_n.
+    #   persist_n <= 1 (default) -> each WG covers 1 N-tile (grid N = gx_total,
+    #                               IR byte-identical to before).
+    #   persist_n = k > 1        -> grid N = gx_total/k; each WG loops over k
+    #                               consecutive N-tiles (base = block_id*k + j).
+    # Source precedence: the per-compile `persist_n` arg (from the `_pn{n}`
+    # kernel-name token) takes precedence, else env FLYDSL_MOE_STAGE2_PERSIST_N,
+    # else full-N default. A requested value that does not divide gx_total (or an
+    # unsupported combination) silently falls back to the default (persist_n=1).
+    # NOTE: kept intentionally independent of / mutually simple with the other
+    # workgroup-shaping knobs: persist_n>1 is only honored for the plain path
+    # (k_batch==1, persist_m==1) and when N stays on a single grid axis (i.e.
+    # not the gx-first XCD remap, which already splits N across XCDs).
+    _gx_total = int(model_dim) // int(tile_n)
+    _pn_env = int(os.environ.get("FLYDSL_MOE_STAGE2_PERSIST_N", "0") or "0")
+    _pn_req = int(persist_n) if int(persist_n) > 0 else _pn_env
+    _persist_n_ok = (
+        _pn_req > 1
+        and _pn_req <= _gx_total
+        and (_gx_total % _pn_req == 0)
+        and int(k_batch) == 1
+        and int(persist_m) == 1
+        and not MOE_XCD_REMAP_GX
+    )
+    _persist_n = _pn_req if _persist_n_ok else 1
+
     gpu_arch = get_hip_arch()
     allocator = SmemAllocator(None, arch=gpu_arch)
 
@@ -1977,6 +2804,37 @@ def compile_moe_gemm2(
     # INT4 here means W4A8: A2 is int8, W is packed int4 and unpacked to int8 in-kernel.
     is_int8 = (in_dtype in ("int8", "int8smooth")) or is_int4
 
+    # ── Split-K (partition the GEMM K=inter_dim across `k_batch` workgroups) ──
+    # Stage2 is a plain linear down-projection that already atomic-accumulates
+    # its result into the final output. Split-K therefore only needs to slice
+    # the K-loop per CTA and let the existing atomics sum the partials, so it
+    # requires accumulate=True. k_batch==1 keeps the original path untouched.
+    _is_splitk2 = int(k_batch) > 1
+    if _is_splitk2:
+        if not bool(accumulate):
+            raise ValueError("split-K (k_batch>1) stage2 requires accumulate=True")
+        if int(inter_dim) % int(k_batch) != 0:
+            raise ValueError(
+                f"split-K: inter_dim={inter_dim} not divisible by k_batch={k_batch}"
+            )
+        _k_per_batch2 = int(inter_dim) // int(k_batch)
+        if _k_per_batch2 % int(tile_k) != 0:
+            raise ValueError(
+                f"split-K: K_per_batch={_k_per_batch2} not divisible by tile_k={tile_k}"
+            )
+        if (_k_per_batch2 // int(tile_k)) < 2:
+            raise ValueError(
+                "split-K: K_per_batch must be >= 2*tile_k (pipeline needs >=2 tail tiles)"
+            )
+    else:
+        _k_per_batch2 = int(inter_dim)
+    _sk_axis_tag2 = (
+        "y"
+        if (_is_splitk2 and MOE_SPLITK_AXIS == "y" and MOE_XCD_REMAP and not MOE_XCD_REMAP_GX)
+        else ""
+    )
+    _sk_tag2 = f"_sk{k_batch}{_sk_axis_tag2}" if _is_splitk2 else ""
+
     _is_gfx950 = str(gpu_arch).startswith("gfx950")
     _use_k64_mfma = _is_gfx950 and is_int8
 
@@ -2005,9 +2863,16 @@ def compile_moe_gemm2(
     num_waves = tile_n // 32
     total_threads = num_waves * 64
     tile_k_bytes = int(tile_k) * int(elem_bytes)
+    # mfma_variant tuning knob: pick the fp8 MFMA ISA (given tile_k allows it).
+    #   None/"16x16x128" -> auto (wide scale MFMA when tk%128==0, else 16x16x32)
+    #   "16x16x32"       -> force mfma_f32_16x16x32_fp8_fp8
+    if mfma_variant in ("32x32x16", "mfma32k16"):
+        raise ValueError(f"mfma_variant={mfma_variant!r} (32x32x16) not wired in compile_moe_gemm2")
+    _force_16x16x32 = mfma_variant in ("16x16x32", "mfma16k32")
     _use_k128_mfma_fp8 = (
         _is_gfx950 and not is_int8 and not is_f16_or_bf16
         and (tile_k_bytes % 128) == 0
+        and not _force_16x16x32
     )
     if (tile_k_bytes % 64) != 0:
         raise ValueError(
@@ -2092,9 +2957,24 @@ def compile_moe_gemm2(
     _use_wptr64 = _w_nbytes_static_s2 >= (1 << 31)
     _wptr64_tag = "_wptr64" if _use_wptr64 else ""
 
+    _knob_tag = _moe_knob_tags(
+        MOE_XCD_REMAP, MOE_XCD_REMAP_GX, _X_CM, _SCALE_CM, _OUT_ATOMIC_AUX
+    )
+    _pm_tag = f"_pm{persist_m}" if persist_m != 1 else ""
+    # Effective B/X prefetch-pool depths: per-kernel param (for tuning) overrides the
+    # module-level env default (for standalone experiments). Baked into the name so
+    # each depth is a distinct compiled kernel.
+    _bp_depth = b_pool_depth if b_pool_depth else MOE_S2_BPOOL_DEPTH
+    _xp_depth = x_pool_depth if x_pool_depth else MOE_S2_XPOOL_DEPTH
+    _pool_tag = (f"_bp{_bp_depth}" if _bp_depth >= 2 else "") + (
+        f"_xp{_xp_depth}" if _xp_depth >= 2 else "")
+    # Encode persist_n so distinct per-WG N-loop lengths get separate compile
+    # caches. Only emitted when partial (>1) so the default stays byte-identical.
+    _pn_tag = f"_pn{_persist_n}" if _persist_n > 1 else ""
+    _mfma_tag = f"_mi{mfma_variant}" if mfma_variant else ""
     module_name = (
         f"mfma_moe2_{in_dtype}_{out_s}_{epilog_tag}"
-        f"_t{tile_m}x{tile_n}x{tile_k}{_async_tag2}{_wpe_tag2}{_bnt_tag2}{_wptr64_tag}"
+        f"_t{tile_m}x{tile_n}x{tile_k}{_async_tag2}{_wpe_tag2}{_bnt_tag2}{_wptr64_tag}{_sk_tag2}{_knob_tag}{_pm_tag}{_pool_tag}{_pn_tag}{_mfma_tag}"
         f"_abi5_wptr64gate"  # ABI bumped: optional 64-bit W load path gated by static size check
     ).replace("-", "_")
 
@@ -2212,11 +3092,96 @@ def compile_moe_gemm2(
             layout_lds = fx.make_layout(shape_lds, stride_lds)
 
             tx = gpu.thread_id("x")
+            # Split-K dispatch axis (see MOE_SPLITK_AXIS). "y" only applies to the
+            # gy-first remap branch; kz/k_start are then derived from blockIdx.y
+            # inside that branch. Otherwise blockIdx.z encodes group*k_batch+kz.
+            _sk_axis_y2 = (
+                _is_splitk2
+                and MOE_SPLITK_AXIS == "y"
+                and MOE_XCD_REMAP
+                and not MOE_XCD_REMAP_GX
+            )
+            if _is_splitk2 and not _sk_axis_y2:
+                _bidz_sk = gpu.block_id("z")
+                kz_sk = _bidz_sk % fx.Index(k_batch)
+                _sk_group_z = _bidz_sk // fx.Index(k_batch)
+                k_start = kz_sk * fx.Index(_k_per_batch2)
+            else:
+                _sk_group_z = None
+                k_start = None
+            # persist_m loop: each WG serially sweeps persist_m M-blocks (the inverse
+            # of split-K). persist follows the M dim (see launch grid): under remap=gy
+            # it folds into the group (z) index, under remap=gx / no-remap into the M
+            # index (block_id.y). persist_m==1 leaves IR/behavior unchanged.
+            _persist2 = persist_m > 1
+            if _persist2:
+                _c_pm2 = arith.constant(persist_m, index=True)
+                _for_persist2 = scf.ForOp(
+                    arith.constant(0, index=True),
+                    _c_pm2,
+                    arith.constant(1, index=True),
+                )
+                _for_ip2 = ir.InsertionPoint(_for_persist2.body)
+                _for_ip2.__enter__()
+                _mi2 = _for_persist2.induction_variable
+                # Anti-LICM: keep tid-derived LDS addresses loop-variant so they
+                # are recomputed (not hoisted + pinned) each persist iteration.
+                tx = _persist_anti_licm_tx(tx, _mi2)
+
+            def _pm_fold2(v):
+                return (v * _c_pm2 + _mi2) if _persist2 else v
+
             # Align with Aiter launch mapping:
             # - blockIdx.x -> N dimension (tile along model_dim)
             # - blockIdx.y -> expert-block id / M dimension (tile along sorted M)
-            by = gpu.block_id("x")  # tile along model_dim
-            bx = gpu.block_id("y")  # tile along sorted M
+            if MOE_XCD_REMAP and MOE_XCD_REMAP_GX:
+                # gx-first: grid=(NUM_XCD, gy, ceil(gx/NUM_XCD)). N (n_tile) split across
+                # XCDs; bx (sorted M) walks the full gy on block_id.y => always in range.
+                # The rounding overruns by (n_tile), so guard by < n_tiles (folded into
+                # blk_valid below).
+                _xcd = gpu.block_id("x")  # 0..NUM_XCD-1 (one per XCD, chunk=1)
+                bx = _pm_fold2(gpu.block_id("y"))  # tile along sorted M (full range)
+                _bz = _sk_group_z if _is_splitk2 else gpu.block_id("z")  # n_tile group
+                by = _bz * fx.Index(MOE_NUM_XCD) + _xcd  # tile along model_dim (n-tile)
+                # n_tiles must match the launcher's gx = n_in // tile_n.
+                _n_tiles_i32 = arith.index_cast(T.i32, n_in // fx.Index(tile_n))
+                by_in_range = arith.cmpi(
+                    arith.CmpIPredicate.ult, arith.index_cast(T.i32, by), _n_tiles_i32
+                )
+            elif MOE_XCD_REMAP:
+                # grid=(NUM_XCD, gx, ceil(gy/NUM_XCD)); see MOE_XCD_REMAP note.
+                _xcd = gpu.block_id("x")  # 0..NUM_XCD-1 (one per XCD, chunk=1)
+                if _sk_axis_y2:
+                    # Split-K on the -2 axis: blockIdx.y = n_tile*k_batch + kz, so a
+                    # tile's kz partials are adjacent in dispatch order (output stays
+                    # L2-hot). blockIdx.z is the pure expert-block group.
+                    _bycomb = gpu.block_id("y")
+                    by = _bycomb // fx.Index(k_batch)  # tile along model_dim (n-tile)
+                    kz_sk = _bycomb % fx.Index(k_batch)
+                    k_start = kz_sk * fx.Index(_k_per_batch2)
+                    _bz = gpu.block_id("z")  # expert-block group
+                else:
+                    by = gpu.block_id("y")  # tile along model_dim (n-tile)
+                    _bz = (
+                        _sk_group_z
+                        if _is_splitk2
+                        else _pm_fold2(gpu.block_id("z"))
+                    )  # expert-block group (persist folds into the group dim)
+                bx = _bz * fx.Index(MOE_NUM_XCD) + _xcd  # tile along sorted M
+                # The XCD remap rounds the grid up, so bx can run past the real
+                # number of expert blocks (size_expert_ids). Flag those pure-padding
+                # blocks here and fold into blk_valid below so they exit via the
+                # whole-kernel gate (no OOB, no wasted buffer/gmem work).
+                bx_in_range = arith.cmpi(
+                    arith.CmpIPredicate.ult,
+                    arith.index_cast(T.i32, bx),
+                    i32_size_expert_ids_in,
+                )
+            else:
+                by = gpu.block_id("x")  # tile along model_dim
+                bx = _pm_fold2(gpu.block_id("y"))  # tile along sorted M
+
+            _xcd_debug_print(2, bx, by)
 
             # XOR16 swizzle parameter (in bytes; constant, power-of-two in our configs).
             k_blocks16 = arith.index(tile_k_bytes // 16)
@@ -2337,18 +3302,72 @@ def compile_moe_gemm2(
 
             # Early-exit guard (as in 2ce65fb): some routing paths can produce extra/garbage
             # expert blocks beyond `num_valid_ids`. Skip those blocks entirely to avoid OOB.
-            numids_rsrc = buffer_ops.create_buffer_resource(
-                arg_num_valid_ids,
-                max_size=False,
-                num_records_bytes=fx.Index(4),
-            )
-            num_valid_i32 = buffer_ops.buffer_load(
-                numids_rsrc, fx.Index(0), vec_width=1, dtype=T.i32
-            )
             bx_m_i32 = arith.index_cast(T.i32, bx_m)
-            blk_valid = arith.cmpi(arith.CmpIPredicate.ult, bx_m_i32, num_valid_i32)
+            if MOE_XCD_REMAP and not MOE_XCD_REMAP_GX:
+                # Only in-range blocks load num_valid_ids and run the token check; padding
+                # blocks (bx >= size_expert_ids) skip the load and yield invalid directly.
+                # num_valid_i32 is also yielded out (the gated body uses it in precompute_row);
+                # padding blocks yield a dummy 0 that is never consumed (blk_valid is False).
+                _i1_ty = ir.IntegerType.get_signless(1)
+                _rng_if = scf.IfOp(bx_in_range, [_i1_ty, T.i32], has_else=True)
+                with _if_then(_rng_if):
+                    numids_rsrc = buffer_ops.create_buffer_resource(
+                        arg_num_valid_ids,
+                        max_size=False,
+                        num_records_bytes=fx.Index(4),
+                    )
+                    _nv = buffer_ops.buffer_load(
+                        numids_rsrc, fx.Index(0), vec_width=1, dtype=T.i32
+                    )
+                    tok_ok = arith.cmpi(arith.CmpIPredicate.ult, bx_m_i32, _nv)
+                    scf.YieldOp([tok_ok, _nv])
+                with _if_else(_rng_if):
+                    scf.YieldOp(
+                        [arith.constant(0, type=_i1_ty), arith.constant(0, type=T.i32)]
+                    )
+                blk_valid = _rng_if.results[0]
+                num_valid_i32 = _rng_if.results[1]
+            elif MOE_XCD_REMAP and MOE_XCD_REMAP_GX:
+                # gx-first: bx (sorted M) is always in range; the rounding overruns by
+                # (n_tile). Only in-range (by) blocks load num_valid_ids and run the token
+                # check; padding blocks (by >= n_tiles) skip the load and yield invalid.
+                _i1_ty = ir.IntegerType.get_signless(1)
+                _rng_if = scf.IfOp(by_in_range, [_i1_ty, T.i32], has_else=True)
+                with _if_then(_rng_if):
+                    numids_rsrc = buffer_ops.create_buffer_resource(
+                        arg_num_valid_ids,
+                        max_size=False,
+                        num_records_bytes=fx.Index(4),
+                    )
+                    _nv = buffer_ops.buffer_load(
+                        numids_rsrc, fx.Index(0), vec_width=1, dtype=T.i32
+                    )
+                    tok_ok = arith.cmpi(arith.CmpIPredicate.ult, bx_m_i32, _nv)
+                    scf.YieldOp([tok_ok, _nv])
+                with _if_else(_rng_if):
+                    scf.YieldOp(
+                        [arith.constant(0, type=_i1_ty), arith.constant(0, type=T.i32)]
+                    )
+                blk_valid = _rng_if.results[0]
+                num_valid_i32 = _rng_if.results[1]
+            else:
+                # non-remap: bx (sorted M) is always in range, so load num_valid directly.
+                numids_rsrc = buffer_ops.create_buffer_resource(
+                    arg_num_valid_ids,
+                    max_size=False,
+                    num_records_bytes=fx.Index(4),
+                )
+                num_valid_i32 = buffer_ops.buffer_load(
+                    numids_rsrc, fx.Index(0), vec_width=1, dtype=T.i32
+                )
+                blk_valid = arith.cmpi(
+                    arith.CmpIPredicate.ult, bx_m_i32, num_valid_i32
+                )
 
-            def _moe_gemm2_then_body():
+            def _moe_gemm2_then_body(_by_tile):
+                # `_by_tile` is the N-tile (model_dim tile) index this invocation
+                # computes. With persist_n<=1 it is simply `by`; with persist_n>1
+                # the caller sweeps `persist_n` consecutive tiles per WG.
                 # Expert id for this M tile.
                 expert_i32 = buffer_ops.buffer_load(
                     expert_rsrc, bx, vec_width=1, dtype=T.i32
@@ -2418,13 +3437,16 @@ def compile_moe_gemm2(
                             rsrc=x_rsrc,
                             vec_elems=vec16_elems,
                             elem_bytes=elem_bytes,
+                            cache_modifier=_X_CM,
                         )
                     if x_load_bytes == 8:
                         return buffer_ops.buffer_load(
-                            x_rsrc, idx_i32, vec_width=2, dtype=T.i32
+                            x_rsrc, idx_i32, vec_width=2, dtype=T.i32,
+                            cache_modifier=_X_CM,
                         )
                     return buffer_ops.buffer_load(
-                        x_rsrc, idx_i32, vec_width=1, dtype=T.i32
+                        x_rsrc, idx_i32, vec_width=1, dtype=T.i32,
+                        cache_modifier=_X_CM,
                     )
 
                 # decode routed token once (per thread's M-slice) and build a base offset.
@@ -2487,7 +3509,7 @@ def compile_moe_gemm2(
                 )
 
                 # Dynamic N tiling within block.
-                by_n = by * fx.Index(tile_n)
+                by_n = _by_tile * fx.Index(tile_n)
                 n_per_wave = tile_n // num_waves
                 num_acc_n = n_per_wave // 16
                 c_n_per_wave = fx.Index(n_per_wave)
@@ -2756,7 +3778,7 @@ def compile_moe_gemm2(
                                 global_offset,
                                 arith.constant(0, type=T.i32),
                                 arith.constant(0, type=T.i32),
-                                arith.constant(0, type=T.i32),
+                                arith.constant(_X_DMA_AUX, type=T.i32),
                             )
 
                     def prefetch_x_to_lds(base_k, lds_base):
@@ -2820,7 +3842,7 @@ def compile_moe_gemm2(
                                 fx.Float32(1.0)
                                 if not needs_scale_w
                                 else buffer_ops.buffer_load(
-                                    sw_rsrc, row_w_idx, vec_width=1, dtype=T.f32
+                                    sw_rsrc, row_w_idx, vec_width=1, dtype=T.f32, cache_modifier=_SCALE_CM
                                 )
                             )
                         # Also prefetch per-row routed/topk weights (sorted_weights) when enabled.
@@ -3080,7 +4102,8 @@ def compile_moe_gemm2(
                     vector.store(_tid_vec1, lds_tid, [tx])
 
                 # Prologue.
-                k0 = fx.Index(0)
+                # Split-K: start at this CTA's K-slice base (k_start); == 0 otherwise.
+                k0 = k_start if _is_splitk2 else fx.Index(0)
                 if use_async_copy:
                     prefetch_x_to_lds(k0, lds_base_cur)
                     b_cur = load_b_tile(k0)
@@ -3113,26 +4136,70 @@ def compile_moe_gemm2(
                 # IMPORTANT: for odd number of K tiles, leave **1** tail tile; for even, leave **2**.
                 # Otherwise the 2-tile tail below would double-count the last tile when num_tiles is odd
                 # (e.g. inter_dim=192, tile_k=64 -> 3 tiles).
-                num_k_tiles_py = int(inter_dim) // int(tile_k)
+                # Split-K: each CTA sweeps only its K-slice [k_start, k_start+K_per_batch).
+                num_k_tiles_py = int(_k_per_batch2) // int(tile_k)
                 odd_k_tiles = (num_k_tiles_py % 2) == 1
                 tail_tiles = 1 if odd_k_tiles else 2
                 k_main2_py = (num_k_tiles_py - tail_tiles) * int(tile_k)
                 if k_main2_py < 0:
                     k_main2_py = 0
+                # End of this CTA's K-slice (== k_in when not split-K, so IR is identical).
+                _k_slice_end = (
+                    (k_start + fx.Index(_k_per_batch2)) if _is_splitk2 else k_in
+                )
 
                 c2_tile_k = arith.index(tile_k * 2)
                 pair_iters = k_main2_py // (int(tile_k) * 2)
+                _use_pool = (_bp_depth >= 2) and not use_async_copy
+
+                def _k_of(t):
+                    return k0 + arith.index(t * tile_k)
+
+                _bpool = []
+                if _use_pool:
+                    # Front-load N weight tiles into the ring pool. Reuse the
+                    # prologue's b_cur as tile 0, then load tiles 1..N-1.
+                    _pooln = min(_bp_depth, num_k_tiles_py)
+                    _bpool = [b_cur] + [load_b_tile(_k_of(t)) for t in range(1, _pooln)]
+                    # Hint the scheduler to issue the front-loaded pool weight loads
+                    # up front (each load_b_tile = k_unroll*num_acc_n*2 buffer_loads).
+                    if _pooln > 1:
+                        rocdl.sched_vmem((_pooln - 1) * k_unroll * num_acc_n * 2)
+                # X HBM prefetch pool: tile 0's X already loaded+stored in prologue;
+                # front-load tiles 1..depth into registers (ds_write stays 1-ahead).
+                _use_xpool = (_xp_depth >= 2) and not use_async_copy
+                _xpool = []
+                if _use_xpool:
+                    _xpool = [load_x_tile(_k_of(t))
+                              for t in range(1, min(_xp_depth + 1, num_k_tiles_py))]
+                    if len(_xpool) > 0:
+                        rocdl.sched_vmem(len(_xpool) * num_x_loads)
                 for pair_i in range_constexpr(pair_iters):
                     k_iv = arith.index(pair_i * (tile_k * 2))
+                    if _is_splitk2:
+                        k_iv = k_start + k_iv
                     next_k1 = k_iv + tile_k
                     if use_async_copy:
                         prefetch_x_to_lds(next_k1, lds_base_ping)
+                    elif _use_xpool:
+                        x_regs_ping = _xpool.pop(0)  # tile 2i+1
+                        _xtl0 = (2 * pair_i + 1) + _xp_depth
+                        if _xtl0 < num_k_tiles_py:
+                            _xpool.append(load_x_tile(_k_of(_xtl0)))
                     else:
                         x_regs_ping = load_x_tile(next_k1)
-                    b_ping = load_b_tile(next_k1)
+                    if _use_pool:
+                        # take head (tile 2i), issue tail load (tile 2i+depth)
+                        _b0 = _bpool.pop(0)
+                        _tl0 = 2 * pair_i + _bp_depth
+                        if _tl0 < num_k_tiles_py:
+                            _bpool.append(load_b_tile(_k_of(_tl0)))
+                    else:
+                        b_ping = load_b_tile(next_k1)
+                        _b0 = b_cur
 
                     acc, _ = compute_tile(
-                        acc, b_cur, lds_base_pong,
+                        acc, _b0, lds_base_pong,
                         a0_prefetch=a0_prefetch_pong,
                         a1_prefetch=a1_prefetch_pong,
                     )
@@ -3159,12 +4226,24 @@ def compile_moe_gemm2(
                     next_k2 = k_iv + c2_tile_k
                     if use_async_copy:
                         prefetch_x_to_lds(next_k2, lds_base_pong)
+                    elif _use_xpool:
+                        x_regs_pong = _xpool.pop(0)  # tile 2i+2
+                        _xtl1 = (2 * pair_i + 2) + _xp_depth
+                        if _xtl1 < num_k_tiles_py:
+                            _xpool.append(load_x_tile(_k_of(_xtl1)))
                     else:
                         x_regs_pong = load_x_tile(next_k2)
-                    b_next = load_b_tile(next_k2)
+                    if _use_pool:
+                        _b1 = _bpool.pop(0)
+                        _tl1 = 2 * pair_i + 1 + _bp_depth
+                        if _tl1 < num_k_tiles_py:
+                            _bpool.append(load_b_tile(_k_of(_tl1)))
+                    else:
+                        b_next = load_b_tile(next_k2)
+                        _b1 = b_ping
 
                     acc, _ = compute_tile(
-                        acc, b_ping, lds_base_ping,
+                        acc, _b1, lds_base_ping,
                         a0_prefetch=a0_prefetch_ping,
                         a1_prefetch=a1_prefetch_ping,
                     )
@@ -3188,29 +4267,40 @@ def compile_moe_gemm2(
                         else None
                     )
 
-                    b_cur = b_next
+                    if _use_pool:
+                        pass  # pool self-manages b state
+                    else:
+                        b_cur = b_next
 
                 if odd_k_tiles:
-                    # Tail: single remaining tile (already in `b_cur` / `lds_base_pong`).
+                    # Tail: single remaining tile (already in `b_cur`/pool / `lds_base_pong`).
+                    _bt = _bpool.pop(0) if _use_pool else b_cur
                     acc, epilogue_pf = compute_tile(
                         acc,
-                        b_cur,
+                        _bt,
                         lds_base_pong,
                         prefetch_epilogue=True,
                         a0_prefetch=a0_prefetch_pong,
                         a1_prefetch=a1_prefetch_pong,
                     )
                 else:
-                    # Tail: 2 remaining tiles.
-                    k_tail1 = k_in - tile_k
+                    # Tail: 2 remaining tiles (k_end == k_in for non-split-K).
+                    k_tail1 = _k_slice_end - tile_k
                     if use_async_copy:
                         prefetch_x_to_lds(k_tail1, lds_base_ping)
+                    elif _use_xpool:
+                        x_regs_ping = _xpool.pop(0)  # last tile's X (held in pool)
                     else:
                         x_regs_ping = load_x_tile(k_tail1)
-                    b_ping = load_b_tile(k_tail1)
+                    if _use_pool:
+                        _bt0 = _bpool.pop(0)   # tile N-2 (held in pool)
+                        b_ping = _bpool.pop(0)  # tile N-1 (held in pool)
+                    else:
+                        _bt0 = b_cur
+                        b_ping = load_b_tile(k_tail1)
 
                     acc, _ = compute_tile(
-                        acc, b_cur, lds_base_pong,
+                        acc, _bt0, lds_base_pong,
                         a0_prefetch=a0_prefetch_pong,
                         a1_prefetch=a1_prefetch_pong,
                     )
@@ -3250,6 +4340,7 @@ def compile_moe_gemm2(
                 topk_i32_v = topk_i32
 
                 zero_i32 = fx.Int32(0)
+                out_aux_i32 = fx.Int32(_OUT_ATOMIC_AUX)  # buffer-atomic cachepolicy (bypass L2 when set)
                 c2_i32 = fx.Int32(2)  # 2B element size for f16/bf16
                 mask_even_i32 = fx.Int32(
                     0xFFFFFFFE
@@ -3263,7 +4354,7 @@ def compile_moe_gemm2(
                         out_rsrc,
                         byte_off_i32,
                         zero_i32,
-                        zero_i32,
+                        out_aux_i32,
                     )
 
                 sw_pf = None
@@ -3283,7 +4374,7 @@ def compile_moe_gemm2(
                             fx.Float32(1.0)
                             if not needs_scale_w
                             else buffer_ops.buffer_load(
-                                sw_rsrc, row_w_idx, vec_width=1, dtype=T.f32
+                                sw_rsrc, row_w_idx, vec_width=1, dtype=T.f32, cache_modifier=_SCALE_CM
                             )
                         )
 
@@ -3297,7 +4388,7 @@ def compile_moe_gemm2(
                             out_rsrc,
                             byte_off_i32,
                             zero_i32,
-                            zero_i32,
+                            out_aux_i32,
                         )
 
                     def _stage2_row_atomic(*, mi: int, ii: int, row_in_tile, row):
@@ -3319,7 +4410,7 @@ def compile_moe_gemm2(
                             else arith.select(
                                 ts_ok,
                                 buffer_ops.buffer_load(
-                                    sx_rsrc, ts2, vec_width=1, dtype=T.f32
+                                    sx_rsrc, ts2, vec_width=1, dtype=T.f32, cache_modifier=_SCALE_CM
                                 ),
                                 fx.Float32(0.0),
                             )
@@ -3337,6 +4428,11 @@ def compile_moe_gemm2(
                                     ),
                                     fx.Float32(0.0),
                                 )
+                            # sx and tw are both per-row; fold into one product here
+                            # (still 0 for invalid rows since both carry the ts_ok mask).
+                            sxtw = sx * tw
+                        else:
+                            sxtw = sx
 
                         idx0 = (
                             t2_safe * model_i32
@@ -3344,16 +4440,14 @@ def compile_moe_gemm2(
 
                         for ni in range_constexpr(num_acc_n):
                             col_g = col_g_list[ni]
-                            sw = sw_vals[ni]
+                            csw = sxtw * sw_vals[ni]
                             acc_idx = mi * num_acc_n + ni
                             v = vector.extract(
                                 acc[acc_idx], static_position=[ii], dynamic_position=[]
                             )
                             if is_int8:
                                 v = arith.sitofp(T.f32, v)
-                            v = v * sx * sw
-                            if doweight_stage2:
-                                v = v * tw
+                            v = v * csw
                             col_i32 = arith.index_cast(T.i32, col_g)
                             idx_elem = idx0 + col_i32
                             byte_off = idx_elem * c4_i32
@@ -3394,25 +4488,19 @@ def compile_moe_gemm2(
                         col_base_local,
                         num_acc_n: int,
                         lds_out,
+                        lds_col_remap=None,
                     ):
+                        # sx (per-token activation scale): decode+load inline. No
+                        # safe-clamp/select mask -- invalid/padding rows are dropped by
+                        # store_pair's row-validity guard (sentinel row_id==tokens makes
+                        # ts2 OOB -> buffer returns 0), so masking here is redundant.
                         fused2 = memref.load(lds_tid, [row_in_tile])
-                        t2 = fused2 & mask24_i32
-                        s2 = fused2 >> 24
-                        t_ok = arith.cmpi(arith.CmpIPredicate.ult, t2, tokens_i32)
-                        s_ok = arith.cmpi(arith.CmpIPredicate.ult, s2, topk_i32_v)
-                        ts_ok = t_ok & s_ok
-                        t2_safe = ts_ok.select(t2, fx.Int32(0))
-                        s2_safe = ts_ok.select(s2, fx.Int32(0))
-                        ts2 = t2_safe * topk_i32_v + s2_safe
+                        ts2 = (fused2 & mask24_i32) * topk_i32_v + (fused2 >> 24)
                         sx = (
                             fx.Float32(1.0)
                             if is_f16_or_bf16
-                            else arith.select(
-                                ts_ok,
-                                buffer_ops.buffer_load(
-                                    sx_rsrc, ts2, vec_width=1, dtype=T.f32
-                                ),
-                                fx.Float32(0.0),
+                            else buffer_ops.buffer_load(
+                                sx_rsrc, ts2, vec_width=1, dtype=T.f32, cache_modifier=_SCALE_CM
                             )
                         )
 
@@ -3424,22 +4512,49 @@ def compile_moe_gemm2(
                                 tw = buffer_ops.buffer_load(
                                     sorted_w_rsrc, row, vec_width=1, dtype=T.f32
                                 )
+                            # Both sx (per-token) and tw (routed weight) are per-row,
+                            # i.e. invariant across ni; fold them into ONE product here
+                            # ("first time") so the ni loop drops a multiply. sw stays
+                            # per-column. FP mul is non-associative so the compiler
+                            # cannot hoist this itself.
+                            sxtw = sx * tw
+                        else:
+                            sxtw = sx
 
+                        # Depth-1 software pipeline over ni: pre-extract v for ni=0,
+                        # then each step scales/stores the current element while
+                        # pre-extracting the NEXT one. Overlaps the AccVGPR-read +
+                        # scale latency across ni, with only ONE extra value live
+                        # (unlike a full pool -> no VGPR pressure / occupancy loss).
+                        _v_cur = vector.extract(
+                            acc[mi * num_acc_n], static_position=[ii], dynamic_position=[]
+                        )
                         for ni in range_constexpr(num_acc_n):
                             col_local = col_base_local + (ni * 16)
-                            sw = sw_vals[ni]
-                            acc_idx = mi * num_acc_n + ni
-                            v = vector.extract(
-                                acc[acc_idx], static_position=[ii], dynamic_position=[]
-                            )
+                            # Per-(row,ni) scale, independent of v -> computed off the
+                            # AccVGPR-read critical path (overlaps the extract latency).
+                            csw = sxtw * sw_vals[ni]
+                            v = _v_cur
+                            if ni + 1 < num_acc_n:
+                                _v_cur = vector.extract(
+                                    acc[mi * num_acc_n + ni + 1],
+                                    static_position=[ii], dynamic_position=[],
+                                )
                             if is_int8:
                                 v = arith.sitofp(T.f32, v)
-                            v = v * sx * sw
-                            if doweight_stage2:
-                                v = v * tw
+                            v = v * csw
                             v_out = arith.trunc_f(out_elem(), v)
 
-                            lds_idx = row_base_lds + col_local
+                            # Interleaved LDS layout (when enabled): remap the column so
+                            # that a reader thread's n_reps fragments land adjacent -> the
+                            # CShuffle read side can use one wide ds_read instead of n_reps
+                            # narrow reads (halves the read-address VALU + ds_read count).
+                            lds_col = (
+                                lds_col_remap(col_local)
+                                if lds_col_remap is not None
+                                else col_local
+                            )
+                            lds_idx = row_base_lds + lds_col
                             vec1_out = T.vec(1, out_elem())
                             v1 = vector.from_elements(vec1_out, [v_out])
                             vector.store(v1, lds_out, [lds_idx], alignment=2)
@@ -3447,24 +4562,27 @@ def compile_moe_gemm2(
                     def precompute_row(*, row_local, row):
                         fused2 = memref.load(lds_tid, [row_local])
                         row_i32 = arith.index_cast(T.i32, row)
-                        row_valid0 = arith.cmpi(
+                        # Guard ONLY row < num_valid_ids (rejects the uninitialized garbage
+                        # tail). Sentinel padding rows (token==tokens) within num_valid are
+                        # neutralized elsewhere (sx OOB->0 => value 0; out idx OOB->dropped),
+                        # so t<tokens & s<topk are redundant.
+                        row_valid = arith.cmpi(
                             arith.CmpIPredicate.ult, row_i32, num_valid_i32
                         )
                         t = fused2 & mask24_i32
-                        s = fused2 >> 24
-                        t_ok = arith.cmpi(arith.CmpIPredicate.ult, t, tokens_i32)
-                        s_ok = arith.cmpi(arith.CmpIPredicate.ult, s, topk_i32_v)
-                        row_valid = row_valid0 & t_ok & s_ok
-                        return (fused2, row_valid)
+                        # Hoist the per-row output base index (idx0) up-front (invariant
+                        # across ni/columns); store_pair then only adds the column. Keeping
+                        # it here (not deferred into the store guard) lets the scheduler
+                        # overlap the index math across rows.
+                        if bool(accumulate):
+                            idx0 = t * model_i32
+                        else:
+                            s = fused2 >> 24
+                            idx0 = (t * topk_i32_v + s) * model_i32
+                        return (idx0, row_valid)
 
                     def store_pair(*, row_local, row, row_ctx, col_pair0, col_g0, frag):
-                        fused = row_ctx
-                        t = fused & mask24_i32
-                        s = fused >> 24
-                        idx0 = t * model_i32
-                        if not bool(accumulate):
-                            ts = t * topk_i32_v + s
-                            idx0 = ts * model_i32
+                        idx0 = row_ctx
                         col_i32 = arith.index_cast(T.i32, col_g0)
                         idx_elem = idx0 + col_i32
                         idx_elem_even = idx_elem & mask_even_i32
@@ -3532,11 +4650,34 @@ def compile_moe_gemm2(
                         write_row_to_lds=write_row_to_lds,
                         precompute_row=precompute_row,
                         store_pair=store_pair,
+                        interleave_n_reps=True,
                     )
 
             _if_blk = scf.IfOp(blk_valid)
             with _if_then(_if_blk):
-                _moe_gemm2_then_body()
+                if _persist_n > 1:
+                    # persist_n N-loop: this WG serially sweeps `_persist_n`
+                    # consecutive N-tiles for its M-block. `by` is the per-WG
+                    # N-tile counter (launch N-grid was divided by _persist_n),
+                    # so the base tile is by*_persist_n. X for this M-block is
+                    # identical across the tiles, so re-streaming it keeps the
+                    # activation L2-resident (reused) across the sweep. A barrier
+                    # separates iterations so tile j's LDS is fully consumed
+                    # before tile j+1 reuses the same static LDS.
+                    _pn_base = by * fx.Index(_persist_n)
+                    for _pn_j in range_constexpr(_persist_n):
+                        #if _pn_j > 0:
+                        #    gpu.barrier()
+                        _moe_gemm2_then_body(_pn_base + fx.Index(_pn_j))
+                else:
+                    _moe_gemm2_then_body(by)
+
+            if _persist2:
+                # barrier so LDS from this M-block is fully consumed before the next
+                # persist iteration reuses it; then close the persist loop.
+                gpu.barrier()
+                scf.YieldOp([])
+                _for_ip2.__exit__(None, None, None)
 
     # ── Host launcher (flyc.jit + .launch) ────────────────────────────────
     @flyc.jit
@@ -3563,8 +4704,48 @@ def compile_moe_gemm2(
 
         n_in = arith.index_cast(T.index, i32_n_in)
         size_expert_ids_in = arith.index_cast(T.index, i32_size_expert_ids_in)
-        gx = n_in // fx.Index(tile_n)
+        # persist_n (>1) folds `_persist_n` consecutive N-tiles into each WG, so
+        # the N-tile grid dim shrinks by that factor (each WG loops the merged
+        # tiles internally). _persist_n<=1 keeps the original expression / IR.
+        gx = (
+            n_in // fx.Index(tile_n)
+            if _persist_n <= 1
+            else n_in // fx.Index(int(tile_n) * int(_persist_n))
+        )
         gy = size_expert_ids_in
+        # Split-K multiplies the launch z-dim by k_batch. The kernel decodes
+        # blockIdx.z as (group * k_batch + kz); k_batch==1 leaves the grid intact.
+        _sk_kb = fx.Index(k_batch)
+
+        # persist_m (>1) divides the M-carrying grid dim so each WG serially sweeps
+        # persist_m M-blocks. persist follows M: under remap=gy that is the group
+        # (z) dim; under remap=gx / no-remap it is the M dim (gy on block_id.y).
+        def _pm_ceil(dim):
+            if persist_m == 1:
+                return dim
+            return (dim + fx.Index(persist_m - 1)) // fx.Index(persist_m)
+
+        if MOE_XCD_REMAP:
+            if MOE_XCD_REMAP_GX:
+                # (NUM_XCD, expert_blocks, ceil(n_tiles/NUM_XCD)): split N across XCDs
+                # so each XCD keeps its weight n_tile slice L2-resident.
+                gz = (gx + fx.Index(MOE_NUM_XCD - 1)) // fx.Index(MOE_NUM_XCD)
+                gz = gz * _sk_kb if _is_splitk2 else gz
+                grid_dims = (fx.Index(MOE_NUM_XCD), _pm_ceil(gy), gz)
+            else:
+                # (NUM_XCD, n_tiles, ceil(expert_blocks/NUM_XCD)) for XCD L2 locality
+                gz = (gy + fx.Index(MOE_NUM_XCD - 1)) // fx.Index(MOE_NUM_XCD)
+                if _is_splitk2 and MOE_SPLITK_AXIS == "y":
+                    # Split-K on the -2 axis: fold k_batch into the n_tile dim so a
+                    # tile's kz partials dispatch adjacently (output stays L2-hot).
+                    grid_dims = (fx.Index(MOE_NUM_XCD), gx * _sk_kb, gz)
+                else:
+                    gz = gz * _sk_kb if _is_splitk2 else gz
+                    grid_dims = (fx.Index(MOE_NUM_XCD), gx, _pm_ceil(gz))
+        else:
+            grid_dims = (
+                (gx, gy, _sk_kb) if _is_splitk2 else (gx, _pm_ceil(gy), 1)
+            )
 
         moe_gemm2(
             arg_out,
@@ -3581,7 +4762,7 @@ def compile_moe_gemm2(
             i32_k_in,
             i32_size_expert_ids_in,
         ).launch(
-            grid=(gx, gy, 1),
+            grid=grid_dims,
             block=(total_threads, 1, 1),
             stream=stream,
         )
@@ -3741,7 +4922,9 @@ def compile_moe_reduction(
                                 v = arith.trunc_f(elem_type(), v)
                             y_idx = token_idx * c_model_dim + col
                             y_idx_i32 = arith.index_cast(i32_type(), y_idx)
-                            buffer_ops.buffer_store(v, y_rsrc, y_idx_i32)
+                            buffer_ops.buffer_store(
+                                v, y_rsrc, y_idx_i32, cache_modifier=_OUT_STORE_CM
+                            )
 
                     with _if_else(_if_full):
                         # Tail path: scalar load/store per lane.
@@ -3799,7 +4982,9 @@ def compile_moe_reduction(
                                     out = arith.trunc_f(elem_type(), out)
                                 y_idx = token_idx * c_model_dim + col
                                 y_idx_i32 = arith.index_cast(i32_type(), y_idx)
-                                buffer_ops.buffer_store(out, y_rsrc, y_idx_i32)
+                                buffer_ops.buffer_store(
+                                    out, y_rsrc, y_idx_i32, cache_modifier=_OUT_STORE_CM
+                                )
 
     # ── Host launcher (flyc.jit + .launch) ────────────────────────────────
     tile_size = BLOCK_SIZE * VEC_WIDTH
