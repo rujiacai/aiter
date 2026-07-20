@@ -2784,6 +2784,7 @@ def compile_mixed_moe_gemm2(
     b_nt: int = 2,
     xcd_swizzle: int = 0,
     mfma_variant: str | None = None,
+    persist_n: int = 1,
 ):
     """Compile stage2 kernel (`moe_gemm2`) and return the compiled executable.
 
@@ -3036,6 +3037,29 @@ def compile_mixed_moe_gemm2(
         _cu_num = get_cu_num()
     else:
         _cu_num = 0
+    # persist-over-N (Phase A): each WG loops over `_persist_n` consecutive N-tiles
+    # so the per-M-tile setup (expert decode / block-validity loads, done outside
+    # `_moe_gemm2_then_body`) amortizes across N-tiles instead of being redone by
+    # every N-tile WG. env `AITER_FLYDSL_STAGE2_PERSIST_N` overrides for A/B.
+    # Restricted to the non-persistent, xcd=0 path; otherwise falls back to 1
+    # (byte-identical to before).
+    _gx_total_pn = int(model_dim) // int(tile_n)
+    _pn_env = os.environ.get("AITER_FLYDSL_STAGE2_PERSIST_N", "").strip()
+    _pn_req = int(_pn_env) if _pn_env else int(persist_n)
+    if (
+        _pn_req > 1
+        and not _persistent
+        and int(xcd_swizzle) == 0
+        and _gx_total_pn > _pn_req
+        and _gx_total_pn % _pn_req == 0
+        # persist static K-loop reads inter_dim//tile_k resident tiles with no
+        # K-padding tail, so only enable when K divides evenly.
+        and int(inter_dim) % int(tile_k) == 0
+    ):
+        _persist_n = _pn_req
+    else:
+        _persist_n = 1
+    _pn_tag = f"_pn{_persist_n}" if _persist_n > 1 else ""
     _sbm_tag = "" if _sort_block_m == tile_m else f"_sbm{_sort_block_m}"
     _pm_tag = f"_persist_cu{_cu_num}" if _persistent else f"_pm{persist_m}"
     _xcd_tag = f"_xcd{xcd_swizzle}" if xcd_swizzle > 0 else ""
@@ -3043,7 +3067,7 @@ def compile_mixed_moe_gemm2(
     module_name = (
         f"mfma_moe2_a{a_dtype}_w{b_dtype}_{out_s}_{epilog_tag}"
         f"_t{tile_m}x{tile_n}x{tile_k}"
-        f"{_mfma_variant_tag}_vscale_fix5{_pm_tag}{_sbm_tag}{_xcd_tag}"
+        f"{_mfma_variant_tag}_vscale_fix5{_pm_tag}{_sbm_tag}{_xcd_tag}{_pn_tag}"
     ).replace("-", "_")
     # -- LDS sizing (pure Python; no MLIR Context needed) ---------------------
     # Ping-pong A2 tiles via separate allocators (like stage1).
@@ -3057,8 +3081,33 @@ def compile_mixed_moe_gemm2(
     lds_tid_bytes = int(tile_m) * 4
     _input_elems = _single_x_bytes if a_elem_bytes == 1 else (_single_x_bytes // 2)
 
-    _pong_buffer_bytes = max(_single_x_bytes, lds_out_bytes)
-    _ping_buffer_bytes = _single_x_bytes
+    # persist-over-N: X(A2) is N-independent, so hold ALL K-tiles resident in LDS and
+    # reuse across the persist_n N-tiles (loaded once on the first N-tile). lds_out
+    # must NOT alias X (epilogue runs per N-tile while X stays live), so X gets the
+    # pong region (all K-tiles) and lds_out the ping region.
+    _num_k_tiles_resident = int(inter_dim) // int(tile_k)
+    # A2-resident static K-loop (all K-tiles loaded upfront -> deepest A2 prefetch +
+    # no per-K-tile ping-pong barriers). Auto-on for persist_n; also selectable at
+    # persist_n=1 via env for the latency-bound single-N-tile case.
+    _a2r_env = os.environ.get("AITER_FLYDSL_STAGE2_A2_RESIDENT", "").strip() in (
+        "1",
+        "true",
+        "True",
+        "yes",
+        "YES",
+    )
+    _a2_resident = (_persist_n > 1) or (
+        _a2r_env
+        and not _persistent
+        and int(xcd_swizzle) == 0
+        and int(inter_dim) % int(tile_k) == 0
+    )
+    if _a2_resident:
+        _pong_buffer_bytes = _num_k_tiles_resident * _single_x_bytes
+        _ping_buffer_bytes = max(_single_x_bytes, lds_out_bytes)
+    else:
+        _pong_buffer_bytes = max(_single_x_bytes, lds_out_bytes)
+        _ping_buffer_bytes = _single_x_bytes
 
     def x_lds_elem():
         return T.f16 if is_f16_a else (T.i8 if is_int8 else T.f8)
@@ -3203,22 +3252,48 @@ def compile_mixed_moe_gemm2(
 
             base_ptr_pong = allocator_pong.get_base()
             base_ptr_ping = allocator_ping.get_base()
-            lds_x_pong = SmemPtr(
-                base_ptr_pong, lds_pong_offset, x_lds_elem(), shape=(_input_elems,)
-            ).get()
-            lds_x_ping = SmemPtr(
-                base_ptr_ping, lds_ping_offset, x_lds_elem(), shape=(_input_elems,)
-            ).get()
-            lds_out = (
-                SmemPtr(
-                    base_ptr_pong,
-                    lds_pong_offset,
-                    (T.bf16 if out_is_bf16 else T.f16),
-                    shape=(tile_m * tile_n,),
+            if const_expr(_a2_resident):
+                # persist: X resident (all K-tiles) in pong; lds_out separate in ping
+                # (no alias) so X stays live across the persist_n N-tile epilogues.
+                _resident_x_bufs = [
+                    SmemPtr(
+                        base_ptr_pong,
+                        lds_pong_offset + _kk * _single_x_bytes,
+                        x_lds_elem(),
+                        shape=(_input_elems,),
+                    ).get()
+                    for _kk in range(_num_k_tiles_resident)
+                ]
+                lds_x_pong = _resident_x_bufs[0]
+                lds_x_ping = _resident_x_bufs[min(1, _num_k_tiles_resident - 1)]
+                lds_out = (
+                    SmemPtr(
+                        base_ptr_ping,
+                        lds_ping_offset,
+                        (T.bf16 if out_is_bf16 else T.f16),
+                        shape=(tile_m * tile_n,),
+                    ).get()
+                    if _use_cshuffle_epilog
+                    else None
+                )
+            else:
+                _resident_x_bufs = None
+                lds_x_pong = SmemPtr(
+                    base_ptr_pong, lds_pong_offset, x_lds_elem(), shape=(_input_elems,)
                 ).get()
-                if _use_cshuffle_epilog
-                else None
-            )
+                lds_x_ping = SmemPtr(
+                    base_ptr_ping, lds_ping_offset, x_lds_elem(), shape=(_input_elems,)
+                ).get()
+                lds_out = (
+                    SmemPtr(
+                        base_ptr_pong,
+                        lds_pong_offset,
+                        (T.bf16 if out_is_bf16 else T.f16),
+                        shape=(tile_m * tile_n,),
+                    ).get()
+                    if _use_cshuffle_epilog
+                    else None
+                )
             lds_tid = SmemPtr(
                 base_ptr_pong, _lds_tid_offset_pong, T.i32, shape=(tile_m,)
             ).get()
@@ -3423,7 +3498,11 @@ def compile_mixed_moe_gemm2(
             else:
                 _m_scale_shift_i32 = None
 
-            def _moe_gemm2_then_body():
+            def _moe_gemm2_then_body(by, is_first_ntile=True):
+                # `by` is the N-tile index (passed in so a persist-over-N caller can
+                # sweep several consecutive N-tiles in one WG); `is_first_ntile` gates
+                # the one-time A2-resident LDS load. For persist_n==1 this is called
+                # once with (by, True) -- byte-identical to the pre-persist body.
                 # Expert id for this M tile.
                 n_idx = arith.constant(model_dim, index=True)
                 expert_off_idx = expert_idx * n_idx  # index
@@ -4420,69 +4499,230 @@ def compile_mixed_moe_gemm2(
 
                 gpu.barrier()
 
-                # Prologue -- B-first + async DMA X(0) -> pong.
-                k0 = arith.index(0)
-                b_cur = _load_b_dispatch(k0)
-                a_scale_pong, b_scale_pong = _prefetch_scale_dispatch(0)
-                scale_opsel_pong = _scale_opsel(0)
-                rocdl.sched_barrier(0)
-                prefetch_x_to_lds(k0, lds_x_pong)
-                rocdl.s_waitcnt(0)
-                gpu.barrier()
+                if const_expr(_a2_resident):
+                    # ===== persist-over-N: A2 resident (all K-tiles) + static K-loop =====
+                    # X(A2) is N-independent: load each K-tile into its own resident LDS
+                    # slot once (first N-tile of this WG), then every N-tile reads the
+                    # resident copies -- no re-DMA and no ping-pong barriers per N-tile.
+                    _num_kt_pn = int(inter_dim) // int(tile_k)
+                    if const_expr(is_first_ntile):
+                        for _kt_pn in range_constexpr(_num_kt_pn):
+                            prefetch_x_to_lds(
+                                arith.index(_kt_pn * int(tile_k)),
+                                _resident_x_bufs[_kt_pn],
+                            )
+                        rocdl.s_waitcnt(0)
+                        gpu.barrier()
 
-                acc = [acc_init] * num_acc_n * m_repeat
+                    def _mk_bhi_pn(base_k):
+                        return lambda _bk=base_k: load_b_tile_hi(_bk)
 
-                # Cross-tile A0+A1 LDS prefetch from pong buffer.
-                a0_prefetch_pong = lds_load_packs_k64(
-                    row_a_lds, col_offset_base, lds_x_pong
-                )
-                _a1_col_base = col_offset_base + 128 // a_elem_vec_pack
-                a1_prefetch_pong = (
-                    lds_load_packs_k64(row_a_lds, _a1_col_base, lds_x_pong)
-                    if pack_K >= 2
-                    else None
-                )
-
-                # Main loop: process K tiles in 2-tile ping-pong steps.
-                #
-                # IMPORTANT: for odd number of K tiles, leave **1** tail tile; for even, leave **2**.
-                # Otherwise the 2-tile tail below would double-count the last tile when num_tiles is odd
-                # (e.g. inter_dim=192, tile_k=64 -> 3 tiles).
-                num_k_tiles_py = int(inter_dim) // int(tile_k)
-                odd_k_tiles = (num_k_tiles_py % 2) == 1
-                tail_tiles = 1 if odd_k_tiles else 2
-                k_main2_py = (num_k_tiles_py - tail_tiles) * int(tile_k)
-                if const_expr(k_main2_py < 0):
-                    k_main2_py = 0
-
-                c2_tile_k = arith.constant(tile_k * 2, index=True)
-                b_pong = b_cur
-                k0_pong_bk = k0
-
-                # Only emit the scf.for when there are actually iterations to run.
-                # When k_main2_py == 0 the loop body is empty; emitting an scf.for
-                # would create a region whose internal SSA values cannot be used
-                # by the post-loop tail code.
-                def _make_b_hi_loader(base_k):
-                    """Create a b_hi_loader callable for a given base_k."""
-                    return lambda _bk=base_k: load_b_tile_hi(_bk)
-
-                if const_expr(k_main2_py > 0):
-                    for k_iv_py in range_constexpr(0, k_main2_py, tile_k * 2):
+                    acc = [acc_init] * num_acc_n * m_repeat
+                    _a1_col_base = col_offset_base + 128 // a_elem_vec_pack
+                    epilogue_pf = None
+                    for _kt_pn in range_constexpr(_num_kt_pn):
                         rocdl.sched_barrier(0)
-                        k_iv = arith.index(k_iv_py)
-                        next_k1 = k_iv + tile_k
-                        next_k1_py = k_iv_py + tile_k
-                        next_k1_bk = next_k1 // 2
-                        # DMA X(next_k1) -> ping (non-blocking, overlaps with compute)
-                        prefetch_x_to_lds(next_k1, lds_x_ping)
-                        b_ping_lo = _load_b_dispatch(next_k1_bk)
-                        # NOTE: _prefetch_scale_dispatch -> _k_base / _k_shift_bits
-                        # require Python-int args so the compile-time scale
-                        # sub-group shift folds to a constant; pass next_k1_py, not
-                        # the MLIR Value next_k1, else arith.constant bad_casts.
-                        a_scale_ping, b_scale_ping = _prefetch_scale_dispatch(next_k1_py)
-                        scale_opsel_ping = _scale_opsel(k_iv_py + int(tile_k))
+                        _k_py_pn = _kt_pn * int(tile_k)
+                        _bk_pn = arith.index(_k_py_pn // 2)
+                        _b_pn = _load_b_dispatch(_bk_pn)
+                        _asc_pn, _bsc_pn = _prefetch_scale_dispatch(_k_py_pn)
+                        _opsel_pn = _scale_opsel(_k_py_pn)
+                        _buf_pn = _resident_x_bufs[_kt_pn]
+                        _a0_pn = lds_load_packs_k64(
+                            row_a_lds, col_offset_base, _buf_pn
+                        )
+                        _a1_pn = (
+                            lds_load_packs_k64(row_a_lds, _a1_col_base, _buf_pn)
+                            if pack_K >= 2
+                            else None
+                        )
+                        acc, epilogue_pf = compute_tile(
+                            acc,
+                            _b_pn,
+                            _buf_pn,
+                            _asc_pn,
+                            _bsc_pn,
+                            a0_prefetch=_a0_pn,
+                            a1_prefetch=_a1_pn,
+                            b_hi_loader=(
+                                _mk_bhi_pn(_bk_pn) if _b_split_enabled else None
+                            ),
+                            prefetch_epilogue=(_kt_pn == _num_kt_pn - 1),
+                            ku_count=k_unroll,
+                            scale_k_opsel=_opsel_pn,
+                        )
+                        hot_loop_scheduler()
+                else:
+                    # Prologue -- B-first + async DMA X(0) -> pong.
+                    k0 = arith.index(0)
+                    b_cur = _load_b_dispatch(k0)
+                    a_scale_pong, b_scale_pong = _prefetch_scale_dispatch(0)
+                    scale_opsel_pong = _scale_opsel(0)
+                    rocdl.sched_barrier(0)
+                    prefetch_x_to_lds(k0, lds_x_pong)
+                    rocdl.s_waitcnt(0)
+                    gpu.barrier()
+
+                    acc = [acc_init] * num_acc_n * m_repeat
+
+                    # Cross-tile A0+A1 LDS prefetch from pong buffer.
+                    a0_prefetch_pong = lds_load_packs_k64(
+                        row_a_lds, col_offset_base, lds_x_pong
+                    )
+                    _a1_col_base = col_offset_base + 128 // a_elem_vec_pack
+                    a1_prefetch_pong = (
+                        lds_load_packs_k64(row_a_lds, _a1_col_base, lds_x_pong)
+                        if pack_K >= 2
+                        else None
+                    )
+
+                    # Main loop: process K tiles in 2-tile ping-pong steps.
+                    #
+                    # IMPORTANT: for odd number of K tiles, leave **1** tail tile; for even, leave **2**.
+                    # Otherwise the 2-tile tail below would double-count the last tile when num_tiles is odd
+                    # (e.g. inter_dim=192, tile_k=64 -> 3 tiles).
+                    num_k_tiles_py = int(inter_dim) // int(tile_k)
+                    odd_k_tiles = (num_k_tiles_py % 2) == 1
+                    tail_tiles = 1 if odd_k_tiles else 2
+                    k_main2_py = (num_k_tiles_py - tail_tiles) * int(tile_k)
+                    if const_expr(k_main2_py < 0):
+                        k_main2_py = 0
+
+                    c2_tile_k = arith.constant(tile_k * 2, index=True)
+                    b_pong = b_cur
+                    k0_pong_bk = k0
+
+                    # Only emit the scf.for when there are actually iterations to run.
+                    # When k_main2_py == 0 the loop body is empty; emitting an scf.for
+                    # would create a region whose internal SSA values cannot be used
+                    # by the post-loop tail code.
+                    def _make_b_hi_loader(base_k):
+                        """Create a b_hi_loader callable for a given base_k."""
+                        return lambda _bk=base_k: load_b_tile_hi(_bk)
+
+                    if const_expr(k_main2_py > 0):
+                        for k_iv_py in range_constexpr(0, k_main2_py, tile_k * 2):
+                            rocdl.sched_barrier(0)
+                            k_iv = arith.index(k_iv_py)
+                            next_k1 = k_iv + tile_k
+                            next_k1_py = k_iv_py + tile_k
+                            next_k1_bk = next_k1 // 2
+                            # DMA X(next_k1) -> ping (non-blocking, overlaps with compute)
+                            prefetch_x_to_lds(next_k1, lds_x_ping)
+                            b_ping_lo = _load_b_dispatch(next_k1_bk)
+                            # NOTE: _prefetch_scale_dispatch -> _k_base / _k_shift_bits
+                            # require Python-int args so the compile-time scale
+                            # sub-group shift folds to a constant; pass next_k1_py, not
+                            # the MLIR Value next_k1, else arith.constant bad_casts.
+                            a_scale_ping, b_scale_ping = _prefetch_scale_dispatch(next_k1_py)
+                            scale_opsel_ping = _scale_opsel(k_iv_py + int(tile_k))
+
+                            acc, _ = compute_tile(
+                                acc,
+                                b_pong,
+                                lds_x_pong,
+                                a_scale_pong,
+                                b_scale_pong,
+                                a0_prefetch=a0_prefetch_pong,
+                                a1_prefetch=a1_prefetch_pong,
+                                b_hi_loader=(
+                                    _make_b_hi_loader(k0_pong_bk)
+                                    if _b_split_enabled
+                                    else None
+                                ),
+                                scale_k_opsel=scale_opsel_pong,
+                            )
+                            hot_loop_scheduler()
+                            rocdl.s_waitcnt(0)
+                            gpu.barrier()
+
+                            # Cross-tile prefetch for the ping tile we are about to compute.
+                            a0_prefetch_ping = lds_load_packs_k64(
+                                row_a_lds, col_offset_base, lds_x_ping
+                            )
+                            a1_prefetch_ping = (
+                                lds_load_packs_k64(row_a_lds, _a1_col_base, lds_x_ping)
+                                if pack_K >= 2
+                                else None
+                            )
+
+                            next_k2 = k_iv + c2_tile_k
+                            next_k2_py = k_iv_py + tile_k * 2
+                            next_k2_bk = next_k2 // 2
+                            # DMA X(next_k2) -> pong (non-blocking, overlaps with compute)
+                            prefetch_x_to_lds(next_k2, lds_x_pong)
+                            b_pong = _load_b_dispatch(next_k2_bk)
+                            a_scale_pong, b_scale_pong = _prefetch_scale_dispatch(next_k2_py)
+                            scale_opsel_pong = _scale_opsel(next_k2_py)
+
+                            acc, _ = compute_tile(
+                                acc,
+                                b_ping_lo,
+                                lds_x_ping,
+                                a_scale_ping,
+                                b_scale_ping,
+                                a0_prefetch=a0_prefetch_ping,
+                                a1_prefetch=a1_prefetch_ping,
+                                b_hi_loader=(
+                                    _make_b_hi_loader(next_k1_bk)
+                                    if _b_split_enabled
+                                    else None
+                                ),
+                                scale_k_opsel=scale_opsel_ping,
+                            )
+                            k0_pong_bk = next_k2_bk
+                            hot_loop_scheduler()
+                            gpu.barrier()
+
+                            # Cross-tile prefetch for the next pong tile.
+                            a0_prefetch_pong = lds_load_packs_k64(
+                                row_a_lds, col_offset_base, lds_x_pong
+                            )
+                            a1_prefetch_pong = (
+                                lds_load_packs_k64(row_a_lds, _a1_col_base, lds_x_pong)
+                                if pack_K >= 2
+                                else None
+                            )
+
+                    if const_expr(odd_k_tiles):
+                        # Tail: single remaining tile (already in pong buffer).
+                        acc, epilogue_pf = compute_tile(
+                            acc,
+                            b_pong,
+                            lds_x_pong,
+                            a_scale_pong,
+                            b_scale_pong,
+                            a0_prefetch=a0_prefetch_pong,
+                            a1_prefetch=a1_prefetch_pong,
+                            prefetch_epilogue=True,
+                            b_hi_loader=(
+                                _make_b_hi_loader(k0_pong_bk) if _b_split_enabled else None
+                            ),
+                            ku_count=_tail_ku_s2 if _pad_ku_skip_s2 > 0 else k_unroll,
+                            scale_k_opsel=scale_opsel_pong,
+                        )
+                    else:
+                        # Tail: 2 remaining tiles.
+                        k_tail1 = (k_in + tile_k - 1) // tile_k * tile_k - tile_k
+                        k_tail1_py = (
+                            int(inter_dim) + tile_k - 1
+                        ) // tile_k * tile_k - tile_k
+                        k_tail1_bk = k_tail1 // 2
+                        # DMA tail X -> ping
+                        prefetch_x_to_lds(k_tail1, lds_x_ping)
+                        if const_expr(_pad_ku_skip_s2 > 0):
+                            b_ping_lo = load_b_tile(k_tail1_bk, ku_limit=_tail_ku_s2)
+                            a_scale_ping, b_scale_ping = prefetch_ab_scale_tile(
+                                _k_base(k_tail1_py),
+                                _k_shift_bits(k_tail1_py),
+                                ku_packed_limit=_tail_ku_packed_s2,
+                            )
+                        else:
+                            b_ping_lo = _load_b_dispatch(k_tail1_bk)
+                            a_scale_ping, b_scale_ping = _prefetch_scale_dispatch(
+                                k_tail1_py
+                            )
+                        scale_opsel_ping = _scale_opsel(k_tail1_py)
 
                         acc, _ = compute_tile(
                             acc,
@@ -4493,36 +4733,25 @@ def compile_mixed_moe_gemm2(
                             a0_prefetch=a0_prefetch_pong,
                             a1_prefetch=a1_prefetch_pong,
                             b_hi_loader=(
-                                _make_b_hi_loader(k0_pong_bk)
-                                if _b_split_enabled
-                                else None
+                                _make_b_hi_loader(k0_pong_bk) if _b_split_enabled else None
                             ),
                             scale_k_opsel=scale_opsel_pong,
                         )
-                        hot_loop_scheduler()
+
+                        # hot_loop_scheduler()
                         rocdl.s_waitcnt(0)
                         gpu.barrier()
 
-                        # Cross-tile prefetch for the ping tile we are about to compute.
+                        # Epilogue tile with sw prefetch.
                         a0_prefetch_ping = lds_load_packs_k64(
                             row_a_lds, col_offset_base, lds_x_ping
                         )
                         a1_prefetch_ping = (
                             lds_load_packs_k64(row_a_lds, _a1_col_base, lds_x_ping)
-                            if pack_K >= 2
+                            if pack_K >= 2 and (_pad_ku_skip_s2 == 0 or _tail_ku_s2 >= 2)
                             else None
                         )
-
-                        next_k2 = k_iv + c2_tile_k
-                        next_k2_py = k_iv_py + tile_k * 2
-                        next_k2_bk = next_k2 // 2
-                        # DMA X(next_k2) -> pong (non-blocking, overlaps with compute)
-                        prefetch_x_to_lds(next_k2, lds_x_pong)
-                        b_pong = _load_b_dispatch(next_k2_bk)
-                        a_scale_pong, b_scale_pong = _prefetch_scale_dispatch(next_k2_py)
-                        scale_opsel_pong = _scale_opsel(next_k2_py)
-
-                        acc, _ = compute_tile(
+                        acc, epilogue_pf = compute_tile(
                             acc,
                             b_ping_lo,
                             lds_x_ping,
@@ -4530,115 +4759,19 @@ def compile_mixed_moe_gemm2(
                             b_scale_ping,
                             a0_prefetch=a0_prefetch_ping,
                             a1_prefetch=a1_prefetch_ping,
+                            prefetch_epilogue=True,
                             b_hi_loader=(
-                                _make_b_hi_loader(next_k1_bk)
-                                if _b_split_enabled
-                                else None
+                                None
+                                if _pad_ku_skip_s2 > 0
+                                else (
+                                    _make_b_hi_loader(k_tail1_bk)
+                                    if _b_split_enabled
+                                    else None
+                                )
                             ),
+                            ku_count=_tail_ku_s2 if _pad_ku_skip_s2 > 0 else k_unroll,
                             scale_k_opsel=scale_opsel_ping,
                         )
-                        k0_pong_bk = next_k2_bk
-                        hot_loop_scheduler()
-                        gpu.barrier()
-
-                        # Cross-tile prefetch for the next pong tile.
-                        a0_prefetch_pong = lds_load_packs_k64(
-                            row_a_lds, col_offset_base, lds_x_pong
-                        )
-                        a1_prefetch_pong = (
-                            lds_load_packs_k64(row_a_lds, _a1_col_base, lds_x_pong)
-                            if pack_K >= 2
-                            else None
-                        )
-
-                if const_expr(odd_k_tiles):
-                    # Tail: single remaining tile (already in pong buffer).
-                    acc, epilogue_pf = compute_tile(
-                        acc,
-                        b_pong,
-                        lds_x_pong,
-                        a_scale_pong,
-                        b_scale_pong,
-                        a0_prefetch=a0_prefetch_pong,
-                        a1_prefetch=a1_prefetch_pong,
-                        prefetch_epilogue=True,
-                        b_hi_loader=(
-                            _make_b_hi_loader(k0_pong_bk) if _b_split_enabled else None
-                        ),
-                        ku_count=_tail_ku_s2 if _pad_ku_skip_s2 > 0 else k_unroll,
-                        scale_k_opsel=scale_opsel_pong,
-                    )
-                else:
-                    # Tail: 2 remaining tiles.
-                    k_tail1 = (k_in + tile_k - 1) // tile_k * tile_k - tile_k
-                    k_tail1_py = (
-                        int(inter_dim) + tile_k - 1
-                    ) // tile_k * tile_k - tile_k
-                    k_tail1_bk = k_tail1 // 2
-                    # DMA tail X -> ping
-                    prefetch_x_to_lds(k_tail1, lds_x_ping)
-                    if const_expr(_pad_ku_skip_s2 > 0):
-                        b_ping_lo = load_b_tile(k_tail1_bk, ku_limit=_tail_ku_s2)
-                        a_scale_ping, b_scale_ping = prefetch_ab_scale_tile(
-                            _k_base(k_tail1_py),
-                            _k_shift_bits(k_tail1_py),
-                            ku_packed_limit=_tail_ku_packed_s2,
-                        )
-                    else:
-                        b_ping_lo = _load_b_dispatch(k_tail1_bk)
-                        a_scale_ping, b_scale_ping = _prefetch_scale_dispatch(
-                            k_tail1_py
-                        )
-                    scale_opsel_ping = _scale_opsel(k_tail1_py)
-
-                    acc, _ = compute_tile(
-                        acc,
-                        b_pong,
-                        lds_x_pong,
-                        a_scale_pong,
-                        b_scale_pong,
-                        a0_prefetch=a0_prefetch_pong,
-                        a1_prefetch=a1_prefetch_pong,
-                        b_hi_loader=(
-                            _make_b_hi_loader(k0_pong_bk) if _b_split_enabled else None
-                        ),
-                        scale_k_opsel=scale_opsel_pong,
-                    )
-
-                    # hot_loop_scheduler()
-                    rocdl.s_waitcnt(0)
-                    gpu.barrier()
-
-                    # Epilogue tile with sw prefetch.
-                    a0_prefetch_ping = lds_load_packs_k64(
-                        row_a_lds, col_offset_base, lds_x_ping
-                    )
-                    a1_prefetch_ping = (
-                        lds_load_packs_k64(row_a_lds, _a1_col_base, lds_x_ping)
-                        if pack_K >= 2 and (_pad_ku_skip_s2 == 0 or _tail_ku_s2 >= 2)
-                        else None
-                    )
-                    acc, epilogue_pf = compute_tile(
-                        acc,
-                        b_ping_lo,
-                        lds_x_ping,
-                        a_scale_ping,
-                        b_scale_ping,
-                        a0_prefetch=a0_prefetch_ping,
-                        a1_prefetch=a1_prefetch_ping,
-                        prefetch_epilogue=True,
-                        b_hi_loader=(
-                            None
-                            if _pad_ku_skip_s2 > 0
-                            else (
-                                _make_b_hi_loader(k_tail1_bk)
-                                if _b_split_enabled
-                                else None
-                            )
-                        ),
-                        ku_count=_tail_ku_s2 if _pad_ku_skip_s2 > 0 else k_unroll,
-                        scale_k_opsel=scale_opsel_ping,
-                    )
 
                 # ---------------- Epilogue: LDS CShuffle + atomic half2 (x2) ----------------
                 # Reuse the shared helper so GEMM / MoE kernels share the exact same CShuffle skeleton.
@@ -4843,7 +4976,8 @@ def compile_mixed_moe_gemm2(
                 )
                 _if_valid = scf.IfOp(_do_gemm)
                 with ir.InsertionPoint(_if_valid.then_block):
-                    _moe_gemm2_then_body()
+                    # persistent path never enables persist_n (guarded at resolution).
+                    _moe_gemm2_then_body(by, True)
                     scf.YieldOp([])
 
                 gpu.barrier()
@@ -4851,7 +4985,20 @@ def compile_mixed_moe_gemm2(
             else:
                 _if_valid = scf.IfOp(_all_valid)
                 with ir.InsertionPoint(_if_valid.then_block):
-                    _moe_gemm2_then_body()
+                    if const_expr(_persist_n > 1):
+                        # persist-over-N: one WG sweeps _persist_n consecutive N-tiles,
+                        # reusing the A2-resident LDS loaded on the first N-tile.
+                        _by_base_pn = by * arith.constant(_persist_n, index=True)
+                        for _jn_pn in range_constexpr(_persist_n):
+                            _moe_gemm2_then_body(
+                                _by_base_pn + arith.constant(_jn_pn, index=True),
+                                _jn_pn == 0,
+                            )
+                            if const_expr(_jn_pn != _persist_n - 1):
+                                # protect lds_out reuse between N-tile epilogues
+                                gpu.barrier()
+                    else:
+                        _moe_gemm2_then_body(by, True)
                     scf.YieldOp([])
 
                 gpu.barrier()
@@ -4911,6 +5058,9 @@ def compile_mixed_moe_gemm2(
         gx = (
             n_in - _model_dim_pad_idx + _tile_n_idx - arith.constant(1, index=True)
         ) / _tile_n_idx
+        if const_expr(_persist_n > 1):
+            # persist-over-N: each WG covers _persist_n N-tiles -> fewer grid-X WGs.
+            gx = gx / arith.constant(_persist_n, index=True)
         if const_expr(_persistent):
             gy = arith.constant(_cu_num, index=True)
         else:
