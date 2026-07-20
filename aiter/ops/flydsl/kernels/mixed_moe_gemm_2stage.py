@@ -3262,37 +3262,53 @@ def compile_mixed_moe_gemm2(
             num_valid_i32 = buffer_ops.buffer_load(
                 numids_rsrc, arith.constant(0, index=True), vec_width=1, dtype=T.i32
             )
-            # num_valid_ids is a scalar (same value for all lanes) loaded into
-            # VGPR.  Promote to SGPR so downstream buffer resource descriptors
-            # that use it for num_records stay in SGPRs, eliminating the
-            # expensive waterfall loop the compiler would otherwise emit.
-            num_valid_i32 = rocdl.ReadfirstlaneOp(T.i32, num_valid_i32).res
-            num_valid_idx = arith.index_cast(ir.IndexType.get(), num_valid_i32)
+            # num_valid_ids is a scalar (same value for all lanes) loaded into VGPR.
+            # It must be promoted to SGPR (readfirstlane) so scale-resource
+            # num_records stay in SGPRs (avoids a waterfall loop). The readfirstlane
+            # forces the vmcnt wait for this load, so WHERE we place it matters:
+            #  - persistent schedule: num_valid sets the loop bounds -> must resolve
+            #    eagerly here (before the loop).
+            #  - default fixed-persist_m schedule: num_valid is only needed at the
+            #    per-tile validity guard / A2-scale resource, so DEFER the resolve +
+            #    scale-resource build into the loop body, issued AFTER the per-tile
+            #    expert/first-token buffer_loads. That way all three uniform-scalar
+            #    loads (num_valid, expert id, first token) are in flight together and
+            #    collapse into a single overlapped vmcnt wait instead of two serial
+            #    waits (num_valid, then expert/first_tok).
+            _num_valid_i32_raw = num_valid_i32  # VGPR (pre-readfirstlane)
 
-            # fp16 path ignores scales completely (implicit scale=1.0).
-            sx_rsrc = 1
-            sw_rsrc = 1
-            if const_expr(not is_f16_a):
+            def _resolve_num_valid():
+                _nv = rocdl.ReadfirstlaneOp(T.i32, _num_valid_i32_raw).res
+                return _nv, arith.index_cast(ir.IndexType.get(), _nv)
+
+            def _build_sx_rsrc(_nv_idx):
+                # fp16 path ignores scales completely (implicit scale=1.0).
+                if const_expr(is_f16_a):
+                    return 1
                 if const_expr(is_f4_a or is_f8_a):
                     # A2 microscale: e8m0 in sorted layout [sorted_size, K/32].
-                    # Caller must pre-scatter a2_scale via moe_mxfp4_sort.
-                    # The scale is read via `layout_a_scale` (built with the
-                    # padded c_k=`scale_k_padded`), so the sorted scale tensor
-                    # MUST be K-padded to `scale_kblk_padded` columns and
-                    # num_records MUST use the SAME padded K/32 — otherwise the
-                    # 16-wide layout reads either get OOB-clamped to 0 (sx too
-                    # small -> lost scales) or overrun an unpadded tensor (sx too
-                    # large -> garbage). Both halves (kernel + caller padding)
-                    # are required.
-                    kblk = arith.constant(scale_kblk_padded, index=True)  # padded K/32
-                    sx_nbytes_idx = num_valid_idx * kblk
-                    sx_nbytes_i32 = arith.index_cast(T.i32, sx_nbytes_idx)
-                    sx_rsrc = _ptr_buffer_resource(arg_scale_x, sx_nbytes_i32)
-                else:
-                    # scale_x (A2 scale): [tokens*topk] f32 -> bytes = tokens*topk*4
-                    sx_nbytes_idx = (tokens_in * c_topk) * arith.constant(4, index=True)
-                    sx_nbytes_i32 = arith.index_cast(T.i32, sx_nbytes_idx)
-                    sx_rsrc = _ptr_buffer_resource(arg_scale_x, sx_nbytes_i32)
+                    # num_records MUST use the SAME padded K/32 as `layout_a_scale`
+                    # (built with padded c_k=`scale_k_padded`), else 16-wide reads
+                    # get OOB-clamped to 0 (lost scales) or overrun (garbage).
+                    _kblk = arith.constant(scale_kblk_padded, index=True)
+                    _nb = arith.index_cast(T.i32, _nv_idx * _kblk)
+                    return _ptr_buffer_resource(arg_scale_x, _nb)
+                # scale_x (A2 scale): [tokens*topk] f32 -> bytes = tokens*topk*4
+                _nb = arith.index_cast(
+                    T.i32, (tokens_in * c_topk) * arith.constant(4, index=True)
+                )
+                return _ptr_buffer_resource(arg_scale_x, _nb)
+
+            sw_rsrc = 1
+            if const_expr(_persistent):
+                num_valid_i32, num_valid_idx = _resolve_num_valid()
+                sx_rsrc = _build_sx_rsrc(num_valid_idx)
+            else:
+                # deferred: num_valid_i32 stays VGPR here; the scalar value,
+                # num_valid_idx and sx_rsrc are assigned in the loop body below.
+                num_valid_i32 = _num_valid_i32_raw
+                num_valid_idx = None
+                sx_rsrc = None
 
             if const_expr(not is_f16_b):
                 # Weight microscale buffer (packed i32 holding e8m0 bytes).
@@ -3374,15 +3390,30 @@ def compile_mixed_moe_gemm2(
                 bx = bx_persist * arith.constant(persist_m, index=True) + _mi_p
 
             bx_m = bx * arith.constant(tile_m, index=True)
-
-            # Early-exit guard: skip garbage expert blocks beyond `num_valid_ids`.
             bx_m_i32 = arith.index_cast(T.i32, bx_m)
-            blk_valid = arith.cmpi(CmpIPredicate.ult, bx_m_i32, num_valid_i32)
 
+            # Issue the two per-tile uniform-scalar loads (expert id, first token)
+            # up-front, BEFORE resolving num_valid, so all three uniform loads
+            # (num_valid issued pre-loop + these two) are in flight together and
+            # collapse into one overlapped vmcnt wait at the validity guard below,
+            # instead of two serial waits (num_valid, then expert/first_tok).
             sort_blk = _div_pow2(bx_m, _sort_block_m)
             expert_i32 = buffer_ops.buffer_load(
                 expert_rsrc, sort_blk, vec_width=1, dtype=T.i32
             )
+            _first_tok = buffer_ops.buffer_load(
+                sorted_rsrc, bx_m, vec_width=1, dtype=T.i32
+            )
+
+            # Deferred num_valid resolve + A2-scale resource (fixed-persist_m path;
+            # the persistent schedule already resolved these before the loop).
+            if const_expr(not _persistent):
+                num_valid_i32, num_valid_idx = _resolve_num_valid()
+                sx_rsrc = _build_sx_rsrc(num_valid_idx)
+
+            # Early-exit guard: skip garbage expert blocks beyond `num_valid_ids`.
+            blk_valid = arith.cmpi(CmpIPredicate.ult, bx_m_i32, num_valid_i32)
+
             expert_idx = arith.index_cast(ir.IndexType.get(), expert_i32)
             exp_valid = arith.cmpi(
                 CmpIPredicate.ult, expert_i32, arith.constant(experts, type=T.i32)
@@ -3404,9 +3435,6 @@ def compile_mixed_moe_gemm2(
 
             # Early-exit: if the first row of this tile is a sentinel (all-padding tile),
             # skip the entire GEMM.
-            _first_tok = buffer_ops.buffer_load(
-                sorted_rsrc, bx_m, vec_width=1, dtype=T.i32
-            )
             _first_tid = arith.andi(_first_tok, arith.constant(0xFFFFFF, type=T.i32))
             _tokens_i32_guard = arith.index_cast(T.i32, tokens_in)
             tile_has_tokens = arith.cmpi(
