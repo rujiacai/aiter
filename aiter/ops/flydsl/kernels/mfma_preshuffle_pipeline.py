@@ -559,6 +559,198 @@ def unpack_b_w4a16_mxfp4(packed32, arith, vector, scale_val=None):
     return (b0, b1)
 
 
+def _e2m1x4_in_i32_to_fp8x4_i32(val_i32, arith, vector, ratios=None):
+    """Convert one i32 (4 e2m1 nibble codes as 4 bytes) to 4 fp8 (e4m3fnuz) in an i32.
+
+    e2m1 code -> bf16 bits -> f32 -> (optional * ratio, a power-of-2 fold factor) ->
+    v_cvt_pk_fp8_f32. ``ratios`` is None (no fold, a8w4 Phase-1 UNIFORM/PAIR) or a
+    length-4 list of f32 fold factors (2^(exp_g - base)) for the a8w4 in-kernel fold.
+
+    The e2m1 code 8 is -0.0; e4m3fnuz encodes -0 as 0x80 (NaN), so we add +0.0
+    (IEEE: -0.0 + 0.0 = +0.0) to normalize -0 -> +0 before the cvt (matches torch
+    ``.to(float8_e4m3fnuz)`` which the Phase-1 proto validated byte-exact).
+    """
+    from flydsl.expr import rocdl
+
+    v1 = vector.from_elements(T.vec(1, T.i32), [val_i32])
+    i8x4 = vector.bitcast(T.i8x4, v1)
+    c_pzero = fx.Float32(0.0)
+    f32_vals = []
+    for i in range(4):
+        byte_i8 = vector.extract(i8x4, static_position=[i], dynamic_position=[])
+        code_i32 = _arith.extui(T.i32, _arith._to_raw(byte_i8))
+        bf16_hi = _e2m1_byte_to_bf16_bits(fx.Int32(code_i32), arith)
+        v = arith.bitcast(T.f32, _arith._to_raw(bf16_hi << fx.Int32(16)))
+        if ratios is not None:
+            v = v * ratios[i]
+        # normalize -0.0 -> +0.0 (e4m3fnuz -0 == 0x80 NaN)
+        v = v + c_pzero
+        f32_vals.append(_arith._to_raw(v))
+    p = _arith._to_raw(fx.Int32(0))
+    p = rocdl.cvt_pk_fp8_f32(T.i32, f32_vals[0], f32_vals[1], p, 0)
+    p = rocdl.cvt_pk_fp8_f32(T.i32, f32_vals[2], f32_vals[3], p, 1)
+    return p
+
+
+def unpack_b_w4a16_mxfp4_to_fp8(packed32, arith, vector, ratios_even=None, ratios_odd=None):
+    """Unpack packed32 (8 e2m1 codes) -> i64 (8 fp8) for one K32 fp8 MFMA operand.
+
+    Mirrors the int4 W4A8 pack layout (:func:`load_b_pack_k32` unpack_int4 path):
+    even nibbles -> low 4 fp8 bytes, odd nibbles -> high 4 fp8 bytes of the i64.
+    ``ratios_even``/``ratios_odd`` are None (no fold) or length-4 f32 fold factors
+    for the a8w4 in-kernel per-element ratio-fold.
+    """
+    even, odd = _unpack_mxfp4_nibble_pair(packed32)
+    fe = _e2m1x4_in_i32_to_fp8x4_i32(even, arith, vector, ratios=ratios_even)
+    fo = _e2m1x4_in_i32_to_fp8x4_i32(odd, arith, vector, ratios=ratios_odd)
+    return _pack_i32_pair_to_i64(fe, fo, vector)
+
+
+def load_b_pack_k32_pair_raw(
+    buffer_ops,
+    arith,
+    vector,
+    *,
+    b_rsrc,
+    layout_b,
+    base_k: ir.Value,
+    ku: int,
+    n_blk: ir.Value,
+    n_intra: ir.Value,
+    lane_div_16: ir.Value,
+    elem_type: ir.Type,
+    kpack_bytes: int = 8,
+    elem_bytes: int = 1,
+):
+    """Load BOTH K32 operands (r0, r1) of one K64 micro-step in ONE wide buffer
+    load, matching the mxfp8 path's ``dwordx4`` load.
+
+    The two operands of a K64 step are the two halves of one 8-byte kpack
+    (r0 = bytes[0:4], r1 = bytes[4:8]); the packed-int4 raw path used to load
+    them as two separate ``dword`` loads (2x the B-load instructions of the
+    mxfp8 ``dwordx4``). Loading the whole kpack once (``dwordx2``) halves the
+    B-load instruction count -- the real a8w4 Phase-1 bottleneck (the unpack ALU
+    is largely hidden by MFMA). Returns (packed32_r0, packed32_r1).
+    """
+    c64 = fx.Index(64)
+    base_k_bytes = base_k * arith.constant(int(elem_bytes), index=True)
+    k0 = base_k_bytes // c64 + arith.constant(int(ku), index=True)
+    k1 = lane_div_16
+    coord_pack = (n_blk, k0, k1, n_intra, fx.Index(0))
+    idx_pack = crd2idx(tuple(fx.Int32(c) for c in coord_pack), layout_b)
+    # one dwordx2 (8 bytes) = the full kpack = both K32 operands.
+    b8 = _buffer_load_vec(
+        buffer_ops,
+        vector,
+        b_rsrc,
+        idx_pack,
+        elem_type=elem_type,
+        vec_elems=8,
+        elem_bytes=1,
+        offset_in_bytes=True,
+    )
+    b_i32x2 = vector.bitcast(T.vec(2, T.i32), b8)
+    r0 = vector.extract(b_i32x2, static_position=[0], dynamic_position=[])
+    r1 = vector.extract(b_i32x2, static_position=[1], dynamic_position=[])
+    return r0, r1
+
+
+def _e2m1_code_to_fp8_byte_fold(code_i32, r_i32, arith):
+    """e2m1 nibble code (i32, 0..15) + integer exp-shift r (i32, <=0) -> fp8
+    e4m3fnuz byte (i32), via PURE integer bit-ops (no bf16/f32 detour, no cvt).
+
+    Reproduces ``(e2m1_value * 2^r).to(float8_e4m3fnuz)``: handles normal,
+    subnormal (round-to-nearest-even), flush-to-0 and fnuz -0->+0. Validated
+    byte-exact for all (code, r) by aiter_logs/proto_a8w4_fp8bits.py.
+
+    Optimization for a8w4 Phase-1: e2m1 (mant<={0,1}) -> fp8 e4m3fnuz is exact in
+    the normal range, and the per-pair ratio (a power of 2) folds into the fp8
+    exponent as an integer add -- so the whole unpack+fold is integer bit-ops,
+    replacing the e2m1->bf16->f32->(*ratio f32)->cvt_pk_fp8 chain.
+    """
+    _r = _arith._to_raw
+    P = _arith.CmpIPredicate
+    c0 = fx.Int32(0)
+    c1 = fx.Int32(1)
+    c2 = fx.Int32(2)
+    c3 = fx.Int32(3)
+    c7 = fx.Int32(7)
+    c8 = fx.Int32(8)
+    c31 = fx.Int32(31)
+    s = (code_i32 >> c3) & c1
+    e = (code_i32 >> c1) & c3
+    m = code_i32 & c1
+    is_e0 = _arith.cmpi(P.eq, _r(e), _r(c0))
+    is_zero = _arith.andi(is_e0, _arith.cmpi(P.eq, _r(m), _r(c0)))
+    # e2m1 magnitude as mant4 (=1.MMM*8, so {8,12}) and unbiased exponent uexp.
+    mant4 = fx.Int32(_arith.select(is_e0, _r(c8), _r(c8 + (m << c2))))
+    uexp = fx.Int32(_arith.select(is_e0, _r(fx.Int32(-1)), _r(e - c1)))
+    # fold ratio 2^r into the exponent; fp8 normal exp field E = uexp + r + 8.
+    E = uexp + r_i32 + c8
+    byte_n = (s << c7) | (E << c3) | (mant4 - c8)
+    # underflow (E<1) -> subnormal mant_sub = round_even(mant4 >> (1-E)).
+    shift0 = c1 - E
+    shift = fx.Int32(
+        _arith.select(
+            _arith.cmpi(P.slt, _r(shift0), _r(c1)),
+            _r(c1),
+            _arith.select(
+                _arith.cmpi(P.sgt, _r(shift0), _r(c31)), _r(c31), _r(shift0)
+            ),
+        )
+    )
+    floor = mant4 >> shift
+    rem = mant4 - (floor << shift)
+    half = c1 << (shift - c1)
+    round_up = _arith.ori(
+        _arith.cmpi(P.sgt, _r(rem), _r(half)),
+        _arith.andi(
+            _arith.cmpi(P.eq, _r(rem), _r(half)),
+            _arith.cmpi(P.ne, _r(floor & c1), _r(c0)),
+        ),
+    )
+    msub = floor + fx.Int32(_arith.select(round_up, _r(c1), _r(c0)))
+    # e2m1 mant4<=12, shift>=1 -> msub<=6 <8, so no subnormal->normal overflow.
+    byte_s = (s << c7) | msub
+    byte_s = fx.Int32(
+        _arith.select(_arith.cmpi(P.eq, _r(msub), _r(c0)), _r(c0), _r(byte_s))
+    )
+    byte = fx.Int32(
+        _arith.select(_arith.cmpi(P.sge, _r(E), _r(c1)), _r(byte_n), _r(byte_s))
+    )
+    byte = fx.Int32(_arith.select(is_zero, _r(c0), _r(byte)))
+    return byte & fx.Int32(0xFF)
+
+
+def _e2m1x4_in_i32_to_fp8x4_i32_bitfold(val_i32, r_i32, arith, vector):
+    """4 e2m1 codes (as 4 bytes in an i32) + integer exp-shift r -> 4 fp8 in an i32.
+
+    Pure integer path (see :func:`_e2m1_code_to_fp8_byte_fold`); all 4 share r
+    (a8w4 Phase-1 per-lane fold). Packs 4 fp8 bytes little-endian into the i32.
+    """
+    v1 = vector.from_elements(T.vec(1, T.i32), [val_i32])
+    i8x4 = vector.bitcast(T.i8x4, v1)
+    c8b = fx.Int32(8)
+    c16 = fx.Int32(16)
+    c24 = fx.Int32(24)
+    b = []
+    for i in range(4):
+        byte_i8 = vector.extract(i8x4, static_position=[i], dynamic_position=[])
+        code = fx.Int32(_arith.extui(T.i32, _arith._to_raw(byte_i8)))
+        b.append(_e2m1_code_to_fp8_byte_fold(code, r_i32, arith))
+    return b[0] | (b[1] << c8b) | (b[2] << c16) | (b[3] << c24)
+
+
+def unpack_b_w4a16_mxfp4_to_fp8_bitfold(packed32, r_i32, arith, vector):
+    """Integer-only variant of :func:`unpack_b_w4a16_mxfp4_to_fp8`: packed32
+    (8 e2m1 codes) + per-lane integer exp-shift r -> i64 (8 fp8) for one K32 fp8
+    MFMA operand. No f32 detour / no cvt (see _e2m1_code_to_fp8_byte_fold)."""
+    even, odd = _unpack_mxfp4_nibble_pair(packed32)
+    fe = _e2m1x4_in_i32_to_fp8x4_i32_bitfold(even, r_i32, arith, vector)
+    fo = _e2m1x4_in_i32_to_fp8x4_i32_bitfold(odd, r_i32, arith, vector)
+    return _pack_i32_pair_to_i64(fe, fo, vector)
+
+
 def load_b_pack_k32(
     buffer_ops,
     arith,
@@ -576,10 +768,14 @@ def load_b_pack_k32(
     kpack_bytes: int = 16,
     elem_bytes: int = 1,
     unpack_int4: bool = False,
+    raw_packed: bool = False,
 ) -> ir.Value:
     """Load one B pack for one MFMA(x32) micro-step.
 
     Returns an i64 Value containing 8 bytes consumed by MFMA.
+    When ``raw_packed`` (packed-int4 weight, e.g. a8w4 Phase-1 mxfp4_fp8), returns
+    the raw i32 ``packed32`` (8 nibble codes) instead — the caller unpacks + folds
+    e2m1->fp8 with the per-group scale in the B-load/compute stage.
     """
     if kpack_bytes not in (8, 16):
         raise ValueError(f"kpack_bytes must be 8 or 16, got {kpack_bytes!r}")
@@ -599,7 +795,7 @@ def load_b_pack_k32(
     coord_pack = (n_blk, k0, k1, n_intra, fx.Index(0))
     idx_pack = crd2idx(tuple(fx.Int32(c) for c in coord_pack), layout_b)
 
-    if unpack_int4:
+    if unpack_int4 or raw_packed:
         idx_bytes = idx_pack + k2_base
         b4 = _buffer_load_vec(
             buffer_ops,
@@ -616,6 +812,8 @@ def load_b_pack_k32(
             static_position=[0],
             dynamic_position=[],
         )
+        if raw_packed:
+            return packed32
         even, odd = _unpack_int4_to_int8_pair(packed32)
         return _pack_i32_pair_to_i64(even, odd, vector)
 

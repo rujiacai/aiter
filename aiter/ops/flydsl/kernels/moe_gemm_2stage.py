@@ -55,6 +55,9 @@ from .mfma_preshuffle_pipeline import (
     load_b_raw_w4a16,
     unpack_b_w4a16,
     unpack_b_w4a16_mxfp4,
+    unpack_b_w4a16_mxfp4_to_fp8,
+    unpack_b_w4a16_mxfp4_to_fp8_bitfold,
+    load_b_pack_k32_pair_raw,
     load_b_raw_w4a16_groupwise,
     _load_groupwise_scale,
     extract_bf16_scale,
@@ -64,6 +67,55 @@ from .mfma_preshuffle_pipeline import (
 )
 from .mfma_epilogues import c_shuffle_epilog, default_epilog, mfma_epilog
 from .tensor_shim import _run_compiled
+
+
+def _mxfp4_fp8_fold_operands(r0, r1, sc, is_B, bitfold, arith, vector):
+    """a8w4 Phase-1 per-lane ratio-fold, shared by stage1/stage2 B-load.
+
+    Inputs: raw packed-4bit operands r0/r1 (the pair's 2 K32 MFMA operands) + the
+    per-pair E8M0 bf16 scale dword ``sc``; ``is_B`` picks the lane's group
+    (lane_div_16>=2 -> group B). Returns (b0, b1) fp8 K32 operands folded by
+    2^(exp_g - base) and ``sc_out`` = 2^base packed into both bf16 halves
+    (compute applies it post-MFMA).
+
+    ``bitfold`` selects the impl:
+      - False (default): e2m1->bf16->f32 ->(*ratio f32)-> cvt_pk_fp8 (hardware cvt).
+      - True (AITER_A8W4_BITFOLD=1): pure integer e2m1->fp8 bit-construct with the
+        ratio folded into the fp8 exponent (no f32 detour / no cvt).
+    """
+    _uw = arith._to_raw
+    scA = extract_bf16_scale(arith, sc, 0)
+    scB = extract_bf16_scale(arith, sc, 1)
+    if bitfold:
+        # integer exponent fields (scales are pure powers of 2; the +127/mantissa
+        # cancel in the difference). r = exp_g - max(expA, expB) <= 0.
+        eA = (arith.bitcast(T.i32, _uw(scA)) >> fx.Int32(23)) & fx.Int32(0xFF)
+        eB = (arith.bitcast(T.i32, _uw(scB)) >> fx.Int32(23)) & fx.Int32(0xFF)
+        _a_ge = arith.cmpi(arith.CmpIPredicate.sge, _uw(eA), _uw(eB))
+        base_e = fx.Int32(arith.select(_a_ge, _uw(eA), _uw(eB)))
+        r = fx.Int32(
+            arith.select(is_B, _uw(eB - base_e), _uw(eA - base_e))
+        )
+        b0 = unpack_b_w4a16_mxfp4_to_fp8_bitfold(r0, r, arith, vector)
+        b1 = unpack_b_w4a16_mxfp4_to_fp8_bitfold(r1, r, arith, vector)
+        base_f32 = arith.select(_a_ge, _uw(scA), _uw(scB))
+        _bb = (arith.bitcast(T.i32, base_f32) >> fx.Int32(16)) & fx.Int32(0xFFFF)
+    else:
+        base = arith.ArithValue(arith.maximumf(_uw(scA), _uw(scB)))
+        _base_raw = _uw(base)
+        ratioA = arith.divf(_uw(scA), _base_raw)
+        ratioB = arith.divf(_uw(scB), _base_raw)
+        ratio = arith.ArithValue(arith.select(is_B, ratioB, ratioA))
+        rr = [ratio, ratio, ratio, ratio]
+        b0 = unpack_b_w4a16_mxfp4_to_fp8(
+            r0, arith, vector, ratios_even=rr, ratios_odd=rr
+        )
+        b1 = unpack_b_w4a16_mxfp4_to_fp8(
+            r1, arith, vector, ratios_even=rr, ratios_odd=rr
+        )
+        _bb = (arith.bitcast(T.i32, _base_raw) >> fx.Int32(16)) & fx.Int32(0xFFFF)
+    sc_out = _bb | (_bb << fx.Int32(16))
+    return b0, b1, sc_out
 
 
 @contextmanager
@@ -142,6 +194,7 @@ def compile_moe_gemm1(
         "int4_bf16",
         "mxfp4_bf16",
         "mxfp8",
+        "mxfp4_fp8",
     )
     if in_dtype not in _valid_dtypes:
         raise ValueError(f"in_dtype must be one of {_valid_dtypes}, got {in_dtype!r}")
@@ -151,6 +204,7 @@ def compile_moe_gemm1(
     # that one difference; is_int4_bf16 stays True so all shared paths are reused.
     is_mxfp4_bf16 = in_dtype == "mxfp4_bf16"
     is_mxfp8 = in_dtype == "mxfp8"  # a8w4 Phase0: fp8 weight + E8M0 per-32 microscale
+    is_mxfp4_fp8 = in_dtype == "mxfp4_fp8"  # a8w4 Phase1: packed-4bit weight, unpack->fp8 in-kernel
     is_int4_bf16 = (
         in_dtype == "int4_bf16" or is_mxfp4_bf16
     )  # W4A16: bf16 activations, packed 4-bit weights
@@ -183,7 +237,7 @@ def compile_moe_gemm1(
     is_int8 = is_int8 or x_is_token_slot
 
     # w_is_int4: True for any variant where weights are packed int4.
-    w_is_int4 = is_int4 or is_int4_bf16
+    w_is_int4 = is_int4 or is_int4_bf16 or is_mxfp4_fp8
 
     # Group-wise scale support for W4A16
     # NOTE: Only group_size=32 is supported due to int4 preshuffle layout constraints.
@@ -196,6 +250,7 @@ def compile_moe_gemm1(
         )
     is_int4_bf16_groupwise = is_int4_bf16 and use_groupwise_scale
     is_mxfp8_groupwise = is_mxfp8 and use_groupwise_scale
+    is_mxfp4_fp8_groupwise = is_mxfp4_fp8 and use_groupwise_scale
     num_groups = model_dim // group_size if use_groupwise_scale else 1
     _scale_is_bf16 = scale_is_bf16 and use_groupwise_scale
     experts * (2 * inter_dim) * num_groups
@@ -432,7 +487,7 @@ def compile_moe_gemm1(
             )
             zero_f32_acc = (
                 arith.constant_vector(0.0, T.f32x4)
-                if (is_int4_bf16_groupwise or is_mxfp8_groupwise)
+                if (is_int4_bf16_groupwise or is_mxfp8_groupwise or is_mxfp4_fp8_groupwise)
                 else None
             )
 
@@ -764,7 +819,7 @@ def compile_moe_gemm1(
                 k_unroll = tile_k_bytes // 64  # K64-byte micro-step (2x MFMA)
 
                 # --- B Load Logic (K64) - shared layout with preshuffle GEMM ---
-                def load_b_pack(base_k, ki_step, ni, blk_list, intra_list):
+                def load_b_pack(base_k, ki_step, ni, blk_list, intra_list, raw_packed=False):
                     return load_b_pack_k32(
                         buffer_ops,
                         arith,
@@ -781,6 +836,7 @@ def compile_moe_gemm1(
                         kpack_bytes=kpack_bytes,
                         elem_bytes=w_elem_bytes,
                         unpack_int4=is_int4,
+                        raw_packed=raw_packed,
                     )
 
                 def load_b_tile(base_k, blk_list, intra_list):
@@ -872,6 +928,65 @@ def compile_moe_gemm1(
                                     scale_dtype=scale_dtype,
                                 )
                                 raw_ku.append((b0, b1, sc))
+                            raw_data.append(raw_ku)
+                        return raw_data
+                    elif const_expr(is_mxfp4_fp8_groupwise):
+                        # a8w4 Phase1: packed-4bit e2m1 weight, unpack->fp8 in-kernel.
+                        # Load raw packed32 for the 2 K32 operands (ki0/ki1) + per-32
+                        # E8M0 scale; unpack e2m1->fp8 here so the (b0,b1,sc) tuple
+                        # matches the mxfp8 format and reuses its compute/flatten.
+                        # in-kernel per-pair ratio-fold (reproduces the Phase-0 host
+                        # fold). Derived nibble->group mapping (aiter_logs/derive_mapping.py):
+                        # lane_div_16 in {0,1} -> group A (sc0), {2,3} -> group B (sc1);
+                        # ALL 8 elements of a lane's K32 operand share the lane's group.
+                        # So fold every element by 2^(exp_g - base) (base=max of the pair)
+                        # and apply 2^base post-MFMA (sc_out packs base into both halves).
+                        _uw = arith._to_raw
+                        _bitfold = os.environ.get("AITER_A8W4_BITFOLD", "0") == "1"
+                        _wideload = os.environ.get("AITER_A8W4_WIDELOAD", "1") == "1"
+                        _lane_i32 = arith.index_cast(T.i32, lane_div_16)
+                        _is_B = arith.cmpi(
+                            arith.CmpIPredicate.sge, _uw(_lane_i32), _uw(fx.Int32(2))
+                        )
+                        raw_data = []
+                        for ku in range_constexpr(k_unroll):
+                            raw_ku = []
+                            for ni in range_constexpr(num_acc_n):
+                                if const_expr(_wideload):
+                                    # one dwordx2 load for both K32 operands (matches
+                                    # mxfp8 wide load; halves B-load instructions).
+                                    r0, r1 = load_b_pack_k32_pair_raw(
+                                        buffer_ops, arith, vector,
+                                        b_rsrc=w_rsrc, layout_b=layout_b,
+                                        base_k=base_k, ku=ku,
+                                        n_blk=blk_list[ni], n_intra=intra_list[ni],
+                                        lane_div_16=lane_div_16, elem_type=w_elem,
+                                        kpack_bytes=kpack_bytes, elem_bytes=w_elem_bytes,
+                                    )
+                                else:
+                                    r0 = load_b_pack(
+                                        base_k, (ku * 2), ni, blk_list, intra_list, raw_packed=True
+                                    )
+                                    r1 = load_b_pack(
+                                        base_k, (ku * 2) + 1, ni, blk_list, intra_list, raw_packed=True
+                                    )
+                                sc = _load_groupwise_scale(
+                                    buffer_ops,
+                                    arith,
+                                    scale_rsrc=sw_rsrc,
+                                    expert_offset=expert_off_idx,
+                                    n_blk=blk_list[ni],
+                                    n_intra=intra_list[ni],
+                                    k_pos=base_k + fx.Index(ku * 64),
+                                    num_groups=num_groups,
+                                    group_size=group_size,
+                                    n_per_expert=2 * inter_dim,
+                                    scale_dtype=scale_dtype,
+                                )
+                                b0, b1, sc_out = _mxfp4_fp8_fold_operands(
+                                    r0, r1, sc, _is_B, _bitfold, arith, vector
+                                )
+                                raw_ku.append((b0, b1, sc_out))
                             raw_data.append(raw_ku)
                         return raw_data
                     else:
@@ -1208,7 +1323,7 @@ def compile_moe_gemm1(
                             up_list[p_idx] = _acc_scaled_f32(
                                 up_list[p_idx], p_u, p_sc_u
                             )
-                    elif const_expr(is_mxfp8_groupwise):
+                    elif const_expr(is_mxfp8_groupwise or is_mxfp4_fp8_groupwise):
                         # a8w4 Phase0: per K32 -> fp8 MFMA into zero acc, then
                         # multiply by the per-32 E8M0 scale (f32 FMA) and accumulate.
                         for ku in range_constexpr(k_unroll):
@@ -1385,7 +1500,7 @@ def compile_moe_gemm1(
                 int4_bf16_single_field = is_int4_bf16 and not is_int4_bf16_groupwise
                 _fields_per_ku = (
                     3
-                    if is_mxfp8_groupwise
+                    if (is_mxfp8_groupwise or is_mxfp4_fp8_groupwise)
                     else (1 if int4_bf16_single_field else 2)
                 )
                 _vals_per_b_tile = k_unroll * _fields_per_ku * num_acc_n
@@ -1401,7 +1516,7 @@ def compile_moe_gemm1(
                         elif int4_bf16_single_field:
                             # [raw_i64, ...] → [raw_0..N]
                             flat.extend(ku_entry)
-                        elif is_mxfp8_groupwise:
+                        elif is_mxfp8_groupwise or is_mxfp4_fp8_groupwise:
                             # [(b0, b1, sc), ...] → [b0_0..N, b1_0..N, sc_0..N]
                             flat.extend(t[0] for t in ku_entry)
                             flat.extend(t[1] for t in ku_entry)
@@ -1430,7 +1545,7 @@ def compile_moe_gemm1(
                         elif int4_bf16_single_field:
                             b_tile.append(list(vals[idx : idx + num_acc_n]))
                             idx += num_acc_n
-                        elif is_mxfp8_groupwise:
+                        elif is_mxfp8_groupwise or is_mxfp4_fp8_groupwise:
                             b0s = list(vals[idx : idx + num_acc_n])
                             idx += num_acc_n
                             b1s = list(vals[idx : idx + num_acc_n])
@@ -2199,6 +2314,7 @@ def compile_moe_gemm2(
         "int4_bf16",
         "mxfp4_bf16",
         "mxfp8",
+        "mxfp4_fp8",
     )
     if in_dtype not in _valid_dtypes:
         raise ValueError(f"in_dtype must be one of {_valid_dtypes}, got {in_dtype!r}")
@@ -2208,6 +2324,7 @@ def compile_moe_gemm2(
     # that one difference; is_int4_bf16 stays True so all shared paths are reused.
     is_mxfp4_bf16 = in_dtype == "mxfp4_bf16"
     is_mxfp8 = in_dtype == "mxfp8"  # a8w4 Phase0: fp8 weight + E8M0 per-32 microscale
+    is_mxfp4_fp8 = in_dtype == "mxfp4_fp8"  # a8w4 Phase1: packed-4bit weight, unpack->fp8 in-kernel
     is_int4_bf16 = (
         in_dtype == "int4_bf16" or is_mxfp4_bf16
     )  # W4A16: bf16 activations, packed 4-bit weights
@@ -2229,7 +2346,7 @@ def compile_moe_gemm2(
         )
     is_int4 = in_dtype == "int4"
     # w_is_int4: True for any variant where weights are packed int4.
-    w_is_int4 = is_int4 or is_int4_bf16
+    w_is_int4 = is_int4 or is_int4_bf16 or is_mxfp4_fp8
     # INT4 here means W4A8: A2 is int8, W is packed int4 and unpacked to int8 in-kernel.
     is_int8 = (in_dtype in ("int8", "int8smooth")) or is_int4
 
@@ -2243,6 +2360,7 @@ def compile_moe_gemm2(
         )
     is_int4_bf16_groupwise = is_int4_bf16 and use_groupwise_scale
     is_mxfp8_groupwise = is_mxfp8 and use_groupwise_scale
+    is_mxfp4_fp8_groupwise = is_mxfp4_fp8 and use_groupwise_scale
     # Stage2 K dimension is inter_dim (weight shape: [E, model_dim, inter_dim])
     num_groups = inter_dim // group_size if use_groupwise_scale else 1
     _scale_is_bf16 = scale_is_bf16 and use_groupwise_scale
@@ -2477,7 +2595,7 @@ def compile_moe_gemm2(
             )
             zero_f32_acc = (
                 arith.constant_vector(0.0, T.f32x4)
-                if (is_int4_bf16_groupwise or is_mxfp8_groupwise)
+                if (is_int4_bf16_groupwise or is_mxfp8_groupwise or is_mxfp4_fp8_groupwise)
                 else None
             )
 
@@ -2765,7 +2883,7 @@ def compile_moe_gemm2(
                 k_unroll = tile_k_bytes // 64  # K64-byte micro-step (2x MFMA)
 
                 # --- B Load Logic (K64) ---
-                def load_b_pack(base_k, ki_step, ni):
+                def load_b_pack(base_k, ki_step, ni, raw_packed=False):
                     return load_b_pack_k32(
                         buffer_ops,
                         arith,
@@ -2782,6 +2900,7 @@ def compile_moe_gemm2(
                         kpack_bytes=kpack_bytes,
                         elem_bytes=w_elem_bytes,
                         unpack_int4=is_int4,
+                        raw_packed=raw_packed,
                     )
 
                 def load_b_tile(base_k):
@@ -2871,6 +2990,54 @@ def compile_moe_gemm2(
                                     scale_dtype=scale_dtype,
                                 )
                                 raw_ku.append((b0, b1, sc))
+                            raw_data.append(raw_ku)
+                        return raw_data
+                    elif const_expr(is_mxfp4_fp8_groupwise):
+                        # a8w4 Phase1 stage2: packed-4bit e2m1 weight, unpack->fp8 +
+                        # in-kernel per-pair ratio-fold. Mapping (derive_mapping.py):
+                        # lane_div_16 {0,1}->group A (sc0), {2,3}->group B (sc1).
+                        _uw = arith._to_raw
+                        _bitfold = os.environ.get("AITER_A8W4_BITFOLD", "0") == "1"
+                        _wideload = os.environ.get("AITER_A8W4_WIDELOAD", "1") == "1"
+                        _lane_i32 = arith.index_cast(T.i32, lane_div_16)
+                        _is_B = arith.cmpi(
+                            arith.CmpIPredicate.sge, _uw(_lane_i32), _uw(fx.Int32(2))
+                        )
+                        raw_data = []
+                        for ku in range_constexpr(k_unroll):
+                            raw_ku = []
+                            for ni in range_constexpr(num_acc_n):
+                                if const_expr(_wideload):
+                                    # one dwordx2 load for both K32 operands (matches
+                                    # mxfp8 wide load; halves B-load instructions).
+                                    r0, r1 = load_b_pack_k32_pair_raw(
+                                        buffer_ops, arith, vector,
+                                        b_rsrc=w_rsrc, layout_b=layout_b,
+                                        base_k=base_k, ku=ku,
+                                        n_blk=n_blk_list[ni], n_intra=n_intra_list[ni],
+                                        lane_div_16=lane_div_16, elem_type=w_elem,
+                                        kpack_bytes=kpack_bytes, elem_bytes=w_elem_bytes,
+                                    )
+                                else:
+                                    r0 = load_b_pack(base_k, (ku * 2), ni, raw_packed=True)
+                                    r1 = load_b_pack(base_k, (ku * 2) + 1, ni, raw_packed=True)
+                                sc = _load_groupwise_scale(
+                                    buffer_ops,
+                                    arith,
+                                    scale_rsrc=sw_rsrc,
+                                    expert_offset=expert_off_idx,
+                                    n_blk=n_blk_list[ni],
+                                    n_intra=n_intra_list[ni],
+                                    k_pos=base_k + fx.Index(ku * 64),
+                                    num_groups=num_groups,
+                                    group_size=group_size,
+                                    n_per_expert=model_dim,
+                                    scale_dtype=scale_dtype,
+                                )
+                                b0, b1, sc_out = _mxfp4_fp8_fold_operands(
+                                    r0, r1, sc, _is_B, _bitfold, arith, vector
+                                )
+                                raw_ku.append((b0, b1, sc_out))
                             raw_data.append(raw_ku)
                         return raw_data
                     else:
@@ -3162,7 +3329,7 @@ def compile_moe_gemm2(
                             acc_list[p_idx] = _acc_scaled_f32(
                                 acc_list[p_idx], p_tmp, p_sc
                             )
-                    elif const_expr(is_mxfp8_groupwise):
+                    elif const_expr(is_mxfp8_groupwise or is_mxfp4_fp8_groupwise):
                         # a8w4 stage2: fp8 MFMA per K32 into zero acc, then per-32 E8M0
                         # scale (per-pair-equal) post-multiply + accumulate (f32).
                         for ku in range_constexpr(k_unroll):
@@ -3353,7 +3520,7 @@ def compile_moe_gemm2(
                 int4_bf16_single_field = is_int4_bf16 and not is_int4_bf16_groupwise
                 _fields_per_ku = (
                     3
-                    if is_mxfp8_groupwise
+                    if (is_mxfp8_groupwise or is_mxfp4_fp8_groupwise)
                     else (1 if int4_bf16_single_field else 2)
                 )
                 _vals_per_b_tile = k_unroll * _fields_per_ku * num_acc_n
@@ -3370,7 +3537,7 @@ def compile_moe_gemm2(
                             flat.extend(t[1] for t in ku_entry)
                         elif int4_bf16_single_field:
                             flat.extend(ku_entry)
-                        elif is_mxfp8_groupwise:
+                        elif is_mxfp8_groupwise or is_mxfp4_fp8_groupwise:
                             flat.extend(t[0] for t in ku_entry)
                             flat.extend(t[1] for t in ku_entry)
                             flat.extend(t[2] for t in ku_entry)
@@ -3397,7 +3564,7 @@ def compile_moe_gemm2(
                         elif int4_bf16_single_field:
                             b_tile.append(list(vals[idx : idx + num_acc_n]))
                             idx += num_acc_n
-                        elif is_mxfp8_groupwise:
+                        elif is_mxfp8_groupwise or is_mxfp4_fp8_groupwise:
                             b0s = list(vals[idx : idx + num_acc_n])
                             idx += num_acc_n
                             b1s = list(vals[idx : idx + num_acc_n])

@@ -98,6 +98,17 @@ def prep_a8w4_weight_scale(wq_fp4x2, e8m0_scale, E, N, K):
     return w_fp8_shuf, scale_shuf
 
 
+def prep_a8w4_w4(wq_fp4x2, e8m0_scale, N, K):
+    """a8w4 Phase-1: keep mxfp4 weight PACKED 4-bit (0.5B) + raw per-32 E8M0 bf16 scale.
+
+    Unlike Phase-0 (prep_a8w4_weight_scale, fp8 storage + host fold), Phase-1 stores
+    the weight as 4-bit e2m1 codes (= a16w4 layout, half the HBM) and does the
+    e2m1->fp8 unpack + per-pair ratio-fold IN-KERNEL, so this reuses the a16w4 host
+    prep unchanged. Returns (w4_packed[fp4x2], scale_bf16_flat).
+    """
+    return prep_a16w4_weight(wq_fp4x2, N, K), prep_a16w4_scale(e8m0_scale, N, K)
+
+
 _SUFFIX_RE = re.compile(
     r"(?:_kw(?P<kw>\d+))?(?P<fp4>_fp4)?(?P<fp8>_fp8)?(?:_sbm(?P<sbm>\d+))?$"
 )
@@ -542,6 +553,75 @@ def get_flydsl_stage2_kernels_mxfp8(out_dtype: str) -> Dict[str, Dict]:
     return kernels
 
 
+def get_flydsl_stage1_kernels_mxfp4_fp8(out_dtype: str) -> Dict[str, Dict]:
+    """Return {kernelName: params} for a8w4 Phase1 (fp8 act + 4bit-stored mxfp4 weight) stage1."""
+    kernels = {}
+    a_dtype = "fp8"
+    b_dtype = "mxfp4"
+    tile_ks = [128, 256]
+    tile_ms = [16, 32, 64, 128]
+    tile_ns = [64, 128]
+    k_batches = [1, 2, 4, 7, 14]
+
+    for tm in tile_ms:
+        for tn in tile_ns:
+            for tk in tile_ks:
+                for kb in k_batches:
+                    name = flydsl_kernel_name(1, a_dtype, b_dtype, out_dtype, tm, tn, tk)
+                    if kb != 1:
+                        name += f"_kb{kb}"
+                    kernels[name] = {
+                        "stage": 1,
+                        "a_dtype": a_dtype,
+                        "b_dtype": b_dtype,
+                        "out_dtype": out_dtype,
+                        "tile_m": tm,
+                        "tile_n": tn,
+                        "tile_k": tk,
+                        "MPerBlock": tm,
+                        "in_dtype": "mxfp4_fp8",
+                        "k_batch": kb,
+                    }
+    return kernels
+
+
+def get_flydsl_stage2_kernels_mxfp4_fp8(out_dtype: str) -> Dict[str, Dict]:
+    """Return {kernelName: params} for a8w4 Phase1 (fp8 act + 4bit-stored mxfp4 weight) stage2."""
+    kernels = {}
+    a_dtype = "fp8"
+    b_dtype = "mxfp4"
+    tile_ks = [128, 256]
+    tile_ms = [16, 32, 64, 128]
+    tile_ns = [128, 256]
+    modes = ["atomic"]
+
+    for tm in tile_ms:
+        for tn in tile_ns:
+            for tk in tile_ks:
+                for mode in modes:
+                    base_name = flydsl_kernel_name(
+                        2, a_dtype, b_dtype, out_dtype, tm, tn, tk, mode
+                    )
+                    base_params = {
+                        "stage": 2,
+                        "a_dtype": a_dtype,
+                        "b_dtype": b_dtype,
+                        "out_dtype": out_dtype,
+                        "tile_m": tm,
+                        "tile_n": tn,
+                        "tile_k": tk,
+                        "mode": mode,
+                        "MPerBlock": tm,
+                        "in_dtype": "mxfp4_fp8",
+                    }
+                    kernels[base_name] = base_params
+                    kernels[base_name + "_persist"] = {
+                        **base_params,
+                        "persist": True,
+                    }
+    return kernels
+
+
 def _register_all_configs():
     """Pre-populate _KERNEL_PARAMS with all supported configs at import time."""
     for a in ("fp8", "fp4", "fp16"):
@@ -561,10 +641,14 @@ def _register_all_configs():
     for out in ("bf16", "f16"):
         _KERNEL_PARAMS.update(get_flydsl_stage1_kernels_mxfp4_bf16(out))
         _KERNEL_PARAMS.update(get_flydsl_stage2_kernels_mxfp4_bf16(out))
-    # mxfp8 (a8w4: fp8 activation + mxfp4->fp8 recast weight, E8M0 per-32 scale)
+    # mxfp8 (a8w4 Phase0: fp8 activation + mxfp4->fp8 recast weight, E8M0 per-32 scale)
     for out in ("bf16", "f16"):
         _KERNEL_PARAMS.update(get_flydsl_stage1_kernels_mxfp8(out))
         _KERNEL_PARAMS.update(get_flydsl_stage2_kernels_mxfp8(out))
+    # mxfp4_fp8 (a8w4 Phase1: fp8 activation + 4bit-stored mxfp4 weight, unpack->fp8 in-kernel)
+    for out in ("bf16", "f16"):
+        _KERNEL_PARAMS.update(get_flydsl_stage1_kernels_mxfp4_fp8(out))
+        _KERNEL_PARAMS.update(get_flydsl_stage2_kernels_mxfp4_fp8(out))
 
 
 _register_all_configs()
@@ -698,6 +782,30 @@ def compile_flydsl_moe_stage1(
             scale_is_bf16=True,
             k_batch=k_batch,
         )
+    elif a_dtype == "fp8" and b_dtype == "mxfp4":
+        # a8w4 Phase1 (CDNA3): fp8 activation x mxfp4 (e2m1) 4-bit-STORED weight,
+        # unpacked to fp8 in-kernel (per-pair E8M0 ratio-fold) + native fp8 MFMA.
+        # Weight HBM = 4-bit (0.5B, = a16w4); reuses the int4_bf16 preshuffle layout.
+        from .kernels.moe_gemm_2stage import compile_moe_gemm1
+
+        _use_cshuffle = None if k_batch > 1 else False
+
+        return compile_moe_gemm1(
+            model_dim=model_dim,
+            inter_dim=inter_dim,
+            experts=experts,
+            topk=topk,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            tile_k=tile_k,
+            doweight_stage1=doweight_stage1,
+            in_dtype="mxfp4_fp8",
+            group_size=32,
+            out_dtype=out_dtype,
+            use_cshuffle_epilog=_use_cshuffle,
+            scale_is_bf16=True,
+            k_batch=k_batch,
+        )
     else:
         raise ValueError(
             f"Unsupported stage1 dtype combination: a_dtype={a_dtype}, b_dtype={b_dtype}"
@@ -816,6 +924,27 @@ def compile_flydsl_moe_stage2(
             tile_k=tile_k,
             doweight_stage2=doweight_stage2,
             in_dtype="mxfp8",
+            group_size=32,
+            out_dtype=out_dtype,
+            accumulate=accumulate,
+            scale_is_bf16=True,
+        )
+    elif a_dtype == "fp8" and b_dtype == "mxfp4":
+        # a8w4 Phase1 (CDNA3): fp8 activation x 4bit-stored mxfp4 weight; unpack
+        # e2m1->fp8 + in-kernel per-pair ratio-fold. Native fp8 MFMA; per-32 scale
+        # post-MFMA in f32. Same 4-bit storage as a16w4, half the weight HBM of mxfp8.
+        from .kernels.moe_gemm_2stage import compile_moe_gemm2
+
+        return compile_moe_gemm2(
+            model_dim=model_dim,
+            inter_dim=inter_dim,
+            experts=experts,
+            topk=topk,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            tile_k=tile_k,
+            doweight_stage2=doweight_stage2,
+            in_dtype="mxfp4_fp8",
             group_size=32,
             out_dtype=out_dtype,
             accumulate=accumulate,
