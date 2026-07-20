@@ -605,6 +605,14 @@ def fused_moe_(
     elif (
         quant_type == QuantType.per_1x32
         and q_dtype_w == dtypes.fp4x2
+        and os.environ.get("AITER_FLYDSL_A8W4_W4", "0") == "1"
+    ):
+        # a8w4 Phase-1 (FlyDSL CDNA3): fp8 activation x 4bit-stored mxfp4 weight
+        # (unpack e2m1->fp8 + in-kernel per-pair ratio-fold). fp8 activation quant.
+        q_dtype_a = dtypes.fp8
+    elif (
+        quant_type == QuantType.per_1x32
+        and q_dtype_w == dtypes.fp4x2
         and os.environ.get("AITER_FLYDSL_A16W4", "0") == "1"
     ):
         # a16w4 (FlyDSL CDNA3): bf16 activation x mxfp4 (e2m1) weight, E8M0 per-32
@@ -2159,6 +2167,53 @@ def get_2stage_cfgs(
             1,  # no split-K (mxfp8 split-K path untested)
             False,
         )
+    if (
+        q_type == QuantType.per_1x32
+        and q_dtype_w == dtypes.fp4x2
+        and os.environ.get("AITER_FLYDSL_A8W4_W4", "0") == "1"
+        and is_flydsl_available()
+    ):
+        # a8w4 Phase-1 (FlyDSL CDNA3): fp8 activation x 4bit-stored mxfp4 weight;
+        # unpack e2m1->fp8 + in-kernel per-pair ratio-fold. 4-bit weight HBM (half
+        # of Phase-0 mxfp8, = a16w4), native fp8 MFMA. AITER_FLYDSL_A8W4_W4=1.
+        # Big adaptive tile_m amortizes the mxfp4-unpack VALU over more M rows
+        # (same heuristic as a16w4; fixed small tile_m is ~2x slower). Weights/
+        # scales prepared by moe_kernels.prep_a8w4_w4 (= a16w4 4-bit layout).
+        _out_str = "bf16"
+        _tpe = max(1, (token * topk + expert - 1) // expert)
+        _tile_m = max(32, min(1 << max(0, (_tpe - 1).bit_length()), 128))
+        # tile_k=256 only when it divides BOTH K dims (stage1 K=model_dim,
+        # stage2 K=inter_dim); else 128. Otherwise the K-loop drops the tail
+        # (e.g. inter_dim=384 with tile_k=256 -> only 256/384 computed -> outputs
+        # scaled by 0.67). 128 divides all 128-aligned shapes.
+        _tile_k = 256 if (_tile_m <= 32 and model_dim % 256 == 0
+                          and inter_dim % 256 == 0) else 128
+        from aiter.ops.flydsl.moe_kernels import flydsl_kernel_name
+
+        kn1 = flydsl_kernel_name(1, "fp8", "mxfp4", _out_str, _tile_m, 128, _tile_k)
+        # stage2 (down-proj, N=model_dim wide) prefers tile_n=256 when it tiles.
+        _s2_tile_n = 256 if model_dim % 256 == 0 else 128
+        kn2 = flydsl_kernel_name(
+            2, "fp8", "mxfp4", _out_str, _tile_m, _s2_tile_n, _tile_k, "atomic"
+        )
+        return MOEMetadata(
+            functools.partial(
+                _flydsl_stage1_wrapper,
+                kernelName=kn1,
+                activation=activation,
+                inter_dim_pad=intermediate_pad,
+                model_dim_pad=hidden_pad,
+            ),
+            functools.partial(
+                _flydsl_stage2_wrapper,
+                kernelName=kn2,
+                inter_dim_pad=intermediate_pad,
+                model_dim_pad=hidden_pad,
+            ),
+            _tile_m,
+            1,  # no split-K
+            False,
+        )
     _flydsl_a16w4 = (
         q_dtype_w == dtypes.fp4x2
         and os.environ.get("AITER_FLYDSL_A16W4", "0") == "1"
@@ -2186,7 +2241,11 @@ def get_2stage_cfgs(
             # ~2x slower because the dequant could not be amortized.
             _tpe = max(1, (token * topk + expert - 1) // expert)
             _tile_m = max(32, min(1 << max(0, (_tpe - 1).bit_length()), 128))
-            _tile_k = 256 if _tile_m <= 32 else 128
+            # tile_k=256 only when it divides BOTH K dims (stage1 K=model_dim,
+            # stage2 K=inter_dim); else 128 (else the K-loop drops the tail, e.g.
+            # inter_dim=384 with tile_k=256 computes only 256/384 -> outputs *0.67).
+            _tile_k = 256 if (_tile_m <= 32 and model_dim % 256 == 0
+                              and inter_dim % 256 == 0) else 128
             _ksplit = 1
         else:
             _tile_m = 16 if token < 2048 else 32 if token < 16384 else 64
@@ -2564,13 +2623,16 @@ def fused_moe_2stages(
     ):
         a1 = hidden_states.to(dtype)
         a1_scale = None
-    elif (
-        quant_type == QuantType.per_1x32
-        and w1.dtype == dtypes.fp8
-        and os.environ.get("AITER_FLYDSL_A8W4", "0") == "1"
+    elif quant_type == QuantType.per_1x32 and (
+        (w1.dtype == dtypes.fp8 and os.environ.get("AITER_FLYDSL_A8W4", "0") == "1")
+        or (
+            w1.dtype == dtypes.fp4x2
+            and os.environ.get("AITER_FLYDSL_A8W4_W4", "0") == "1"
+        )
     ):
-        # a8w4 (FlyDSL): per-token fp8 activation quant (f32 scale, original token
-        # order; the kernel gathers rows by sorted_ids and applies scale per token).
+        # a8w4 (FlyDSL Phase-0 mxfp8 / Phase-1 mxfp4_fp8): per-token fp8 activation
+        # quant (f32 scale, original token order; the kernel gathers rows by
+        # sorted_ids and applies scale per token). Both phases share this path.
         from aiter.ops.quant import get_hip_quant
 
         a1, _a1s = get_hip_quant(QuantType.per_Token)(
@@ -2745,13 +2807,16 @@ def fused_moe_2stages(
         )
     ):
         a2_scale = None
-    elif (
-        quant_type == QuantType.per_1x32
-        and w1.dtype == dtypes.fp8
-        and os.environ.get("AITER_FLYDSL_A8W4", "0") == "1"
+    elif quant_type == QuantType.per_1x32 and (
+        (w1.dtype == dtypes.fp8 and os.environ.get("AITER_FLYDSL_A8W4", "0") == "1")
+        or (
+            w1.dtype == dtypes.fp4x2
+            and os.environ.get("AITER_FLYDSL_A8W4_W4", "0") == "1"
+        )
     ):
-        # a8w4 (FlyDSL): per-slot fp8 requant of the bf16 stage1 output
-        # (f32 scale [token*topk]); kernel gathers/scales per (token, slot).
+        # a8w4 (FlyDSL Phase-0 mxfp8 / Phase-1 mxfp4_fp8): per-slot fp8 requant of
+        # the bf16 stage1 output (f32 scale [token*topk]); kernel gathers/scales
+        # per (token, slot). Both phases share this inter-stage requant.
         from aiter.ops.quant import get_hip_quant
 
         a2q, _a2s = get_hip_quant(QuantType.per_Token)(
