@@ -897,6 +897,8 @@ def _flydsl_stage1_wrapper(
         a_scale_one=_a_scale_one,
         xcd_swizzle=parsed.get("xcd_swizzle", 0),
         swiglu_limit=swiglu_limit,
+        compact_a2=_kwargs.get("compact_a2", False),
+        compact_map=_kwargs.get("compact_map", None),
     )
 
 
@@ -955,7 +957,39 @@ def _flydsl_stage2_wrapper(
         mfma_variant=parsed.get("mfma_variant", None),
         expert_mask=expert_mask,
         topk_ids=topk_ids,
+        compact_a2=_kwargs.get("compact_a2", False),
+        compact_map=_kwargs.get("compact_map", None),
     )
+
+
+def _build_compact_row_map(sorted_ids, token_num, topk):
+    """compact_row_map[p] = exclusive #valid entries before sorted pos p.
+
+    For a real routing row this is its packed (compact) physical row in the
+    token*topk-sized A2 buffer. Used by the gated Compact-A2 flydsl path so
+    stage1 writes / stage2 reads contiguously with no padding.
+    """
+    fused = sorted_ids.to(torch.int64)
+    t = fused & 0xFFFFFF
+    s = (fused >> 24) & 0xFF
+    valid = ((t < token_num) & (s < topk)).to(torch.int64)
+    cm = torch.cumsum(valid, 0) - valid  # exclusive prefix sum
+    return cm.clamp(max=token_num * topk - 1).to(torch.int32)
+
+
+def _compact_scale_to_tt(scale_compact_lin, compact_map, sorted_ids, token_num, topk):
+    """Reorder a compact-order [token*topk, cols] scale back to token*topk order
+    so it can be fed to the standard moe scale-sort (which tiles it)."""
+    fused = sorted_ids.to(torch.int64)
+    t = fused & 0xFFFFFF
+    s = (fused >> 24) & 0xFF
+    valid = (t < token_num) & (s < topk)
+    n = int(sorted_ids.shape[0])
+    ts = (t * topk + s).clamp(0, token_num * topk - 1)
+    vmask = valid[:n]
+    out = torch.zeros_like(scale_compact_lin)
+    out[ts[:n][vmask]] = scale_compact_lin[compact_map[:n][vmask].long()]
+    return out
 
 
 @functools.lru_cache(maxsize=2048)
@@ -1839,6 +1873,25 @@ def fused_moe_2stages(
     if stage2_func is _flydsl_stage2_wrapper and expert_mask is not None:
         extra_stage2_args["expert_mask"] = expert_mask
         extra_stage2_args["topk_ids"] = topk_ids
+    # Gated Compact-A2 (a4w4 only): stage1 writes / stage2 reads the token*topk
+    # A2 buffer in compact (expert-packed, no-padding) row order via compact_map,
+    # eliminating the stage1 scatter and stage2 gather. Off by default.
+    _compact_a2 = (
+        os.environ.get("AITER_FLYDSL_COMPACT_A2", "0") == "1"
+        and stage1_func is _flydsl_stage1_wrapper
+        and stage2_func is _flydsl_stage2_wrapper
+        and quant_type == QuantType.per_1x32
+        and w1.dtype == dtypes.fp4x2
+        and q_dtype_a == dtypes.fp4x2
+        and not metadata.fuse_quant
+    )
+    _compact_map = None
+    if _compact_a2:
+        _compact_map = _build_compact_row_map(sorted_ids, token_num, topk)
+        extra_stage1_args["compact_a2"] = True
+        extra_stage1_args["compact_map"] = _compact_map
+        extra_stage2_args["compact_a2"] = True
+        extra_stage2_args["compact_map"] = _compact_map
     a2 = metadata.stage1(
         a1,
         w1,
@@ -1902,6 +1955,28 @@ def fused_moe_2stages(
     elif quant_type == QuantType.per_1x32 and w1.dtype == dtypes.i4x2:
         # a16wi4: stage1 output is bf16, no inter-stage quantization
         a2_scale = None
+    elif quant_type == QuantType.per_1x32 and _compact_a2:
+        # Compact-A2: a2 is compact bf16 (rows permuted by compact_map). Quant
+        # positionally -> compact fp4 + compact-linear scale, then reorder the
+        # (small) scale back to token*topk order and tile-sort it. fp4 values
+        # stay compact (no gather); stage2 reads them via compact_map.
+        from aiter import get_torch_quant
+        from aiter.utility.fp4_utils import moe_mxfp4_sort
+
+        a2 = a2.view(-1, inter_dim)
+        _tq = get_torch_quant(QuantType.per_1x32)
+        a2_fp4, a2_scale_lin = _tq(a2, quant_dtype=dtypes.fp4x2)
+        a2_scale_tt = _compact_scale_to_tt(
+            a2_scale_lin, _compact_map, sorted_ids, token_num, topk
+        )
+        a2_scale = moe_mxfp4_sort(
+            a2_scale_tt.view(token_num, topk, -1),
+            sorted_ids=sorted_ids,
+            num_valid_ids=num_valid_ids,
+            token_num=token_num,
+            block_size=block_size_M,
+        )
+        a2 = a2_fp4.view(token_num, topk, -1)
     elif quant_type == QuantType.per_1x32:
         a2 = a2.view(-1, inter_dim)
         a2, a2_scale = fused_dynamic_mxfp4_quant_moe_sort(

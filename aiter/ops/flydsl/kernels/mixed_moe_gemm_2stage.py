@@ -122,6 +122,8 @@ def compile_mixed_moe_gemm1(
     a_scale_one: bool = False,
     xcd_swizzle: int = 0,
     swiglu_limit: float = 0.0,
+    sorted_a2: bool = False,
+    compact_a2: bool = False,
 ):
     """Compile stage1 kernel (gate+up with silu/swiglu).
 
@@ -453,6 +455,7 @@ def compile_mixed_moe_gemm1(
             arg_num_valid_ids: fx.Pointer,
             arg_bias: fx.Pointer,
             arg_out_scale_sorted: fx.Pointer,
+            arg_compact_map: fx.Pointer,
             i32_tokens_in: fx.Int32,
             i32_n_in: fx.Int32,
             i32_k_in: fx.Int32,
@@ -659,6 +662,15 @@ def compile_mixed_moe_gemm1(
             sorted_nbytes_i32 = arith.index_cast(T.i32, sorted_nbytes_idx)
             sorted_rsrc = _ptr_buffer_resource(arg_sorted_token_ids, sorted_nbytes_i32)
             sorted_w_rsrc = _ptr_buffer_resource(arg_sorted_weights, sorted_nbytes_i32)
+
+            # Compact-A2 (stage1 write side): map sorted-row -> compact physical
+            # row of the token*topk-sized A2 buffer, so stage1 writes contiguously
+            # (no scatter). Same map stage2 reads with.
+            compact_map_rsrc = 1
+            if const_expr(compact_a2):
+                compact_map_rsrc = _ptr_buffer_resource(
+                    arg_compact_map, sorted_nbytes_i32
+                )
 
             eid_nbytes_idx = size_expert_ids_in * arith.constant(4, index=True)
             eid_nbytes_i32 = arith.index_cast(T.i32, eid_nbytes_idx)
@@ -2176,9 +2188,22 @@ def compile_mixed_moe_gemm1(
                     t_ok = arith.cmpi(CmpIPredicate.ult, t, tokens_i32_v)
                     s_ok = arith.cmpi(CmpIPredicate.ult, s, topk_i32_v)
                     row_valid = arith.andi(row_valid0, arith.andi(t_ok, s_ok))
-                    t_idx = arith.index_cast(ir.IndexType.get(), t)
-                    s_idx = arith.index_cast(ir.IndexType.get(), s)
-                    ts_idx = t_idx * arith.constant(topk, index=True) + s_idx
+                    if const_expr(compact_a2):
+                        # Compact-A2: write to compact_map[row] (contiguous within
+                        # a block, no scatter). Same map stage2 reads with.
+                        _cr = buffer_ops.buffer_load(
+                            compact_map_rsrc, row, vec_width=1, dtype=T.i32
+                        )
+                        ts_idx = arith.index_cast(ir.IndexType.get(), _cr)
+                    elif const_expr(sorted_a2):
+                        # Sorted-order A2: write each row to its sorted position
+                        # (contiguous), instead of scattering to token*topk.
+                        # `row` is the global sorted row index (bx_m + row_local).
+                        ts_idx = row
+                    else:
+                        t_idx = arith.index_cast(ir.IndexType.get(), t)
+                        s_idx = arith.index_cast(ir.IndexType.get(), s)
+                        ts_idx = t_idx * arith.constant(topk, index=True) + s_idx
                     row_byte_base = out_base_idx + ts_idx * arith.constant(
                         _out_row_stride, index=True
                     )
@@ -2679,6 +2704,8 @@ def compile_mixed_moe_gemm1(
         gate_mode,
         a_scale_one,
         xcd_swizzle,
+        sorted_a2,
+        compact_a2,
     )
 
     @flyc.jit
@@ -2694,6 +2721,7 @@ def compile_mixed_moe_gemm1(
         arg_max_token_ids: fx.Pointer,
         arg_bias: fx.Pointer,
         arg_out_scale_sorted: fx.Pointer,
+        arg_compact_map: fx.Pointer,
         i32_tokens_in: fx.Int32,
         i32_inter_in: fx.Int32,
         i32_k_in: fx.Int32,
@@ -2748,6 +2776,7 @@ def compile_mixed_moe_gemm1(
             arg_max_token_ids,
             arg_bias,
             arg_out_scale_sorted,
+            arg_compact_map,
             i32_tokens_in,
             i32_inter_in,
             i32_k_in,
@@ -2784,6 +2813,8 @@ def compile_mixed_moe_gemm2(
     b_nt: int = 2,
     xcd_swizzle: int = 0,
     mfma_variant: str | None = None,
+    sorted_a2: bool = False,
+    compact_a2: bool = False,
 ):
     """Compile stage2 kernel (`moe_gemm2`) and return the compiled executable.
 
@@ -3085,6 +3116,7 @@ def compile_mixed_moe_gemm2(
             arg_sorted_weights: fx.Pointer,
             arg_num_valid_ids: fx.Pointer,
             arg_bias: fx.Pointer,
+            arg_compact_map: fx.Pointer,
             i32_tokens_in: fx.Int32,
             i32_n_in: fx.Int32,
             i32_k_in: fx.Int32,
@@ -3232,11 +3264,34 @@ def compile_mixed_moe_gemm2(
             # fp8/int8: 1 byte per element  -> bytes = tokens*topk * K
             # fp4:      2 elements per byte -> bytes = tokens*topk * K / 2
             c_elem_bytes = arith.constant(int(a_elem_bytes), index=True)
+            if const_expr(sorted_a2):
+                # Sorted-order A2: buffer is [sorted_size, K] where sorted_size =
+                # num_blocks * sort_block_m (padded). Reads index by sorted row,
+                # so the resource must span the padded rows, not tokens*topk.
+                _x_rows = size_expert_ids_in * arith.constant(
+                    _sort_block_m, index=True
+                )
+            else:
+                _x_rows = tokens_in * c_topk
             x_nbytes_idx = _div_pow2(
-                (tokens_in * c_topk) * k_in * c_elem_bytes, int(a_elem_vec_pack)
+                _x_rows * k_in * c_elem_bytes, int(a_elem_vec_pack)
             )
             x_nbytes_i32 = arith.index_cast(T.i32, x_nbytes_idx)
             x_rsrc = _ptr_buffer_resource(arg_x, x_nbytes_i32)
+
+            # Compact-A2: per-(sorted-row) map -> compact physical row of the
+            # token*topk-sized A2 buffer. Lets stage2 read contiguously without
+            # padding (the map is a prefix-sum of valid counts). Only the value
+            # index changes; the scale stays in its sorted-tiled layout.
+            compact_map_rsrc = 1
+            if const_expr(compact_a2):
+                _cm_rows = size_expert_ids_in * arith.constant(
+                    _sort_block_m, index=True
+                )
+                _cm_nbytes = arith.index_cast(
+                    T.i32, _cm_rows * arith.constant(4, index=True)
+                )
+                compact_map_rsrc = _ptr_buffer_resource(arg_compact_map, _cm_nbytes)
 
             w_rsrc = _ptr_buffer_resource(arg_w, w_nbytes)
 
@@ -3557,19 +3612,35 @@ def compile_mixed_moe_gemm2(
                     x_col_local_i32.append(col_local_i32)
 
                     sorted_row_i = bx_m + row_local
-                    fused_i = buffer_ops.buffer_load(
-                        sorted_rsrc, sorted_row_i, vec_width=1, dtype=T.i32
-                    )
-                    t_i32 = arith.andi(fused_i, mask24)
-                    s_i32 = arith.shrui(fused_i, arith.constant(24))
+                    if const_expr(compact_a2):
+                        # Compact-A2: physical row = compact_map[sorted_row].
+                        # For valid rows this is base_block + row_local
+                        # (contiguous); padding rows borrow the next block's row
+                        # and are masked at the epilogue.
+                        cr_i32 = buffer_ops.buffer_load(
+                            compact_map_rsrc, sorted_row_i, vec_width=1, dtype=T.i32
+                        )
+                        row_ts_idx = arith.index_cast(ir.IndexType.get(), cr_i32)
+                    elif const_expr(sorted_a2):
+                        # Sorted-order A2: read the sorted row directly
+                        # (contiguous block read) -- no token*topk gather.
+                        # Padding rows are in-bounds (rsrc spans padded size) and
+                        # their GEMM output is masked at the epilogue.
+                        row_ts_idx = sorted_row_i
+                    else:
+                        fused_i = buffer_ops.buffer_load(
+                            sorted_rsrc, sorted_row_i, vec_width=1, dtype=T.i32
+                        )
+                        t_i32 = arith.andi(fused_i, mask24)
+                        s_i32 = arith.shrui(fused_i, arith.constant(24))
 
-                    t_valid = arith.cmpi(CmpIPredicate.ult, t_i32, tokens_i32)
-                    s_valid = arith.cmpi(CmpIPredicate.ult, s_i32, topk_i32)
-                    ts_valid = arith.andi(t_valid, s_valid)
-                    t_safe = arith.select(ts_valid, t_i32, arith.constant(0))
-                    s_safe = arith.select(ts_valid, s_i32, arith.constant(0))
-                    row_ts_i32 = t_safe * topk_i32 + s_safe
-                    row_ts_idx = arith.index_cast(ir.IndexType.get(), row_ts_i32)
+                        t_valid = arith.cmpi(CmpIPredicate.ult, t_i32, tokens_i32)
+                        s_valid = arith.cmpi(CmpIPredicate.ult, s_i32, topk_i32)
+                        ts_valid = arith.andi(t_valid, s_valid)
+                        t_safe = arith.select(ts_valid, t_i32, arith.constant(0))
+                        s_safe = arith.select(ts_valid, s_i32, arith.constant(0))
+                        row_ts_i32 = t_safe * topk_i32 + s_safe
+                        row_ts_idx = arith.index_cast(ir.IndexType.get(), row_ts_i32)
 
                     x_row_base_div4.append(row_ts_idx * c_k_div4)
 
@@ -4905,6 +4976,8 @@ def compile_mixed_moe_gemm2(
         _sort_block_m,
         _cu_num if _persistent else 0,
         xcd_swizzle,
+        sorted_a2,
+        compact_a2,
     )
 
     @flyc.jit
@@ -4919,6 +4992,7 @@ def compile_mixed_moe_gemm2(
         arg_sorted_weights: fx.Pointer,
         arg_num_valid_ids: fx.Pointer,
         arg_bias: fx.Pointer,
+        arg_compact_map: fx.Pointer,
         i32_tokens_in: fx.Int32,
         i32_n_in: fx.Int32,
         i32_k_in: fx.Int32,
@@ -4960,6 +5034,7 @@ def compile_mixed_moe_gemm2(
             arg_sorted_weights,
             arg_num_valid_ids,
             arg_bias,
+            arg_compact_map,
             i32_tokens_in,
             i32_n_in,
             i32_k_in,

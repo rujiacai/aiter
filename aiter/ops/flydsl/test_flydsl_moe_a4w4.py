@@ -417,6 +417,237 @@ def test_flydsl_e2e_a4w4(
 
 
 # ---------------------------------------------------------------------------
+# Sorted-order A2 (no stage1 scatter / no stage2 gather)
+# ---------------------------------------------------------------------------
+
+
+def _decode_sorted_ids(sorted_ids, token, topk):
+    """Decode fused sorted_ids -> (valid, ts) where ts = token*topk + slot."""
+    fused = sorted_ids.to(torch.int64)
+    t = fused & 0xFFFFFF
+    s = (fused >> 24) & 0xFF
+    valid = (t < token) & (s < topk)
+    ts = torch.where(valid, t * topk + s, torch.zeros_like(t))
+    return valid, ts
+
+
+def _sorted_rows_for(sorted_ids, sorted_expert_ids, block_m):
+    """Padded sorted-row count (matches the kernel's x-resource / stage1 alloc)."""
+    return max(
+        int(sorted_ids.shape[0]),
+        int(sorted_expert_ids.shape[0]) * max(32, block_m),
+    )
+
+
+def _gather_tt_to_sorted(vals_tt, sorted_ids, token, topk, sorted_rows):
+    """[token*topk, cols] (token*topk) -> [sorted_rows, cols] (sorted order)."""
+    valid, ts = _decode_sorted_ids(sorted_ids, token, topk)
+    n = int(sorted_ids.shape[0])
+    cols = vals_tt.shape[-1]
+    out = torch.zeros((sorted_rows, cols), dtype=vals_tt.dtype, device=vals_tt.device)
+    g = vals_tt[ts[:n]]
+    g = torch.where(valid[:n].unsqueeze(-1), g, torch.zeros_like(g))
+    out[:n] = g
+    return out
+
+
+def test_flydsl_sorted_a2_e2e_a4w4(
+    token: int = 16,
+    model_dim: int = 7168,
+    inter_dim: int = 256,
+    E: int = 256,
+    topk: int = 8,
+    block_m: int = 32,
+    mode: str = "atomic",
+    atol: float = 1.0,
+    rtol: float = 0.05,
+):
+    """End-to-end with sorted-order A2: stage1 writes each row to its sorted
+    position (no scatter) and stage2 reads sorted rows directly (no gather)."""
+    from aiter.ops.flydsl.moe_kernels import flydsl_moe_stage1, flydsl_moe_stage2
+
+    print(f"\n{'='*70}")
+    print(
+        f"[TEST] FlyDSL SORTED-A2 E2E A4W4: token={token}, dim=({model_dim},{inter_dim}), "
+        f"E={E}, topk={topk}, block_m={block_m}, mode={mode}"
+    )
+    print(f"{'='*70}")
+
+    data = _generate_a4w4_data(
+        token=token,
+        model_dim=model_dim,
+        inter_dim=inter_dim,
+        E=E,
+        topk=topk,
+        block_m=block_m,
+    )
+    out_dtype_str = "bf16" if data["dtype"] == torch.bfloat16 else "f16"
+    sorted_rows = _sorted_rows_for(data["sorted_ids"], data["sorted_expert_ids"], block_m)
+
+    _common_s1 = dict(
+        a=data["a1_qt"],
+        w1=data["w1_qt_shuf"],
+        sorted_token_ids=data["sorted_ids"],
+        sorted_expert_ids=data["sorted_expert_ids"],
+        num_valid_ids=data["num_valid_ids"],
+        topk=topk,
+        tile_m=block_m,
+        tile_n=256,
+        tile_k=256,
+        a_dtype="fp4",
+        b_dtype="fp4",
+        out_dtype=out_dtype_str,
+        w1_scale=data["w1_scale_shuf"],
+        a1_scale=data["a1_scale_sort"],
+        sorted_weights=data["sorted_weights_s1"],
+    )
+    # Stage1 write check: sorted output, gathered from the normal (token*topk)
+    # output, must match on valid rows -> proves the sorted *write* is correct
+    # (no scatter). Gather direction is padding-safe (padding rows ignored).
+    out_normal = flydsl_moe_stage1(**_common_s1)
+    out_sorted = flydsl_moe_stage1(**_common_s1, sorted_a2=True).view(-1, inter_dim)
+    torch.cuda.synchronize()
+    valid, ts = _decode_sorted_ids(data["sorted_ids"], token, topk)
+    n = int(data["sorted_ids"].shape[0])
+    # Real routing rows are decode-valid AND at position < num_valid[0] (trailing
+    # padding is zero-filled and decodes to a spurious (0,0), so must be excluded).
+    nv = int(data["num_valid_ids"][0].item())
+    pos_ok = torch.arange(n, device=valid.device) < nv
+    vmask = (valid[:n] & pos_ok).unsqueeze(-1)
+    normal_flat = out_normal.reshape(token * topk, inter_dim).float()
+    gathered = normal_flat[ts[:n]]
+    s1_diff = ((out_sorted[:n].float() - gathered).abs() * vmask).max().item()
+    print(
+        f"  [stage1 sorted-write] max|sorted - gather(normal)| on {int(vmask.sum())} "
+        f"valid rows = {s1_diff:.5f}"
+    )
+
+    # Stage2 read check (end-to-end vs torch ref): gather the *reference* fp4
+    # values into sorted order and reuse the reference sorted-tiled scale, so we
+    # isolate stage2's sorted *read* (no gather) from any stage1 quant noise.
+    a2_qt_sorted = _gather_tt_to_sorted(
+        data["a2_qt"].reshape(token * topk, -1).view(torch.uint8),
+        data["sorted_ids"],
+        token,
+        topk,
+        sorted_rows,
+    ).view(Q_DTYPE_A)
+
+    out = flydsl_moe_stage2(
+        inter_states=a2_qt_sorted,
+        w2=data["w2_qt_shuf"],
+        sorted_token_ids=data["sorted_ids"],
+        sorted_expert_ids=data["sorted_expert_ids"],
+        num_valid_ids=data["num_valid_ids"],
+        topk=topk,
+        tile_m=block_m,
+        tile_n=256,
+        tile_k=256,
+        a_dtype="fp4",
+        b_dtype="fp4",
+        out_dtype=out_dtype_str,
+        mode=mode,
+        w2_scale=data["w2_scale_shuf"],
+        a2_scale=data["a2_scale_sort"],
+        sorted_weights=data["sorted_weights_s2"],
+        sorted_a2=True,
+        token_num=token,
+    )
+    torch.cuda.synchronize()
+
+    ref = data["ref_stage2"]
+    return _check_result(
+        ref, out, f"sorted_a2_e2e_a4w4_{mode}", atol=atol, rtol=rtol, pass_pct=90.0
+    )
+
+
+def _compact_row_map(sorted_ids, token, topk):
+    """compact_row_map[p] = exclusive #valid entries before sorted pos p.
+
+    For a real routing row this is its packed (compact) physical row in the
+    token*topk-sized A2 buffer; padding rows get a harmless clamped value
+    (they are masked at the kernel epilogue)."""
+    valid, _ = _decode_sorted_ids(sorted_ids, token, topk)
+    v = valid.to(torch.int64)
+    cm = torch.cumsum(v, 0) - v  # exclusive prefix sum
+    return cm.clamp(max=token * topk - 1).to(torch.int32)
+
+
+def test_flydsl_compact_a2_e2e_a4w4(
+    token: int = 16,
+    model_dim: int = 7168,
+    inter_dim: int = 256,
+    E: int = 256,
+    topk: int = 8,
+    block_m: int = 32,
+    mode: str = "atomic",
+    atol: float = 1.0,
+    rtol: float = 0.05,
+):
+    """Compact-A2 end-to-end: stage1 writes each row to compact_map[row] (no
+    scatter, no padding) and stage2 reads via compact_map (no gather). The A2
+    buffer keeps the token*topk shape; only the physical row order changes."""
+    from aiter.ops.flydsl.moe_kernels import flydsl_moe_stage1, flydsl_moe_stage2
+
+    print(f"\n{'='*70}")
+    print(
+        f"[TEST] FlyDSL COMPACT-A2 E2E A4W4: token={token}, dim=({model_dim},{inter_dim}), "
+        f"E={E}, topk={topk}, block_m={block_m}, mode={mode}"
+    )
+    print(f"{'='*70}")
+
+    data = _generate_a4w4_data(
+        token=token, model_dim=model_dim, inter_dim=inter_dim, E=E, topk=topk,
+        block_m=block_m,
+    )
+    out_dtype_str = "bf16" if data["dtype"] == torch.bfloat16 else "f16"
+    sorted_ids = data["sorted_ids"]
+    compact_map = _compact_row_map(sorted_ids, token, topk)
+
+    _common_s1 = dict(
+        a=data["a1_qt"], w1=data["w1_qt_shuf"], sorted_token_ids=sorted_ids,
+        sorted_expert_ids=data["sorted_expert_ids"], num_valid_ids=data["num_valid_ids"],
+        topk=topk, tile_m=block_m, tile_n=256, tile_k=256, a_dtype="fp4", b_dtype="fp4",
+        out_dtype=out_dtype_str, w1_scale=data["w1_scale_shuf"], a1_scale=data["a1_scale_sort"],
+        sorted_weights=data["sorted_weights_s1"],
+    )
+    # Stage1 compact write: out keeps [token, topk, inter] shape, rows permuted.
+    out_compact = flydsl_moe_stage1(**_common_s1, compact_a2=True, compact_map=compact_map)
+    torch.cuda.synchronize()
+    out_compact = out_compact.view(-1, inter_dim)
+
+    # Stage1 write check: a2[compact_map[p]] must equal ref1[(t,s)_p] on valid rows.
+    valid, ts = _decode_sorted_ids(sorted_ids, token, topk)
+    n = int(sorted_ids.shape[0])
+    nv = int(data["num_valid_ids"][0].item())
+    vmask = valid[:n] & (torch.arange(n, device=valid.device) < nv)
+    ref1_flat = data["ref_stage1"].reshape(token * topk, inter_dim).float()
+    written = out_compact[compact_map[:n].long()][vmask].float()
+    expected = ref1_flat[ts[:n]][vmask]
+    s1_diff = (written - expected).abs().max().item()
+    print(f"  [stage1 compact-write] max|a2[cmap] - ref1| on {int(vmask.sum())} rows = {s1_diff:.5f}")
+
+    # Build compact fp4 values for stage2 from the reference (isolates stage2 read).
+    src = data["a2_qt"].reshape(token * topk, -1).view(torch.uint8)
+    a2_fp4_compact = torch.zeros((token * topk, src.shape[-1]), dtype=torch.uint8, device=src.device)
+    a2_fp4_compact[compact_map[:n][vmask].long()] = src[ts[:n][vmask]]
+    a2_fp4_compact = a2_fp4_compact.view(token, topk, -1).view(Q_DTYPE_A)
+
+    out = flydsl_moe_stage2(
+        inter_states=a2_fp4_compact, w2=data["w2_qt_shuf"], sorted_token_ids=sorted_ids,
+        sorted_expert_ids=data["sorted_expert_ids"], num_valid_ids=data["num_valid_ids"],
+        topk=topk, tile_m=block_m, tile_n=256, tile_k=256, a_dtype="fp4", b_dtype="fp4",
+        out_dtype=out_dtype_str, mode=mode, w2_scale=data["w2_scale_shuf"],
+        a2_scale=data["a2_scale_sort"], sorted_weights=data["sorted_weights_s2"],
+        compact_a2=True, compact_map=compact_map,
+    )
+    torch.cuda.synchronize()
+    return _check_result(
+        data["ref_stage2"], out, f"compact_a2_e2e_a4w4_{mode}", atol=atol, rtol=rtol, pass_pct=90.0
+    )
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -452,6 +683,16 @@ def main():
     )
     parser.add_argument("--atol", type=float, default=1.0)
     parser.add_argument("--rtol", type=float, default=0.05)
+    parser.add_argument(
+        "--sorted-a2",
+        action="store_true",
+        help="Run the sorted-order A2 e2e variant (no stage1 scatter / stage2 gather).",
+    )
+    parser.add_argument(
+        "--compact-a2",
+        action="store_true",
+        help="Run the compact-A2 e2e variant (no scatter/gather, no padding).",
+    )
     args = parser.parse_args()
 
     from aiter.ops.flydsl.utils import is_flydsl_available
@@ -520,6 +761,68 @@ def main():
                         traceback.print_exc()
                         results.append(
                             (f"stage2_a4w4_t{token}_bm{bm}_{mode}", "ERROR", 0, 0)
+                        )
+
+            # Compact-A2 e2e (no scatter/gather, no padding)
+            if args.compact_a2:
+                for mode in args.mode:
+                    try:
+                        passed, max_delta, pct = test_flydsl_compact_a2_e2e_a4w4(
+                            token=token,
+                            model_dim=args.model_dim,
+                            inter_dim=args.inter_dim,
+                            E=args.experts,
+                            topk=args.topk,
+                            block_m=bm,
+                            mode=mode,
+                            atol=args.atol,
+                            rtol=args.rtol,
+                        )
+                        results.append(
+                            (
+                                f"compact_a2_e2e_t{token}_bm{bm}_{mode}",
+                                "PASS" if passed else "FAIL",
+                                max_delta,
+                                pct,
+                            )
+                        )
+                    except Exception:
+                        import traceback
+
+                        traceback.print_exc()
+                        results.append(
+                            (f"compact_a2_e2e_t{token}_bm{bm}_{mode}", "ERROR", 0, 0)
+                        )
+
+            # Sorted-order A2 e2e (no stage1 scatter / stage2 gather)
+            if args.sorted_a2:
+                for mode in args.mode:
+                    try:
+                        passed, max_delta, pct = test_flydsl_sorted_a2_e2e_a4w4(
+                            token=token,
+                            model_dim=args.model_dim,
+                            inter_dim=args.inter_dim,
+                            E=args.experts,
+                            topk=args.topk,
+                            block_m=bm,
+                            mode=mode,
+                            atol=args.atol,
+                            rtol=args.rtol,
+                        )
+                        results.append(
+                            (
+                                f"sorted_a2_e2e_t{token}_bm{bm}_{mode}",
+                                "PASS" if passed else "FAIL",
+                                max_delta,
+                                pct,
+                            )
+                        )
+                    except Exception:
+                        import traceback
+
+                        traceback.print_exc()
+                        results.append(
+                            (f"sorted_a2_e2e_t{token}_bm{bm}_{mode}", "ERROR", 0, 0)
                         )
 
             # End-to-end tests

@@ -355,6 +355,8 @@ def compile_flydsl_moe_stage1(
     a_scale_one: bool = False,
     xcd_swizzle: int = 0,
     swiglu_limit: float = 0.0,
+    sorted_a2: bool = False,
+    compact_a2: bool = False,
 ):
     """Compile stage1 kernel (cached via underlying lru_cache)."""
     if b_dtype == "fp4":
@@ -386,6 +388,8 @@ def compile_flydsl_moe_stage1(
             a_scale_one=a_scale_one,
             xcd_swizzle=xcd_swizzle,
             swiglu_limit=swiglu_limit,
+            sorted_a2=sorted_a2,
+            compact_a2=compact_a2,
         )
     elif a_dtype == "bf16" and b_dtype == "int4":
         # a16wi4: bf16 activations, int4 weights with groupwise scale
@@ -437,6 +441,8 @@ def compile_flydsl_moe_stage2(
     xcd_swizzle: int = 0,
     enable_bias: bool = False,
     mfma_variant: Optional[str] = None,
+    sorted_a2: bool = False,
+    compact_a2: bool = False,
 ):
     """Compile stage2 kernel (cached via underlying lru_cache)."""
     if b_dtype == "fp4":
@@ -463,6 +469,8 @@ def compile_flydsl_moe_stage2(
             xcd_swizzle=xcd_swizzle,
             enable_bias=enable_bias,
             mfma_variant=mfma_variant,
+            sorted_a2=sorted_a2,
+            compact_a2=compact_a2,
         )
     elif a_dtype == "bf16" and b_dtype == "int4":
         # a16wi4: bf16 activations, int4 weights with groupwise scale
@@ -534,10 +542,16 @@ def _s1_args_fp4(
     size_expert_ids_in,
     dev,
     bias=None,
+    compact_map=None,
     stream=None,
 ):
     empty_f32 = torch.empty(0, device=dev, dtype=torch.float32)
     _bias = bias if bias is not None else empty_f32
+    _cm = (
+        compact_map
+        if compact_map is not None
+        else torch.empty(0, device=dev, dtype=torch.int32)
+    )
     if stream is None:
         stream = torch.cuda.current_stream()
     return (
@@ -552,6 +566,7 @@ def _s1_args_fp4(
         _ptr_view_safe(num_valid_ids),
         _ptr_view_safe(_bias),
         _ptr_view_safe(out_scale_sorted),
+        _ptr_view_safe(_cm),
         token_num,
         n_in,
         k_in,
@@ -612,12 +627,18 @@ def _s2_args_fp4(
     blocks,
     dev,
     bias=None,
+    compact_map=None,
     stream=None,
 ):
     _bias = (
         bias.view(-1)
         if bias is not None
         else torch.empty(0, device=dev, dtype=torch.float32)
+    )
+    _cm = (
+        compact_map
+        if compact_map is not None
+        else torch.empty(0, device=dev, dtype=torch.int32)
     )
     if stream is None:
         stream = torch.cuda.current_stream()
@@ -632,6 +653,7 @@ def _s2_args_fp4(
         _ptr_view_safe(sorted_weights),
         _ptr_view_safe(num_valid_ids),
         _ptr_view_safe(_bias),
+        _ptr_view_safe(_cm),
         token_num,
         n_in,
         k_in,
@@ -764,6 +786,9 @@ def flydsl_moe_stage1(
     a_scale_one: bool = False,
     xcd_swizzle: int = 0,
     swiglu_limit: float = 0.0,
+    sorted_a2: bool = False,
+    compact_a2: bool = False,
+    compact_map=None,
 ):
     """Fused gate+up GEMM (MOE stage1).
 
@@ -814,7 +839,33 @@ def flydsl_moe_stage1(
     _gui_sk_fused = _gui_sk and _fuse_any_quant
 
     if out is None:
-        if _need_fp4 or (_gui_sk_fused and _need_fp4):
+        if sorted_a2 and not compact_a2:
+            # Sorted-order A2: allocate [sorted_size, cols] (padded sorted rows)
+            # instead of [token, topk, cols]. stage1 writes each row to its
+            # sorted position (contiguous), stage2 reads it back contiguously.
+            # (Compact-A2 keeps the [token, topk, cols] shape and permutes rows
+            # via compact_map instead, so it falls through to the normal alloc.)
+            _sbm1 = max(32, tile_m)
+            _sorted_rows = max(
+                sorted_token_ids.shape[0],
+                sorted_expert_ids.shape[0] * _sbm1,
+            )
+            # Zero-init: padding rows (per-expert block pad + trailing pad) are
+            # not written by stage1 but ARE read back by stage2 (masked at its
+            # epilogue). Zeroing avoids uninitialized NaN/Inf in those rows.
+            if _need_fp4 or (_gui_sk_fused and _need_fp4):
+                out = torch.zeros(
+                    (_sorted_rows, inter_dim // 2), dtype=dtypes.fp4x2, device=dev
+                )
+            elif _need_fp8 or (_gui_sk_fused and _need_fp8):
+                out = torch.zeros(
+                    (_sorted_rows, inter_dim), dtype=dtypes.fp8, device=dev
+                )
+            else:
+                out = torch.zeros(
+                    (_sorted_rows, inter_dim), dtype=torch_out_dtype, device=dev
+                )
+        elif _need_fp4 or (_gui_sk_fused and _need_fp4):
             out = torch.empty(
                 (token_num, topk, inter_dim // 2), dtype=dtypes.fp4x2, device=dev
             )
@@ -912,6 +963,7 @@ def flydsl_moe_stage1(
                 if kernel_bias is not None
                 else torch.empty(0, device=dev)
             ),
+            compact_map=compact_map,
         )
     else:
         args = _s1_args_std(
@@ -955,6 +1007,8 @@ def flydsl_moe_stage1(
         a_scale_one=a_scale_one,
         xcd_swizzle=xcd_swizzle,
         swiglu_limit=swiglu_limit,
+        sorted_a2=sorted_a2,
+        compact_a2=compact_a2,
     )
     _run_compiled(exe, args)
 
@@ -1116,6 +1170,10 @@ def flydsl_moe_stage2(
     mfma_variant: Optional[str] = None,
     expert_mask: Optional[torch.Tensor] = None,
     topk_ids: Optional[torch.Tensor] = None,
+    sorted_a2: bool = False,
+    token_num: int = 0,
+    compact_a2: bool = False,
+    compact_map=None,
 ) -> torch.Tensor:
     """Down-projection GEMM (MOE stage2). Supports atomic/reduce modes.
 
@@ -1135,10 +1193,19 @@ def flydsl_moe_stage2(
         slots. expert_mask is [num_experts] i32, topk_ids is [token_num, topk] i32.
     """
 
-    token_num = inter_states.shape[0]
     E = w2.shape[0]
     model_dim = w2.shape[1]
-    inter_dim = inter_states.shape[2]
+    if sorted_a2 and not compact_a2:
+        # Sorted-order A2: inter_states is [sorted_size, cols] (padded sorted
+        # rows). The real token count must be passed explicitly since
+        # inter_states.shape[0] is now the padded size, not tokens.
+        assert token_num > 0, "sorted_a2 requires an explicit token_num > 0"
+        inter_dim = inter_states.shape[-1]
+    else:
+        # Normal + Compact-A2: inter_states keeps the [token, topk, cols] shape
+        # (compact permutes physical rows via compact_map, same total size).
+        token_num = inter_states.shape[0]
+        inter_dim = inter_states.shape[2]
 
     # Debug: force stage2 to use the masked reduce epilogue instead of atomic
     # accumulate. Enabled by default; set AITER_FLYDSL_FORCE_REDUCE=0 to opt out.
@@ -1229,6 +1296,7 @@ def flydsl_moe_stage2(
             m_blocks,
             dev,
             bias=bias,
+            compact_map=compact_map,
         )
     else:
         args = _s2_args_std(
@@ -1268,6 +1336,8 @@ def flydsl_moe_stage2(
         xcd_swizzle=xcd_swizzle,
         enable_bias=(bias is not None),
         mfma_variant=mfma_variant,
+        sorted_a2=sorted_a2,
+        compact_a2=compact_a2,
     )
     _run_compiled(exe, args)
 
