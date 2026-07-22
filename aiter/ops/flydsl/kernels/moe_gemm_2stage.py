@@ -57,6 +57,7 @@ from .mfma_preshuffle_pipeline import (
     unpack_b_w4a16_mxfp4,
     unpack_b_w4a16_mxfp4_to_fp8,
     unpack_b_w4a16_mxfp4_to_fp8_bitfold,
+    unpack_b_w4a16_mxfp4_to_fp8_permlut,
     load_b_pack_k32_pair_raw,
     load_b_raw_w4a16_groupwise,
     _load_groupwise_scale,
@@ -69,7 +70,7 @@ from .mfma_epilogues import c_shuffle_epilog, default_epilog, mfma_epilog
 from .tensor_shim import _run_compiled
 
 
-def _mxfp4_fp8_fold_operands(r0, r1, sc, is_B, bitfold, arith, vector):
+def _mxfp4_fp8_fold_operands(r0, r1, sc, is_B, bitfold, permlut, arith, vector):
     """a8w4 Phase-1 per-lane ratio-fold, shared by stage1/stage2 B-load.
 
     Inputs: raw packed-4bit operands r0/r1 (the pair's 2 K32 MFMA operands) + the
@@ -78,10 +79,14 @@ def _mxfp4_fp8_fold_operands(r0, r1, sc, is_B, bitfold, arith, vector):
     2^(exp_g - base) and ``sc_out`` = 2^base packed into both bf16 halves
     (compute applies it post-MFMA).
 
-    ``bitfold`` selects the impl:
-      - False (default): e2m1->bf16->f32 ->(*ratio f32)-> cvt_pk_fp8 (hardware cvt).
-      - True (AITER_A8W4_BITFOLD=1): pure integer e2m1->fp8 bit-construct with the
-        ratio folded into the fp8 exponent (no f32 detour / no cvt).
+    ``bitfold``/``permlut`` select the e2m1->fp8 unpack impl:
+      - permlut (DEFAULT, AITER_A8W4_PERMLUT=1): 3x v_perm_b32 byte-LUT for
+        code->fp8 then the f32 ratio-fold (scheme B); ~8x fewer unpack int-ops,
+        stage1 1.38x / e2e 1.43x, cos lossless. Set AITER_A8W4_PERMLUT=0 for the
+        legacy f32 bit-construction path.
+      - f32 construct (AITER_A8W4_PERMLUT=0): e2m1->bf16->f32 ->(*ratio)-> cvt_pk_fp8.
+      - bitfold (AITER_A8W4_BITFOLD=1, overrides permlut): pure integer e2m1->fp8
+        bit-construct with the ratio folded into the fp8 exponent (no cvt).
     """
     _uw = arith._to_raw
     scA = extract_bf16_scale(arith, sc, 0)
@@ -107,12 +112,13 @@ def _mxfp4_fp8_fold_operands(r0, r1, sc, is_B, bitfold, arith, vector):
         ratioB = arith.divf(_uw(scB), _base_raw)
         ratio = arith.ArithValue(arith.select(is_B, ratioB, ratioA))
         rr = [ratio, ratio, ratio, ratio]
-        b0 = unpack_b_w4a16_mxfp4_to_fp8(
-            r0, arith, vector, ratios_even=rr, ratios_odd=rr
+        _unpack = (
+            unpack_b_w4a16_mxfp4_to_fp8_permlut
+            if permlut
+            else unpack_b_w4a16_mxfp4_to_fp8
         )
-        b1 = unpack_b_w4a16_mxfp4_to_fp8(
-            r1, arith, vector, ratios_even=rr, ratios_odd=rr
-        )
+        b0 = _unpack(r0, arith, vector, ratios_even=rr, ratios_odd=rr)
+        b1 = _unpack(r1, arith, vector, ratios_even=rr, ratios_odd=rr)
         _bb = (arith.bitcast(T.i32, _base_raw) >> fx.Int32(16)) & fx.Int32(0xFFFF)
     sc_out = _bb | (_bb << fx.Int32(16))
     return b0, b1, sc_out
@@ -944,6 +950,7 @@ def compile_moe_gemm1(
                         _uw = arith._to_raw
                         _bitfold = os.environ.get("AITER_A8W4_BITFOLD", "0") == "1"
                         _wideload = os.environ.get("AITER_A8W4_WIDELOAD", "1") == "1"
+                        _permlut = os.environ.get("AITER_A8W4_PERMLUT", "1") == "1"
                         _lane_i32 = arith.index_cast(T.i32, lane_div_16)
                         _is_B = arith.cmpi(
                             arith.CmpIPredicate.sge, _uw(_lane_i32), _uw(fx.Int32(2))
@@ -984,7 +991,7 @@ def compile_moe_gemm1(
                                     scale_dtype=scale_dtype,
                                 )
                                 b0, b1, sc_out = _mxfp4_fp8_fold_operands(
-                                    r0, r1, sc, _is_B, _bitfold, arith, vector
+                                    r0, r1, sc, _is_B, _bitfold, _permlut, arith, vector
                                 )
                                 raw_ku.append((b0, b1, sc_out))
                             raw_data.append(raw_ku)
@@ -2999,6 +3006,7 @@ def compile_moe_gemm2(
                         _uw = arith._to_raw
                         _bitfold = os.environ.get("AITER_A8W4_BITFOLD", "0") == "1"
                         _wideload = os.environ.get("AITER_A8W4_WIDELOAD", "1") == "1"
+                        _permlut = os.environ.get("AITER_A8W4_PERMLUT", "1") == "1"
                         _lane_i32 = arith.index_cast(T.i32, lane_div_16)
                         _is_B = arith.cmpi(
                             arith.CmpIPredicate.sge, _uw(_lane_i32), _uw(fx.Int32(2))
@@ -3035,7 +3043,7 @@ def compile_moe_gemm2(
                                     scale_dtype=scale_dtype,
                                 )
                                 b0, b1, sc_out = _mxfp4_fp8_fold_operands(
-                                    r0, r1, sc, _is_B, _bitfold, arith, vector
+                                    r0, r1, sc, _is_B, _bitfold, _permlut, arith, vector
                                 )
                                 raw_ku.append((b0, b1, sc_out))
                             raw_data.append(raw_ku)
