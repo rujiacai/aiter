@@ -576,6 +576,70 @@ def _e2m1x4_in_i32_to_fp8x4_i32(val_i32, arith, vector, ratios=None):
     return p
 
 
+# e2m1 code(0..15) -> fp8(e4m3fnuz) byte LUT, packed into 4 constant dwords
+# (little-endian). Byte-exact vs torch ``.to(float8_e4m3fnuz)`` (verified over all
+# 16^4 combos in aiter_logs/proto_perm_lut.py):
+#   [0x00,0x38,0x40,0x44, 0x48,0x4c,0x50,0x54, 0x00,0xb8,0xc0,0xc4, 0xc8,0xcc,0xd0,0xd4]
+_A8W4_FP8_LUT = (0x44403800, 0x54504C48, 0xC4C0B800, 0xD4D0CCC8)
+
+
+def _e2m1x4_in_i32_to_fp8x4_i32_permlut(val_i32, arith, vector, ratios=None):
+    """perm_b32 byte-LUT variant of :func:`_e2m1x4_in_i32_to_fp8x4_i32`.
+
+    Looks up e2m1 code -> fp8(e4m3fnuz) byte with 3x ``v_perm_b32`` over a 16-entry
+    LUT (4 constant dwords) instead of the ~15-int-op/nibble bit-construction
+    (``_e2m1_byte_to_bf16_bits``). ``ratios`` is None (unscaled fp8 out) or 4 f32
+    fold factors: the unscaled fp8 is widened fp8->f32 (``cvt_pk_f32_fp8``), *ratio,
+    +0.0 (-0 norm), repacked f32->fp8 (scheme B -- reuses the reliable f32 fold and
+    only swaps the code->f32 front-end for the LUT).
+    """
+    from flydsl.expr import rocdl
+
+    lut_lo_lo = fx.Int32(_A8W4_FP8_LUT[0])
+    lut_lo_hi = fx.Int32(_A8W4_FP8_LUT[1])
+    lut_hi_lo = fx.Int32(_A8W4_FP8_LUT[2])
+    lut_hi_hi = fx.Int32(_A8W4_FP8_LUT[3])
+    v = fx.Int32(val_i32)
+    # code&7 selects a byte within an 8-byte pool; perm picks it per output byte.
+    sel = v & fx.Int32(0x07070707)
+    res_lo = fx.Int32(rocdl.perm_b32(lut_lo_hi, lut_lo_lo, sel))  # codes 0..7
+    res_hi = fx.Int32(rocdl.perm_b32(lut_hi_hi, lut_hi_lo, sel))  # codes 8..15
+    # blend by bit3 of each code: output byte i from res_lo (sel i) or res_hi (i+4).
+    blend_sel = fx.Int32(0x03020100) | ((v >> fx.Int32(1)) & fx.Int32(0x04040404))
+    fp8x4 = rocdl.perm_b32(res_hi, res_lo, blend_sel)
+    if ratios is None:
+        return fp8x4
+    # scheme B: fp8 -> f32 -> *ratio -> fp8 (reuse the reliable f32 fold).
+    c_pzero = fx.Float32(0.0)
+    f_lo = rocdl.cvt_pk_f32_fp8(T.vec(2, T.f32), fp8x4, False)  # fp8 elems 0,1
+    f_hi = rocdl.cvt_pk_f32_fp8(T.vec(2, T.f32), fp8x4, True)   # fp8 elems 2,3
+    fvs = [
+        vector.extract(f_lo, static_position=[0], dynamic_position=[]),
+        vector.extract(f_lo, static_position=[1], dynamic_position=[]),
+        vector.extract(f_hi, static_position=[0], dynamic_position=[]),
+        vector.extract(f_hi, static_position=[1], dynamic_position=[]),
+    ]
+    f32_vals = []
+    for i in range(4):
+        vv = arith.ArithValue(fvs[i]) * ratios[i]
+        vv = vv + c_pzero
+        f32_vals.append(_arith._to_raw(vv))
+    p = _arith._to_raw(fx.Int32(0))
+    p = rocdl.cvt_pk_fp8_f32(T.i32, f32_vals[0], f32_vals[1], p, 0)
+    p = rocdl.cvt_pk_fp8_f32(T.i32, f32_vals[2], f32_vals[3], p, 1)
+    return p
+
+
+def unpack_b_w4a16_mxfp4_to_fp8_permlut(
+    packed32, arith, vector, ratios_even=None, ratios_odd=None
+):
+    """perm_b32 byte-LUT variant of :func:`unpack_b_w4a16_mxfp4_to_fp8` (a8w4 P1)."""
+    even, odd = _unpack_mxfp4_nibble_pair(packed32)
+    fe = _e2m1x4_in_i32_to_fp8x4_i32_permlut(even, arith, vector, ratios=ratios_even)
+    fo = _e2m1x4_in_i32_to_fp8x4_i32_permlut(odd, arith, vector, ratios=ratios_odd)
+    return _pack_i32_pair_to_i64(fe, fo, vector)
+
+
 def unpack_b_w4a16_mxfp4_to_fp8(packed32, arith, vector, ratios_even=None, ratios_odd=None):
     """Unpack packed32 (8 e2m1 codes) -> i64 (8 fp8) for one K32 fp8 MFMA operand.
 
