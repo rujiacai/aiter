@@ -349,6 +349,76 @@ def _persist_n_candidates() -> list[int]:
     return out
 
 
+def _a2c_tune_enabled() -> bool:
+    """Whether the autotuner should try a2_compact (expert-major compacted a2).
+
+    Unlike the per-kernel knobs above, a2_compact is a COUPLED stage1<->stage2
+    property (stage1 writes compacted, stage2 reads compacted -- they must match),
+    so it is NOT enumerated as an independent per-stage name token. Instead the
+    tuner re-profiles the best (stage1, stage2) PAIR with a2_compact and keeps it
+    only when it is correct AND faster than the token-major pair.
+
+    Default OFF -> the tuned result is byte-identical to before. Enable via:
+      AITER_TUNE_MOE_A2C=1
+    """
+    vals = _tune_csv("AITER_TUNE_MOE_A2C", ["0"])
+    return any(
+        str(v).strip().lower() in ("1", "true", "yes", "on") for v in vals
+    )
+
+
+def compute_blk_valid_start(
+    sorted_token_ids, num_tokens: int, block_m: int, topk: int,
+    num_valid_ids=None,
+):
+    """Exclusive prefix-sum of per-M-block valid-row counts, for the compacted
+    (expert-major, no-padding) a2 layout used by AITER_MOE_A2_COMPACT.
+
+    A sorted position is *valid* exactly as the stage kernels decide it: fused
+    ``t = id & 0xFFFFFF`` with ``t < num_tokens`` AND slot ``s = id >> 24`` with
+    ``s < topk``, AND (when given) the position is below ``num_valid_ids`` (the
+    padded tail of the array is zero-filled, i.e. ``t == 0``, and must not be
+    counted). Valid rows are a contiguous prefix within each block, so the
+    compacted row of valid sorted position ``p = b*block_m + r`` is
+    ``blk_valid_start[b] + r`` and the layout is gapless.
+
+    Args:
+      sorted_token_ids: 1-D int32 tensor (fused token|slot).
+      num_tokens: real token count (token-id sentinel threshold).
+      block_m: sorting block size (== stage tile_m's M-block size).
+      topk: routing top-k (slot sentinel threshold).
+      num_valid_ids: optional int32 tensor/int bounding the processed region.
+    Returns:
+      (blk_valid_start[num_blocks] int32, total_valid int) on the same device.
+    """
+    import torch
+
+    n = sorted_token_ids.numel()
+    num_blocks = (n + block_m - 1) // block_m
+    fused = sorted_token_ids.to(torch.int64)
+    tok = fused & 0xFFFFFF
+    slot = fused >> 24
+    valid = (tok < int(num_tokens)) & (slot < int(topk))
+    if num_valid_ids is not None:
+        if torch.is_tensor(num_valid_ids):
+            nvi = num_valid_ids.reshape(-1)[0].to(torch.int64)
+        else:
+            nvi = int(num_valid_ids)
+        pos = torch.arange(n, device=sorted_token_ids.device)
+        valid = valid & (pos < nvi)
+    valid = valid.to(torch.int32)
+    # pad to full blocks then per-block valid count
+    if valid.numel() < num_blocks * block_m:
+        pad = num_blocks * block_m - valid.numel()
+        valid = torch.cat([valid, torch.zeros(pad, dtype=torch.int32, device=valid.device)])
+    per_block = valid.view(num_blocks, block_m).sum(dim=1)  # [num_blocks] int32
+    start = torch.zeros(num_blocks, dtype=torch.int32, device=sorted_token_ids.device)
+    if num_blocks > 1:
+        start[1:] = torch.cumsum(per_block, dim=0)[:-1].to(torch.int32)
+    total_valid = int(per_block.sum().item())
+    return start, total_valid
+
+
 def _stage2_mfma_variants(tk: int, a_dtype: str, b_dtype: str):
     """Yield (name_tag, params-overlay) for the fp8 stage2 MFMA-ISA choice.
 
@@ -815,6 +885,7 @@ def compile_flydsl_moe_stage1(
     b_pool_depth: int = 0,
     x_pool_depth: int = 0,
     mfma_variant: Optional[str] = None,
+    a2_compact: bool = False,
 ):
     """Compile stage1 kernel (cached via underlying lru_cache)."""
     if b_dtype == "fp4":
@@ -873,6 +944,7 @@ def compile_flydsl_moe_stage1(
             b_pool_depth=b_pool_depth,
             x_pool_depth=x_pool_depth,
             mfma_variant=mfma_variant,
+            a2_compact=a2_compact,
         )
 
 
@@ -904,6 +976,7 @@ def compile_flydsl_moe_stage2(
     b_pool_depth: int = 0,
     x_pool_depth: int = 0,
     persist_n: int = 0,
+    a2_compact: bool = False,
 ):
     """Compile stage2 kernel (cached via underlying lru_cache)."""
     if b_dtype == "fp4":
@@ -956,6 +1029,7 @@ def compile_flydsl_moe_stage2(
             x_pool_depth=x_pool_depth,
             persist_n=persist_n,
             mfma_variant=mfma_variant,
+            a2_compact=a2_compact,
         )
 
 
@@ -1026,6 +1100,7 @@ def _s1_args_std(
     n_in,
     k_in,
     size_expert_ids_in,
+    blk_valid_start,
 ):
     return (
         out,
@@ -1041,6 +1116,7 @@ def _s1_args_std(
         n_in,
         k_in,
         size_expert_ids_in,
+        blk_valid_start,
         torch.cuda.current_stream(),
     )
 
@@ -1095,6 +1171,7 @@ def _s2_args_std(
     n_in,
     k_in,
     blocks,
+    blk_valid_start,
 ):
     return (
         target,
@@ -1110,6 +1187,7 @@ def _s2_args_std(
         n_in,
         k_in,
         blocks,
+        blk_valid_start,
         torch.cuda.current_stream(),
     )
 
@@ -1180,6 +1258,8 @@ def flydsl_moe_stage1(
     b_pool_depth: int = 0,
     x_pool_depth: int = 0,
     mfma_variant: Optional[str] = None,
+    a2_compact: bool = False,
+    blk_valid_start: Optional[torch.Tensor] = None,
 ):
     """Fused MOE stage1 GEMM.
 
@@ -1362,6 +1442,9 @@ def flydsl_moe_stage1(
             dev,
         )
     else:
+        _bvs1 = blk_valid_start
+        if _bvs1 is None:
+            _bvs1 = torch.zeros(1, dtype=torch.int32, device=a.device)
         args = _s1_args_std(
             _kernel_out.view(-1),
             a.view(-1),
@@ -1376,6 +1459,7 @@ def flydsl_moe_stage1(
             _n_in,
             _k_in,
             _grid_y,
+            _bvs1,
         )
 
     exe = compile_flydsl_moe_stage1(
@@ -1411,6 +1495,7 @@ def flydsl_moe_stage1(
         b_pool_depth=b_pool_depth,
         x_pool_depth=x_pool_depth,
         mfma_variant=mfma_variant,
+        a2_compact=a2_compact,
     )
     _run_compiled(exe, args)
 
@@ -1500,6 +1585,8 @@ def flydsl_moe_stage2(
     b_pool_depth: int = 0,
     x_pool_depth: int = 0,
     persist_n: int = 0,
+    a2_compact: bool = False,
+    blk_valid_start: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Down-projection GEMM (MOE stage2). Supports atomic/reduce modes.
 
@@ -1517,10 +1604,17 @@ def flydsl_moe_stage2(
         if False, use legacy persist_m mode; if None, auto-select.
     """
 
-    token_num = inter_states.shape[0]
     E = w2.shape[0]
     model_dim = w2.shape[1]
-    inter_dim = inter_states.shape[2]
+    if a2_compact:
+        # compacted a2 is 2-D [total_valid, inter_dim]; the real token count comes
+        # from `out` ([token, model_dim]) since inter_states.shape[0]=total_valid.
+        assert out is not None, "a2_compact requires `out` (source of token_num)"
+        token_num = out.shape[0]
+        inter_dim = inter_states.shape[-1]
+    else:
+        token_num = inter_states.shape[0]
+        inter_dim = inter_states.shape[2]
 
     accumulate = mode != "reduce"
 
@@ -1600,6 +1694,11 @@ def flydsl_moe_stage2(
             dev,
         )
     else:
+        # arg_blk_valid_start is a trailing kernarg on every stage2 kernel (ABI6).
+        # Unused unless a2_compact; pass a 1-elem dummy when not compacting.
+        _bvs = blk_valid_start
+        if _bvs is None:
+            _bvs = torch.zeros(1, dtype=torch.int32, device=inter_states.device)
         args = _s2_args_std(
             target,
             inter_states,
@@ -1614,6 +1713,7 @@ def flydsl_moe_stage2(
             _n_in,
             _k_in,
             m_blocks,
+            _bvs,
         )
 
     exe = compile_flydsl_moe_stage2(
@@ -1644,6 +1744,7 @@ def flydsl_moe_stage2(
         b_pool_depth=b_pool_depth,
         x_pool_depth=x_pool_depth,
         persist_n=persist_n,
+        a2_compact=a2_compact,
     )
     _run_compiled(exe, args)
 

@@ -433,8 +433,16 @@ def compile_moe_gemm1(
     b_pool_depth: int = 0,
     x_pool_depth: int = 0,
     mfma_variant: str | None = None,
+    a2_compact: bool = False,
 ):
     """Compile stage1 kernel (`moe_gemm1`) and return the compiled executable.
+
+    a2_compact (AITER_MOE_A2_COMPACT): write the stage-1 output in COMPACTED
+    expert-major (sorted, no-padding) order -- row = blk_valid_start[bx]+row_local
+    (invalid/padding rows are skipped, reusing the existing t_valid store guard) --
+    instead of scattering token-major. Pairs with stage2 a2_compact. Only the tp2
+    tuned path (CShuffle epilogue, non-async, non-split-K) is supported; other
+    paths raise NotImplementedError.
 
     mfma_variant selects the fp8 MFMA ISA (tunable; must be valid for tile_k):
       - None / "16x16x128" : mfma_scale_f32_16x16x128_f8f6f4 (needs tile_k%128==0),
@@ -580,6 +588,16 @@ def compile_moe_gemm1(
     # else auto (wide 16x16x128 scale MFMA whenever tile_k allows).
     if mfma_variant in ("32x32x16", "mfma32k16"):
         raise ValueError(f"mfma_variant={mfma_variant!r} (32x32x16) not wired in compile_moe_gemm1")
+    # a2_compact vs split-K: incompatible (K-partial accumulate vs the single-write
+    # compact epilogue). a2_compact vs async-copy: compatible -- stage1 async only
+    # affects the a1 INPUT global->LDS load; the compacted a2 OUTPUT store lives in
+    # the (separate) CShuffle epilogue, so the two are orthogonal. (async allowed;
+    # split-K blocked. Still requires the CShuffle epilogue, enforced below.)
+    if a2_compact and _is_splitk1:
+        raise NotImplementedError(
+            "a2_compact (AITER_MOE_A2_COMPACT) stage1 does not support split-K; "
+            f"got k_batch={k_batch}"
+        )
     _force_16x16x32 = mfma_variant in ("16x16x32", "mfma16k32")
     _use_k128_mfma_fp8 = (
         _is_gfx950 and not is_int8 and not is_f16_or_bf16
@@ -649,6 +667,10 @@ def compile_moe_gemm1(
             "yes",
         )
     use_cshuffle_epilog = bool(use_cshuffle_epilog)
+    if a2_compact and not use_cshuffle_epilog:
+        raise NotImplementedError(
+            "a2_compact stage1 requires the CShuffle epilogue (tile_n % 128 == 0)"
+        )
     #if out_dtype != "f16" and use_cshuffle_epilog:
     #    raise ValueError(
     #        "stage1 cshuffle epilog currently supports only f16 output (out_dtype='f16')"
@@ -676,10 +698,11 @@ def compile_moe_gemm1(
     )
     _pm_tag = f"_pm{persist_m}" if persist_m != 1 else ""
     _mfma_tag = f"_mi{mfma_variant}" if mfma_variant else ""
+    _a2c_tag = "_a2c" if a2_compact else ""
     module_name = (
         f"mfma_moe1_{g1u_tag}_{in_dtype}_{out_dtype}_{epilog_tag}"
-        f"_t{tile_m}x{tile_n}x{tile_k}{_async_tag}{_wpe_tag}{_bnt_tag}{_wptr64_tag}{_sk_tag1}{_knob_tag}{_pm_tag}{_mfma_tag}"
-        f"_abi6_wptr64gate"  # ABI bumped: optional 64-bit W load path gated by static size check
+        f"_t{tile_m}x{tile_n}x{tile_k}{_async_tag}{_wpe_tag}{_bnt_tag}{_wptr64_tag}{_sk_tag1}{_knob_tag}{_pm_tag}{_mfma_tag}{_a2c_tag}"
+        f"_abi7_bvsarg"  # ABI bumped: added trailing arg_blk_valid_start kernarg (unused unless a2_compact)
     ).replace("-", "_")
 
     # ── LDS sizing (pure Python; no MLIR Context needed) ─────────────────────
@@ -725,6 +748,7 @@ def compile_moe_gemm1(
             i32_inter_in: fx.Int32,
             i32_k_in: fx.Int32,
             i32_size_expert_ids_in: fx.Int32,
+            arg_blk_valid_start: fx.Tensor,
         ):
             # Unwrap tensor handles to memrefs for ext dialect helpers (e.g. fly.extract_aligned_pointer_as_index).
             #arg_out = arg_out.value
@@ -2411,7 +2435,21 @@ def compile_moe_gemm1(
                             v1 = vector.from_elements(_out_vec_type(), [y16])
                             vector.store(v1, lds_out, [lds_idx], alignment=2)
 
+                    if a2_compact:
+                        _bvs_rsrc1 = buffer_ops.create_buffer_resource(
+                            arg_blk_valid_start,
+                            max_size=False,
+                            num_records_bytes=(size_expert_ids_in * fx.Index(4)),
+                        )
+                        _bvs1_i32 = buffer_ops.buffer_load(
+                            _bvs_rsrc1, bx, vec_width=1, dtype=T.i32
+                        )
+
                     def precompute_row(*, row_local, row):
+                        if a2_compact:
+                            # compacted expert-major row = blk_valid_start[bx] + row_local
+                            _rl_i32 = arith.index_cast(T.i32, row_local)
+                            return (_bvs1_i32 + _rl_i32) * inter_i32_local
                         fused2 = memref.load(lds_tid, [row_local])
                         t2 = fused2 & mask24_i32
                         s2 = fused2 >> 24
@@ -2585,6 +2623,7 @@ def compile_moe_gemm1(
         i32_inter_in: fx.Int32,
         i32_k_in: fx.Int32,
         i32_size_expert_ids_in: fx.Int32,
+        arg_blk_valid_start: fx.Tensor,
         stream: fx.Stream,
     ):
         allocator.finalized = False
@@ -2644,6 +2683,7 @@ def compile_moe_gemm1(
             i32_inter_in,
             i32_k_in,
             i32_size_expert_ids_in,
+            arg_blk_valid_start,
         ).launch(
             grid=grid_dims,
             block=(total_threads, 1, 1),
@@ -2683,8 +2723,15 @@ def compile_moe_gemm2(
     x_pool_depth: int = 0,
     persist_n: int = 0,
     mfma_variant: str | None = None,
+    a2_compact: bool = False,
 ):
     """Compile stage2 kernel (`moe_gemm2`) and return the compiled executable.
+
+    a2_compact (AITER_MOE_A2_COMPACT): read the stage-1 output a2 in COMPACTED
+    expert-major (sorted, no-padding) order instead of gathering token-major via
+    sorted_token_ids. The M-block's contiguous a2 rows start at
+    blk_valid_start[bx] (passed as arg_blk_valid_start). Only the tp2 tuned path
+    (atomic, non-async) is supported; other paths raise NotImplementedError.
 
     mfma_variant selects the fp8 MFMA ISA (tunable; must be valid for tile_k):
       - None / "16x16x128" : mfma_scale_f32_16x16x128_f8f6f4 (needs tile_k%128==0),
@@ -2868,6 +2915,17 @@ def compile_moe_gemm2(
     #   "16x16x32"       -> force mfma_f32_16x16x32_fp8_fp8
     if mfma_variant in ("32x32x16", "mfma32k16"):
         raise ValueError(f"mfma_variant={mfma_variant!r} (32x32x16) not wired in compile_moe_gemm2")
+    # a2_compact vs split-K: fundamentally incompatible (split-K accumulates the
+    # K-partials via atomic/scratch-reduce, which can't map onto the single-write
+    # compact epilogue). a2_compact vs async-copy: COMPATIBLE -- the async
+    # global->LDS DMA A-load reuses the SAME compact-aware ``x_row_base_div4`` row
+    # addressing as the direct buffer-load path, and the compacted-sx epilogue read
+    # is independent of the tile-load mechanism. (async allowed; split-K blocked.)
+    if a2_compact and int(k_batch) > 1:
+        raise NotImplementedError(
+            "a2_compact (AITER_MOE_A2_COMPACT) does not support split-K stage2; "
+            f"got k_batch={k_batch}"
+        )
     _force_16x16x32 = mfma_variant in ("16x16x32", "mfma16k32")
     _use_k128_mfma_fp8 = (
         _is_gfx950 and not is_int8 and not is_f16_or_bf16
@@ -2972,10 +3030,11 @@ def compile_moe_gemm2(
     # caches. Only emitted when partial (>1) so the default stays byte-identical.
     _pn_tag = f"_pn{_persist_n}" if _persist_n > 1 else ""
     _mfma_tag = f"_mi{mfma_variant}" if mfma_variant else ""
+    _a2c_tag = "_a2c2" if a2_compact else ""  # v2: expert-major sx (no host scatter)
     module_name = (
         f"mfma_moe2_{in_dtype}_{out_s}_{epilog_tag}"
-        f"_t{tile_m}x{tile_n}x{tile_k}{_async_tag2}{_wpe_tag2}{_bnt_tag2}{_wptr64_tag}{_sk_tag2}{_knob_tag}{_pm_tag}{_pool_tag}{_pn_tag}{_mfma_tag}"
-        f"_abi5_wptr64gate"  # ABI bumped: optional 64-bit W load path gated by static size check
+        f"_t{tile_m}x{tile_n}x{tile_k}{_async_tag2}{_wpe_tag2}{_bnt_tag2}{_wptr64_tag}{_sk_tag2}{_knob_tag}{_pm_tag}{_pool_tag}{_pn_tag}{_mfma_tag}{_a2c_tag}"
+        f"_abi6_bvsarg"  # ABI bumped: added trailing arg_blk_valid_start kernarg (unused unless a2_compact)
     ).replace("-", "_")
 
     # ── CShuffle epilogue e_vec (pure Python; must be computed before @flyc.kernel
@@ -3033,6 +3092,7 @@ def compile_moe_gemm2(
             i32_n_in: fx.Int32,
             i32_k_in: fx.Int32,
             i32_size_expert_ids_in: fx.Int32,
+            arg_blk_valid_start: fx.Tensor,
         ):
             # Unwrap tensor handles to memrefs for ext dialect helpers (e.g. fly.extract_aligned_pointer_as_index).
             #arg_out = arg_out.value
@@ -3376,6 +3436,20 @@ def compile_moe_gemm2(
                 n_idx = fx.Index(model_dim)
                 expert_off_idx = expert_idx * n_idx  # index
 
+                # a2-compact: compacted a2/scale rows for this M-block start at
+                # blk_valid_start[bx]; the epilogue reads sx at (bvs+row_in_tile)
+                # instead of the token-major ts=t*topk+s (kept expert-major, no
+                # host-side scatter).
+                if a2_compact:
+                    _bvs_epi_rsrc = buffer_ops.create_buffer_resource(
+                        arg_blk_valid_start,
+                        max_size=False,
+                        num_records_bytes=(size_expert_ids_in * fx.Index(4)),
+                    )
+                    _bvs_epi_i32 = buffer_ops.buffer_load(
+                        _bvs_epi_rsrc, bx, vec_width=1, dtype=T.i32
+                    )
+
                 # ---- X gmem->reg prefetch (match preshuffle GEMM mapping) ----
                 # Prefer 16B buffer-load (dwordx4). If the per-thread byte count isn't divisible by
                 # 16, fall back to 8B (dwordx2) or 4B (dword) loads. For fp16/bf16 we require 16B.
@@ -3453,10 +3527,28 @@ def compile_moe_gemm2(
                 x_row_base_div4 = []
                 x_col_local_i32 = []
                 x_row_local = []
+                if a2_compact:
+                    # Compacted expert-major a2: this M-block's rows are contiguous
+                    # starting at blk_valid_start[bx]. No sorted_token_ids gather for A.
+                    _bvs_rsrc = buffer_ops.create_buffer_resource(
+                        arg_blk_valid_start,
+                        max_size=False,
+                        num_records_bytes=(size_expert_ids_in * fx.Index(4)),
+                    )
+                    _bvs_i32 = buffer_ops.buffer_load(
+                        _bvs_rsrc, bx, vec_width=1, dtype=T.i32
+                    )
+                    _bvs_idx = arith.index_cast(T.index, _bvs_i32)
                 for i in range_constexpr(num_x_loads):
                     row_local, col_local_i32 = x_tile_chunk_coord_i32(i)
                     x_row_local.append(row_local)
                     x_col_local_i32.append(col_local_i32)
+
+                    if a2_compact:
+                        # compacted row = blk_valid_start[bx] + row_local (dense, in order).
+                        crow_idx = _bvs_idx + row_local
+                        x_row_base_div4.append(crow_idx * c_k_div4)
+                        continue
 
                     sorted_row_i = bx_m + row_local
                     fused_i = buffer_ops.buffer_load(
@@ -4404,13 +4496,19 @@ def compile_moe_gemm2(
                         t2_safe = ts_ok.select(t2, fx.Int32(0))
                         s2_safe = ts_ok.select(s2, fx.Int32(0))
                         ts2 = t2_safe * topk_i32_v + s2_safe
+                        # a2-compact: read sx at the compacted row (== a2 value row)
+                        # instead of the token-major ts2 (scale stays expert-major).
+                        if a2_compact:
+                            _sx_idx = _bvs_epi_i32 + arith.index_cast(T.i32, row_in_tile)
+                        else:
+                            _sx_idx = ts2
                         sx = (
                             arith.select(ts_ok, fx.Float32(1.0), fx.Float32(0.0))
                             if is_f16_or_bf16
                             else arith.select(
                                 ts_ok,
                                 buffer_ops.buffer_load(
-                                    sx_rsrc, ts2, vec_width=1, dtype=T.f32, cache_modifier=_SCALE_CM
+                                    sx_rsrc, _sx_idx, vec_width=1, dtype=T.f32, cache_modifier=_SCALE_CM
                                 ),
                                 fx.Float32(0.0),
                             )
@@ -4496,11 +4594,18 @@ def compile_moe_gemm2(
                         # ts2 OOB -> buffer returns 0), so masking here is redundant.
                         fused2 = memref.load(lds_tid, [row_in_tile])
                         ts2 = (fused2 & mask24_i32) * topk_i32_v + (fused2 >> 24)
+                        # a2-compact: sx at compacted row (scale stays expert-major).
+                        # Padding rows are dropped by store_pair's guard, so an
+                        # out-of-prefix compacted read here is harmless.
+                        if a2_compact:
+                            _sx_idx = _bvs_epi_i32 + arith.index_cast(T.i32, row_in_tile)
+                        else:
+                            _sx_idx = ts2
                         sx = (
                             fx.Float32(1.0)
                             if is_f16_or_bf16
                             else buffer_ops.buffer_load(
-                                sx_rsrc, ts2, vec_width=1, dtype=T.f32, cache_modifier=_SCALE_CM
+                                sx_rsrc, _sx_idx, vec_width=1, dtype=T.f32, cache_modifier=_SCALE_CM
                             )
                         )
 
@@ -4695,6 +4800,7 @@ def compile_moe_gemm2(
         i32_n_in: fx.Int32,
         i32_k_in: fx.Int32,
         i32_size_expert_ids_in: fx.Int32,
+        arg_blk_valid_start: fx.Tensor,
         stream: fx.Stream,
     ):
         allocator.finalized = False
@@ -4761,6 +4867,7 @@ def compile_moe_gemm2(
             i32_n_in,
             i32_k_in,
             i32_size_expert_ids_in,
+            arg_blk_valid_start,
         ).launch(
             grid=grid_dims,
             block=(total_threads, 1, 1),

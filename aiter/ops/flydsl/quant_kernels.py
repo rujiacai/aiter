@@ -16,6 +16,8 @@ from .kernels.dynamic_quant import (
     GROUP_QUANT_BLOCK_SIZE as _FP4_GROUP_QUANT_BLOCK_SIZE,
     FP4_GROUP_SIZE as _FP4_GROUP_SIZE,
     build_dynamic_per_tensor_quant_module,
+    build_per_token_fp8_quant_module,
+    build_per_token_fp8_quant_blk_valid_module,
     build_per_1x32_fp4_quant_module,
     build_per_1x32_fp4_quant_hadamard_module,
     build_per_1x32_fp4_quant_block_rotation_module,
@@ -26,6 +28,8 @@ from .kernels.dynamic_quant import (
 from .kernels.tensor_shim import get_dtype_str
 
 __all__ = [
+    "flydsl_per_token_fp8_quant",
+    "flydsl_per_token_fp8_quant_blk_valid",
     "flydsl_dynamic_per_tensor_quant",
     "flydsl_per_1x32_fp4_quant",
     "flydsl_per_1x32_fp4_quant_hadamard",
@@ -107,6 +111,146 @@ def _out_dtype_str(dtype: torch.dtype) -> str:
     if dtype == torch.int8:
         return "i8"
     raise ValueError(f"unsupported out dtype: {dtype}")
+
+
+def flydsl_per_token_fp8_quant(
+    input: torch.Tensor,
+    out: "torch.Tensor | None" = None,
+    scale: "torch.Tensor | None" = None,
+    *,
+    block_threads: int = 256,
+    pool_depth: int = 0,
+    stream: torch.cuda.Stream = None,
+):
+    """Per-token (per-row) dynamic fp8 (E4M3) quant.
+
+    Matches ``aiter.dynamic_per_token_scaled_quant`` / ``per_token_quant_hip``:
+    per row, ``scale = amax(|x|) / 448`` (dequant scale) and ``y = round(x/scale)``.
+
+    Parameters
+    ----------
+    input : ``(rows, cols)`` bf16/fp16, contiguous, ``cols % 8 == 0``.
+    out   : optional ``(rows, cols)`` fp8 dest (allocated if None).
+    scale : optional ``(rows,)`` f32 dest (allocated if None).
+
+    Returns ``(out, scale)``.
+    """
+    from aiter import dtypes
+
+    assert input.dim() == 2, f"input must be 2-D (rows, cols), got {input.shape}"
+    if not input.is_contiguous():
+        input = input.contiguous()
+    rows, cols = int(input.shape[0]), int(input.shape[1])
+    in_dtype = get_dtype_str(input.dtype)
+    if in_dtype not in ("bf16", "f16"):
+        raise ValueError(f"unsupported input dtype {input.dtype}; only bf16/fp16")
+    if in_dtype == "f16":
+        in_dtype = "fp16"
+
+    if out is None:
+        out = torch.empty((rows, cols), dtype=dtypes.fp8, device=input.device)
+    if scale is None:
+        scale = torch.empty((rows,), dtype=torch.float32, device=input.device)
+
+    launcher = build_per_token_fp8_quant_module(
+        cols=cols,
+        in_dtype=in_dtype,
+        use_ptr64=bool((rows * cols) >= (1 << 31)),
+        pool_depth=int(pool_depth),
+        block_threads=int(block_threads),
+    )
+    if stream is None:
+        stream = torch.cuda.current_stream()
+    launcher(input, out, scale, rows, stream)
+    return out, scale
+
+
+def flydsl_per_token_fp8_quant_blk_valid(
+    input: torch.Tensor,
+    sorted_token_ids: torch.Tensor,
+    num_valid_ids: torch.Tensor,
+    num_tokens: int,
+    block_m: int,
+    topk: int,
+    out: "torch.Tensor | None" = None,
+    scale: "torch.Tensor | None" = None,
+    *,
+    block_threads: int = 256,
+    pool_depth: int = 0,
+    stream: torch.cuda.Stream = None,
+):
+    """Per-token fp8 quant **fused** with the a2-compact ``blk_valid_start``.
+
+    One kernel: quantizes ``input`` (identical to
+    :func:`flydsl_per_token_fp8_quant`) and, on the first ``num_blocks`` quant
+    WGs (thread 0), counts each sorted M-block's valid rows -- piggybacks on the
+    quant grid (rows >> num_blocks), so the count is ~free. The host then adds a
+    cheap exclusive cumsum. Replaces the standalone ``blk_valid_count`` kernel +
+    the multi-pass torch ``compute_blk_valid_start`` (arange + masks +
+    segmented-sum + a device->host ``.item()`` sync).
+
+    Returns ``(out, scale, blk_valid_start)`` (``blk_valid_start`` ``[num_blocks]``
+    int32). Requires ``rows (== input.shape[0]) >= num_blocks``.
+    """
+    from aiter import dtypes
+
+    assert input.dim() == 2, f"input must be 2-D (rows, cols), got {input.shape}"
+    if not input.is_contiguous():
+        input = input.contiguous()
+    rows, cols = int(input.shape[0]), int(input.shape[1])
+    in_dtype = get_dtype_str(input.dtype)
+    if in_dtype not in ("bf16", "f16"):
+        raise ValueError(f"unsupported input dtype {input.dtype}; only bf16/fp16")
+    if in_dtype == "f16":
+        in_dtype = "fp16"
+
+    if out is None:
+        out = torch.empty((rows, cols), dtype=dtypes.fp8, device=input.device)
+    if scale is None:
+        scale = torch.empty((rows,), dtype=torch.float32, device=input.device)
+
+    n = int(sorted_token_ids.numel())
+    num_blocks = (n + block_m - 1) // block_m
+    # The count piggybacks on the quant grid (one WG per row), so every M-block
+    # must be covered by a row-WG. Holds for tp2 (rows=token >> num_blocks).
+    if num_blocks > rows:
+        raise NotImplementedError(
+            f"fused blk_valid needs rows({rows}) >= num_blocks({num_blocks}); "
+            "use a standalone count for tiny token counts"
+        )
+    dev = input.device
+    if sorted_token_ids.dtype != torch.int32:
+        sorted_token_ids = sorted_token_ids.to(torch.int32)
+    if num_valid_ids.dtype != torch.int32:
+        num_valid_ids = num_valid_ids.to(torch.int32)
+
+    launcher = build_per_token_fp8_quant_blk_valid_module(
+        cols=cols,
+        in_dtype=in_dtype,
+        use_ptr64=bool((rows * cols) >= (1 << 31)),
+        pool_depth=int(pool_depth),
+        block_threads=int(block_threads),
+        block_m=int(block_m),
+        topk=int(topk),
+    )
+    if stream is None:
+        stream = torch.cuda.current_stream()
+    per_block = torch.empty(num_blocks, dtype=torch.int32, device=dev)
+    launcher(
+        input, out, scale, sorted_token_ids, per_block, num_valid_ids,
+        rows, int(num_tokens), n, int(num_blocks), stream,
+    )
+    # Exclusive prefix sum: blk_valid_start[0]=0, [i]=sum(per_block[:i]).
+    # cumsum(dtype=int32) keeps the scan in int32 (no int64 promotion + no
+    # .to(int32) cast copy); out=blk_valid_start[1:] writes the scan result in
+    # place (no slice-assign copy). This removes BOTH direct_copy_kernel_cuda
+    # launches (~10us @1k) that dominated the a2-compact blk_valid bookkeeping.
+    blk_valid_start = torch.zeros(num_blocks, dtype=torch.int32, device=dev)
+    if num_blocks > 1:
+        torch.cumsum(
+            per_block[:-1], dim=0, dtype=torch.int32, out=blk_valid_start[1:]
+        )
+    return out, scale, blk_valid_start
 
 
 def flydsl_dynamic_per_tensor_quant(

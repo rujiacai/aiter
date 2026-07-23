@@ -50,6 +50,9 @@ if is_flydsl_available():
         get_flydsl_stage2_kernels,
         flydsl_moe_stage1,
         flydsl_moe_stage2,
+        compute_blk_valid_start,
+        get_flydsl_kernel_params,
+        _a2c_tune_enabled,
     )
 
 sys.path.insert(0, f"{AITER_CSRC_DIR}/ck_gemm_moe_2stages_codegen/")
@@ -502,6 +505,11 @@ class FmoeTuner(TunerCommon):
             b_pool_depth=kparams.get("b_pool_depth", 0),
             x_pool_depth=kparams.get("x_pool_depth", 0),
             mfma_variant=kparams.get("mfma_variant", None),
+            # a2_compact re-profile hook (AITER_TUNE_MOE_A2C): when set, write the
+            # expert-major compacted output into the caller-provided buffer.
+            out=kparams.get("a2c_out", None),
+            a2_compact=kparams.get("a2_compact", False),
+            blk_valid_start=kparams.get("blk_valid_start", None),
         )
         if isinstance(result, tuple):
             out_raw = result[0]
@@ -578,6 +586,10 @@ class FmoeTuner(TunerCommon):
             b_pool_depth=kparams.get("b_pool_depth", 0),
             x_pool_depth=kparams.get("x_pool_depth", 0),
             persist_n=kparams.get("persist_n", 0),
+            # a2_compact re-profile hook (AITER_TUNE_MOE_A2C): read the compacted
+            # expert-major a2 (caller passes an already-compacted inter_states).
+            a2_compact=kparams.get("a2_compact", False),
+            blk_valid_start=kparams.get("blk_valid_start", None),
         )
 
     @staticmethod
@@ -2898,6 +2910,152 @@ class FmoeTuner(TunerCommon):
         )
         resultdf.to_csv(file, index=False)
 
+    def _tune_a2c_for_best(self, best_one):
+        """AITER_TUNE_MOE_A2C: decide a2_compact for the best (stage1,stage2) pair.
+
+        a2_compact is a COUPLED stage1<->stage2 property, so it is decided here
+        (post-selection) rather than as a per-kernel candidate: re-profile the best
+        flydsl pair with the compacted layout (same harness for both), and return 1
+        iff it is numerically correct (cos vs the token-major pipeline) AND faster
+        than token-major. Any ineligibility/error -> 0 (safe, unchanged behaviour).
+        """
+        if not (is_flydsl_available() and _a2c_tune_enabled()):
+            return 0
+        try:
+            kn1 = str(best_one.get("kernelName1", ""))
+            kn2 = str(best_one.get("kernelName2", ""))
+            if not (kn1.startswith("flydsl_") and kn2.startswith("flydsl_")):
+                return 0
+            if int(best_one.get("run_1stage", 0)) == 1:
+                return 0
+            p1 = get_flydsl_kernel_params(kn1)
+            p2 = get_flydsl_kernel_params(kn2)
+            if p1 is None or p2 is None:
+                return 0
+            bm = int(best_one["block_m"])
+            bm2 = int(best_one.get("block_m2", bm))
+            # Eligibility mirrors fused_moe's a2c gate + the stage1/stage2 kernel
+            # guards: both flydsl, matching block_m/tile_m, non-split-K (async OK),
+            # plain per-Token bf16/fp16 -> fp8.
+            if bm != bm2 or int(p1["tile_m"]) != bm or int(p2["tile_m"]) != bm:
+                return 0
+            if int(p1.get("k_batch", 1)) != 1 or int(p2.get("k_batch", 1)) != 1:
+                return 0
+            if str(best_one["q_type2"]) != str(QuantType.per_Token):
+                return 0
+            dtype = best_one["dtype"]
+            if dtype not in (dtypes.bf16, dtypes.fp16) or best_one["q_dtype_a"] != dtypes.fp8:
+                return 0
+
+            import torch
+            from aiter.test_common import run_perftest
+
+            token = int(best_one["token"]); model_dim = int(best_one["model_dim"])
+            inter_dim = int(best_one["inter_dim"]); expert = int(best_one["expert"])
+            topk = int(best_one["topk"]); use_g1u1 = bool(int(best_one["use_g1u1"]))
+            doweight_stage1 = bool(int(best_one["doweight_stage1"]))
+            act_type = best_one["act_type"]; q_type = best_one["q_type"]
+            q_dtype_a = best_one["q_dtype_a"]; q_dtype_w = best_one["q_dtype_w"]
+            q_dtype_a2 = best_one["q_dtype_a2"]; q_dtype_w2 = best_one["q_dtype_w2"]
+            q_type2 = best_one["q_type2"]
+            act = ("swiglu" if act_type == ActivationType.Swiglu
+                   else "gelu" if act_type == ActivationType.Gelu else "silu")
+
+            d1 = FmoeTuner.generate_data_2stages(
+                token, model_dim, inter_dim, expert, topk, act_type, dtype,
+                q_dtype_a, q_dtype_w, q_type, use_g1u1, doweight_stage1, bm, 1,
+                q_dtype_a2, q_dtype_w2, q_type2)
+            a1_qt, w1_ck, a1s = d1[0], d1[1], d1[3]
+            sids, seids, sw, nvi, w1sa = d1[5], d1[6], d1[7], d1[8], d1[15]
+            d2 = FmoeTuner.generate_data_2stages(
+                token, model_dim, inter_dim, expert, topk, act_type, dtype,
+                q_dtype_a, q_dtype_w, q_type, use_g1u1, doweight_stage1, bm, 2,
+                q_dtype_a2, q_dtype_w2, q_type2)
+            sids2, seids2, sw2, nvi2 = d2[5], d2[6], d2[7], d2[8]
+            moe_buf, w2fly, w2sf = d2[9], d2[17], d2[19]
+            bvs, total_valid = compute_blk_valid_start(sids, token, bm, topk, nvi)
+            dev = a1_qt.device
+
+            FP8 = dtypes.fp8; FP8_MAX = torch.finfo(FP8).max
+
+            def rowwise_fp8(x2d):
+                amax = x2d.abs().amax(dim=1, keepdim=True).clamp(min=1e-8)
+                scale = (amax / FP8_MAX).to(torch.float32)
+                q = (x2d.to(torch.float32) / scale).clamp(-FP8_MAX, FP8_MAX).to(FP8)
+                return q, scale.squeeze(1)
+
+            def s1(out=None, a2c=False):
+                return flydsl_moe_stage1(
+                    a=a1_qt, w1=w1_ck, sorted_token_ids=sids, sorted_expert_ids=seids,
+                    num_valid_ids=nvi, topk=topk, tile_m=bm, tile_n=p1["tile_n"],
+                    tile_k=p1["tile_k"], a_dtype=p1["a_dtype"], b_dtype=p1["b_dtype"],
+                    out_dtype=p1["out_dtype"], act=act, use_g1u1=use_g1u1,
+                    w1_scale=w1sa, a1_scale=a1s,
+                    sorted_weights=(sw if doweight_stage1 else None),
+                    use_cshuffle_epilog=True,
+                    use_async_copy=p1.get("use_async_copy", False),
+                    waves_per_eu=p1.get("waves_per_eu", 3), b_nt=p1.get("b_nt", 2),
+                    b_pool_depth=p1.get("b_pool_depth", 0),
+                    x_pool_depth=p1.get("x_pool_depth", 0),
+                    mfma_variant=p1.get("mfma_variant", None),
+                    out=out, a2_compact=a2c, blk_valid_start=(bvs if a2c else None))
+
+            def s2(a2, a2_scale, a2c=False):
+                moe_buf.zero_()
+                return flydsl_moe_stage2(
+                    inter_states=a2, w2=w2fly, sorted_token_ids=sids2,
+                    sorted_expert_ids=seids2, num_valid_ids=nvi2, out=moe_buf,
+                    topk=topk, tile_m=bm, tile_n=p2["tile_n"], tile_k=p2["tile_k"],
+                    a_dtype=p2["a_dtype"], b_dtype=p2["b_dtype"],
+                    out_dtype=p2["out_dtype"], mode=p2.get("mode", "atomic"),
+                    w2_scale=w2sf, a2_scale=a2_scale,
+                    sorted_weights=(sw2 if not doweight_stage1 else None),
+                    use_async_copy=p2.get("use_async_copy", False),
+                    waves_per_eu=p2.get("waves_per_eu", 3), b_nt=p2.get("b_nt", 2),
+                    mfma_variant=p2.get("mfma_variant", None),
+                    a2_compact=a2c, blk_valid_start=(bvs if a2c else None))
+
+            # token-major baseline (same harness)
+            a2b, us1_b = run_perftest(s1, a2c=False)
+            a2b_q, a2b_s = rowwise_fp8(a2b.reshape(token * topk, inter_dim))
+            out_base, us2_b = run_perftest(
+                s2, a2b_q.view(token, topk, inter_dim), a2b_s, a2c=False)
+            out_base = out_base.clone()
+
+            # compacted (stage1 writes compacted -> correct order; scale stays compacted)
+            out_c = torch.zeros(total_valid, inter_dim, dtype=dtype, device=dev)
+            _, us1_c = run_perftest(s1, out=out_c, a2c=True)
+            a2c_q, a2c_s = rowwise_fp8(out_c)
+            out_comp, us2_c = run_perftest(s2, a2c_q, a2c_s, a2c=True)
+
+            cos = torch.nn.functional.cosine_similarity(
+                out_base.float().flatten(), out_comp.float().flatten(), dim=0).item()
+
+            nb = int(bvs.numel())
+            per_block = torch.randint(0, max(2, topk + 1), (nb,),
+                                      dtype=torch.int32, device=dev)
+
+            def _bv():
+                b = torch.zeros(nb, dtype=torch.int32, device=dev)
+                if nb > 1:
+                    torch.cumsum(per_block[:-1], dim=0, dtype=torch.int32, out=b[1:])
+                return b
+
+            _, us_bv = run_perftest(_bv)
+
+            us_base = float(us1_b) + float(us2_b)
+            us_comp = float(us1_c) + float(us2_c) + float(us_bv)
+            win = (cos > 0.99) and (us_comp < us_base)
+            print(
+                f"  [a2c-tune] cos={cos:.4f} base={us_base:.2f}"
+                f"(s1{us1_b:.2f}+s2{us2_b:.2f}) compact={us_comp:.2f}"
+                f"(s1{us1_c:.2f}+s2{us2_c:.2f}+bv{us_bv:.2f}) -> a2_compact={int(win)}"
+            )
+            return 1 if win else 0
+        except Exception as e:
+            print(f"  [a2c-tune] skipped (error: {e})")
+            return 0
+
     def post_process(self, results, args, topk=-1, fast_mode=False):
         profileDF = []
         profileDF = []
@@ -3150,6 +3308,7 @@ class FmoeTuner(TunerCommon):
                         -1,
                         -1,
                         active_expert_val,
+                        0,  # a2_compact (unused on the failed/invalid row)
                     ]
                 )
                 failedf = pd.DataFrame(ret, columns=self.columns)
@@ -3229,6 +3388,7 @@ class FmoeTuner(TunerCommon):
             profileDF["tflops"] = results[0]
             profileDF["bw"] = results[1]
             profileDF["active_expert"] = active_expert_val
+            profileDF["a2_compact"] = 0  # default; set per-shape below (AITER_TUNE_MOE_A2C)
             profileDF.drop(["tflops1", "tflops2", "bw1", "bw2"], axis=1, inplace=True)
             profileDF["err1"] = profileDF["err1"].apply(lambda x: f"{x:.1%}")
             profileDF["err2"] = profileDF["err2"].apply(lambda x: f"{x:.1%}")
@@ -3245,6 +3405,9 @@ class FmoeTuner(TunerCommon):
                 f"{(best_one['block_m'], best_one.get('block_m2', best_one['block_m'])) ,best_one['kernelName1'], best_one['kernelName2'], best_one['err1'], best_one['err2'],  best_one['run_1stage']} "
                 f"{best_one['us']} us, {best_one['tflops']} TFLOPS, {best_one['bw']} GB/s"
             )
+            # AITER_TUNE_MOE_A2C: re-profile the best pair with the compacted a2
+            # layout and record a2_compact=1 iff it is correct and faster.
+            best_one["a2_compact"] = self._tune_a2c_for_best(best_one)
             best_one["act_type"] = str(best_one["act_type"])
             best_one["q_type"] = str(best_one["q_type"])
             best_one["dtype"] = str(best_one["dtype"])
@@ -3308,6 +3471,7 @@ class FmoeTuner(TunerCommon):
                     non_flydsl_df["bw"] = 0
                     fb = non_flydsl_df.loc[non_flydsl_df["us"].idxmin()].copy()
                     fb["active_expert"] = active_expert_val
+                    fb["a2_compact"] = 0  # non-flydsl fallback never uses a2-compact
                     fb["act_type"] = str(fb["act_type"])
                     fb["q_type"] = str(fb["q_type"])
                     fb["dtype"] = str(fb["dtype"])
@@ -3395,6 +3559,10 @@ if __name__ == "__main__":
         "tflops",
         "bw",
         "active_expert",
+        # a2_compact (AITER_MOE_A2_COMPACT): 1 => expert-major compacted a2 layout
+        # for this shape (chosen by the tuner when AITER_TUNE_MOE_A2C=1 and it is
+        # correct + faster). Default 0. Read back by fused_moe's a2c gate.
+        "a2_compact",
     ]
     tuner = FmoeTuner("fmoeTuner", key, resultList, "fmoe tuner")
     args = tuner.parse_args()

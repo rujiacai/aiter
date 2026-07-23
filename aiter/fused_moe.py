@@ -25,10 +25,14 @@ if is_flydsl_available():
         flydsl_per_1x32_fp4_quant_block_rotation_mfma_sort,
         flydsl_per_1x32_fp4_quant_block_rotation_mfma_sort_inplace,
     )
+    from aiter.ops.flydsl.quant_kernels import (
+        flydsl_per_token_fp8_quant_blk_valid,
+    )
 else:  # noqa: E501
     flydsl_per_1x32_fp4_quant_block_rotation_mfma = None  # type: ignore[assignment]
     flydsl_per_1x32_fp4_quant_block_rotation_mfma_sort = None  # type: ignore[assignment]
     flydsl_per_1x32_fp4_quant_block_rotation_mfma_sort_inplace = None  # type: ignore[assignment]
+    flydsl_per_token_fp8_quant_blk_valid = None  # type: ignore[assignment]
 
 BLOCK_SIZE_M = 32
 
@@ -941,6 +945,13 @@ class MOEMetadata:
     has_bias: bool = False
     use_non_temporal_load: bool = True
     fuse_fp4_quant: bool = False
+    # AITER_MOE_A2_COMPACT (tunable): expert-major compacted a2 layout. A single
+    # per-config flag drives BOTH stage1 and stage2 so the two stages are always
+    # consistent (compacted write in stage1 <-> compacted read in stage2). Only
+    # honored on the flydsl-2stage path; the gate downstream still validates that
+    # both selected kernels actually support it (non-async, non-split-K, matching
+    # tile_m) and otherwise falls both stages back to token-major together.
+    a2_compact: bool = False
 
     def __post_init__(self):
         if self.block_m2 is None:
@@ -1007,6 +1018,9 @@ def _flydsl_stage1_wrapper(
         b_pool_depth=parsed.get("b_pool_depth", 0),
         x_pool_depth=parsed.get("x_pool_depth", 0),
         mfma_variant=parsed.get("mfma_variant", None),
+        # AITER_MOE_A2_COMPACT: expert-major compacted a2 output (gated upstream).
+        a2_compact=_kwargs.get("a2_compact", False),
+        blk_valid_start=_kwargs.get("blk_valid_start", None),
     )
 
 
@@ -1061,6 +1075,9 @@ def _flydsl_stage2_wrapper(
         # reduce-mode scratch only needs zeroing when slots may be unwritten
         # (EP / variable dispatch); default True keeps direct callers safe.
         zero_intermediate=_kwargs.get("zero_intermediate", True),
+        # AITER_MOE_A2_COMPACT: read expert-major compacted a2 (gated upstream).
+        a2_compact=_kwargs.get("a2_compact", False),
+        blk_valid_start=_kwargs.get("blk_valid_start", None),
     )
 
 
@@ -1369,6 +1386,14 @@ def get_2stage_cfgs(
     is_flydsl2 = bool(kernelName2) and kernelName2.startswith("flydsl_")
     if (is_flydsl1 or is_flydsl2) and is_flydsl_available():
         _s1_fq = is_flydsl1 and "_fq" in kernelName1
+        # a2_compact tunable flag (optional CSV column). Only meaningful when BOTH
+        # stages are flydsl so the compacted write (stage1) and read (stage2) stay
+        # consistent; the downstream gate re-validates actual kernel support.
+        _a2c_raw = cfg.get("a2_compact", 0) if cfg is not None else 0
+        try:
+            _a2c_cfg = bool(int(float(_a2c_raw))) and is_flydsl1 and is_flydsl2
+        except (TypeError, ValueError):
+            _a2c_cfg = False
         if is_flydsl1:
             stage1_func = functools.partial(
                 _flydsl_stage1_wrapper,
@@ -1415,6 +1440,7 @@ def get_2stage_cfgs(
             block_m2=block_m2,
             run_1stage=run_1stage,
             fuse_fp4_quant=_s1_fq and q_type2 == QuantType.per_1x32,
+            a2_compact=_a2c_cfg,
         )
     if (
         dtype in [dtypes.bf16, dtypes.fp16]
@@ -1694,7 +1720,89 @@ def fused_moe_2stages(
         q_dtype_w2=q_dtype_w2,
         q_type2=q_type2,
     )
-    if (
+
+    # ── AITER_MOE_A2_COMPACT gate (decision) ─────────────────────────────────
+    # Decide whether to use the expert-major compacted a2 layout, and whether the
+    # a1 (stage1-input) per-token fp8 quant can be FUSED with the per-M-block
+    # valid-count (blk_valid_start) in one flydsl kernel. blk_valid_start is then
+    # produced either by that fused quant or by a torch fallback below.
+    _a2c_blk_valid_start = None
+    _use_a2c = False
+    _a2c_fuse_a1 = False
+    _bm = int(block_size_M)
+    # Trigger: an explicit AITER_MOE_A2_COMPACT env var overrides (force on/off,
+    # for testing/bringup); otherwise fall back to the per-config tunable flag
+    # (metadata.a2_compact). A single flag drives BOTH stages, so stage1 (compact
+    # write) and stage2 (compact read) are always consistent.
+    _a2c_env = os.getenv("AITER_MOE_A2_COMPACT", None)
+    _a2c_want = (
+        (_a2c_env == "1")
+        if _a2c_env is not None
+        else bool(getattr(metadata, "a2_compact", False))
+    )
+    if _a2c_want:
+        _s1_fd = getattr(metadata.stage1, "func", None) is _flydsl_stage1_wrapper
+        _s2_fd = getattr(metadata.stage2, "func", None) is _flydsl_stage2_wrapper
+        _shared_sort = (sorted_ids2 is sorted_ids) and (
+            int(block_size_M) == int(block_size_M2)
+        )
+        _plain_q2 = (q_type2 == QuantType.per_Token) and not metadata.fuse_fp4_quant
+        if _s1_fd and _s2_fd and _shared_sort and _plain_q2:
+            _p1 = aiter.ops.flydsl.moe_kernels.get_flydsl_kernel_params(
+                metadata.stage1.keywords.get("kernelName", "")
+            )
+            _p2 = aiter.ops.flydsl.moe_kernels.get_flydsl_kernel_params(
+                metadata.stage2.keywords.get("kernelName", "")
+            )
+            _tile_ok = (
+                _p1 is not None and _p2 is not None
+                and int(_p1["tile_m"]) == _bm and int(_p2["tile_m"]) == _bm
+            )
+            # async-copy is compatible with a2_compact on BOTH stages (validated
+            # bit-exact vs the token-major path): stage1 async only touches the a1
+            # INPUT load while the compacted a2 OUTPUT store lives in the separate
+            # CShuffle epilogue; stage2 async reuses the same compact-aware row
+            # addressing (x_row_base_div4) as the direct load. Only split-K stays
+            # blocked (K-partial accumulate can't map onto the single-write compact
+            # epilogue).
+            _path_ok = _tile_ok and (
+                int(_p1.get("k_batch", 1)) == 1
+                and int(_p2.get("k_batch", 1)) == 1
+            )
+            if _path_ok:
+                _use_a2c = True
+                _num_blocks_a2c = (sorted_ids.numel() + _bm - 1) // _bm
+                # Fuse blk_valid into the a1 per-token fp8 quant on the plain
+                # bf16->fp8 per-Token path (non-EP), when every M-block is covered
+                # by a row-WG (rows=token >= num_blocks).
+                _a2c_fuse_a1 = (
+                    flydsl_per_token_fp8_quant_blk_valid is not None
+                    and quant_type == QuantType.per_Token
+                    and q_dtype_a == dtypes.fp8
+                    and hidden_states.dtype in (dtypes.bf16, dtypes.fp16)
+                    and fc1_smooth_scale is None
+                    and num_local_tokens is None
+                    and token_num >= _num_blocks_a2c
+                )
+            else:
+                logger.warning(
+                    "[fused_moe] AITER_MOE_A2_COMPACT ignored (unsupported cfg): "
+                    f"s1={_p1 and (_p1.get('tile_m'), _p1.get('use_async_copy'), _p1.get('k_batch'))}, "
+                    f"s2={_p2 and (_p2.get('tile_m'), _p2.get('use_async_copy'), _p2.get('k_batch'))}, "
+                    f"block_m={_bm}"
+                )
+
+    if _use_a2c and _a2c_fuse_a1:
+        # Fused: a1 per-token fp8 quant + per-M-block valid count in one kernel.
+        a1, a1_scale, _a2c_blk_valid_start = flydsl_per_token_fp8_quant_blk_valid(
+            hidden_states, sorted_ids, num_valid_ids, token_num, _bm, topk,
+        )
+        a1_scale = a1_scale.reshape(token_num, 1)
+        logger.info(
+            "[fused_moe] AITER_MOE_A2_COMPACT active: fused a1-quant+blk_valid "
+            f"block_m={_bm}"
+        )
+    elif (
         quant_type == QuantType.per_1x32
         and dtype in [dtypes.bf16, dtypes.fp16]
         and w1.dtype == dtypes.fp4x2
@@ -1809,6 +1917,17 @@ def fused_moe_2stages(
             a1_scale is not None or quant_type == QuantType.No
         ), "a1_scale must be provided for quantized input for fused_moe"
         a1 = hidden_states
+    # blk_valid_start fallback: compact is on but the a1 quant wasn't the fused
+    # flydsl path -> compute the per-M-block valid prefix on the host (torch).
+    if _use_a2c and _a2c_blk_valid_start is None:
+        _a2c_blk_valid_start, _ = aiter.ops.flydsl.moe_kernels.compute_blk_valid_start(
+            sorted_ids, token_num, _bm, topk, num_valid_ids
+        )
+        logger.info(
+            "[fused_moe] AITER_MOE_A2_COMPACT active: torch blk_valid (a1-quant "
+            f"not fused) block_m={_bm}"
+        )
+
     if quant_type == QuantType.per_1x128 and metadata.stage1.func is asm_stage1:
         ratio = a1_scale.element_size() // a1.element_size()
         a2 = torch.empty(
@@ -1816,6 +1935,11 @@ def fused_moe_2stages(
             dtype=q_dtype_a,
             device=device,
         )
+    elif _use_a2c:
+        # Compacted expert-major stage1 output. Allocate the token-major upper
+        # bound (token_num*topk >= total_valid; equal for dense non-EP) so we
+        # never need total_valid on the host (no device->host sync).
+        a2 = torch.empty((token_num * topk, inter_dim), dtype=dtype, device=device)
     else:
         # On the per-block rotation path (W1_R/W2_R) the CK stage1 GEMM
         # addresses its ``a2`` output with a 32-bit element offset, so once
@@ -1856,6 +1980,11 @@ def fused_moe_2stages(
     # kwarg so non-FlyDSL stage2 impls (CK/asm) never receive it.
     if getattr(metadata.stage2, "func", None) is _flydsl_stage2_wrapper:
         extra_stage2_args["zero_intermediate"] = stage2_zero_intermediate
+    if _use_a2c:
+        extra_stage1_args["a2_compact"] = True
+        extra_stage1_args["blk_valid_start"] = _a2c_blk_valid_start
+        extra_stage2_args["a2_compact"] = True
+        extra_stage2_args["blk_valid_start"] = _a2c_blk_valid_start
     a2 = metadata.stage1(
         a1,
         w1,
@@ -1927,6 +2056,16 @@ def fused_moe_2stages(
             .view(token_num, -1)
         )
         a2 = a2_v
+    elif _use_a2c:
+        # a2 is compacted [total_valid, inter_dim]: quantize per compacted row and
+        # keep the per-row scale in the SAME expert-major (compacted) order. The
+        # stage2 epilogue reads sx at the compacted row (blk_valid_start[bx]+row),
+        # so NO host-side scatter back to token-major is needed (this removes the
+        # dominant compact overhead: the index-math + index_put scatter kernels).
+        a2, a2_scale = quant_func2(
+            a2, quant_dtype=q_dtype_a2, num_rows=num_local_tokens
+        )
+        a2_scale = a2_scale.view(-1)  # [total_valid], compacted-row order
     else:
         a2, a2_scale = quant_func2(
             a2,

@@ -485,6 +485,603 @@ def build_dynamic_per_tensor_quant_module(
     return launch_dynamic_per_tensor_quant
 
 
+@functools.lru_cache(maxsize=None)
+def _build_per_token_fp8_quant_impl(
+    cols: int,
+    in_dtype: str = "bf16",
+    use_ptr64: bool = False,
+    pool_depth: int = 0,
+    block_threads: int = 256,
+):
+    """Impl for the PURE per-token fp8 (E4M3) quant kernel. Do not call directly
+    -- use :func:`build_per_token_fp8_quant_module`.
+
+    Build a launcher for per-**token** (per-row) dynamic fp8 (E4M3) quant.
+
+    ``pool_depth`` sets the software-pipeline / ping-pong depth for the row
+    loads (number of buffer loads kept in flight; ``0`` -> full = ``num_iters``).
+    ``block_threads`` is the WG size; when it is a single wave (== ``WARP_SIZE``)
+    the cross-wave LDS reduce + barrier are skipped entirely (intra-wave only).
+
+    One workgroup per row: pass 1 computes the row amax (per-thread -> intra-wave
+    shuffle-xor -> cross-wave LDS reduce, all WG-local, no atomics); the dequant
+    scale ``amax/448`` is broadcast via LDS and written to ``scale[row]``; pass 2
+    reuses the register-cached row to emit ``y = round(x / scale)`` as fp8.
+    Semantics match ``aiter.dynamic_per_token_scaled_quant`` /
+    ``per_token_quant_hip``.
+    """
+    if cols <= 0 or (cols % VEC) != 0:
+        raise ValueError(f"cols must be a positive multiple of VEC={VEC}, got {cols}")
+    if in_dtype not in ("bf16", "fp16", "f16"):
+        raise ValueError(f"unsupported input dtype: {in_dtype!r}")
+
+    bt = int(block_threads)
+    if bt <= 0 or bt % WARP_SIZE != 0:
+        raise ValueError(f"block_threads must be a positive multiple of {WARP_SIZE}")
+    nw = bt // WARP_SIZE  # waves per WG
+
+    elem_bytes_in = 2
+    inv_dtype_max_val = 1.0 / _FP8_E4M3_MAX
+    cols_per_iter = bt * VEC
+    num_iters = (cols + cols_per_iter - 1) // cols_per_iter
+
+    gpu_arch = get_hip_arch()
+    sym_tag = f"pt_fp8_lds_{cols}_{in_dtype}_bt{bt}"
+    allocator = SmemAllocator(None, arch=gpu_arch, global_sym_name=sym_tag)
+    lds_red_offset = allocator._align(allocator.ptr, 16)
+    allocator.ptr = lds_red_offset + max(nw, 1) * 4  # nw f32 partials
+
+    def _emit_quant(inp, out, scale):
+        """Emit the per-token fp8 quant body; returns (bid_i32, tid_i32)."""
+        from flydsl._mlir.dialects import memref as _memref
+
+        bid = fx.block_idx.x
+        tid = fx.thread_idx.x
+        f32 = T.f32
+        i32 = T.i32
+        in_elem_ty = _input_elem_mlir_type(in_dtype)
+        in_vec_ty = T.vec(VEC, in_elem_ty)
+
+        c0_i32 = arith.constant(0, type=i32)
+        c1_i32 = arith.constant(1, type=i32)
+        c64_i32 = arith.constant(WARP_SIZE, type=i32)
+        c0_f32 = arith.constant(0.0, type=f32)
+        c_inv_dmax = arith.constant(inv_dtype_max_val, type=f32)
+        cols_i32 = arith.constant(cols, type=i32)
+        vec_i32 = arith.constant(VEC, type=i32)
+
+        in_rsrc = buffer_ops.create_buffer_resource(inp, max_size=True)
+        out_rsrc = buffer_ops.create_buffer_resource(out, max_size=True)
+        scale_rsrc = buffer_ops.create_buffer_resource(scale, max_size=True)
+
+        tid_i32 = ArithValue(tid)
+        bid_i32 = ArithValue(bid)
+        row_elem_base = bid_i32 * cols_i32
+
+        if use_ptr64:
+            inp_base_ptr, _ptr_ty_as1 = _global_base_ptr(inp)
+            out_base_ptr, _ = _global_base_ptr(out)
+            row_base_idx = arith.index_cast(T.index, bid_i32) * arith.constant(
+                cols, type=T.index
+            )
+        vec_dw = VEC * elem_bytes_in // 4  # 4 dwords for VEC=8 bf16
+
+        # ── Pass 1: prefetched (ping-pong / pooled) row loads + per-thread amax
+        _pd = num_iters if pool_depth <= 0 else min(int(pool_depth), num_iters)
+
+        def _issue_load(it):
+            col_thread = tid_i32 * vec_i32 + arith.constant(
+                it * cols_per_iter, type=i32
+            )
+            in_range = arith.cmpi(CmpIPredicate.ult, col_thread, cols_i32)
+            elem_off = row_elem_base + col_thread
+            if use_ptr64:
+                safe_col_idx = arith.index_cast(
+                    T.index, arith.select(in_range, col_thread, c0_i32)
+                )
+                raw = _ptr64_load_dwords(
+                    inp_base_ptr, _ptr_ty_as1, row_base_idx + safe_col_idx,
+                    elem_bytes_in, vec_dw,
+                )
+            else:
+                safe_elem_off = arith.select(in_range, elem_off, row_elem_base)
+                raw = buffer_ops.buffer_load(
+                    in_rsrc, safe_elem_off >> c1_i32, vec_width=vec_dw, dtype=i32
+                )
+            return raw, in_range, elem_off
+
+        # Prime the pool: issue the first _pd loads (all kept in flight).
+        inflight = []
+        for j in range_constexpr(_pd):
+            inflight.append(_issue_load(j))
+
+        x_cache = [None] * num_iters
+        local_max = c0_f32
+        for it in range_constexpr(num_iters):
+            raw_i32, in_range, elem_off = inflight[it % _pd]
+            nxt = it + _pd
+            if nxt < num_iters:
+                # Issue the next load before consuming current -> overlap.
+                inflight[it % _pd] = _issue_load(nxt)
+            x_f32 = vector.bitcast(in_vec_ty, raw_i32).extf(T.vec(VEC, f32))
+            x_cache[it] = (x_f32, in_range, elem_off)
+            for vi in range_constexpr(VEC):
+                v = vector.extract(x_f32, static_position=[vi], dynamic_position=[])
+                abs_v = _llvm.call_intrinsic(f32, "llvm.fabs.f32", [v], [], [])
+                local_max = arith.maximumf(
+                    local_max, arith.select(in_range, abs_v, c0_f32)
+                )
+
+        # ── Row amax reduce: intra-wave shuffle-xor + ONE-barrier cross-wave ──
+        for sh in [32, 16, 8, 4, 2, 1]:
+            peer = local_max.shuffle_xor(arith.constant(sh, type=i32), c64_i32)
+            local_max = arith.maximumf(local_max, peer)
+
+        if nw == 1:
+            # Single-wave WG: intra-wave shuffle-xor already yields the row max;
+            # no LDS, no barrier.
+            row_max = local_max
+        else:
+            base_ptr = allocator.get_base()
+            lds_red_view = SmemPtr(
+                base_ptr, lds_red_offset, T.f32, shape=(nw,)
+            ).get()
+            lane_i32 = tid_i32 & arith.constant(WARP_SIZE - 1, type=i32)
+            wave_i32 = tid_i32 >> arith.constant(6, type=i32)
+            is_lane0 = arith.cmpi(CmpIPredicate.eq, lane_i32, c0_i32)
+            _if_l0 = _scf.IfOp(is_lane0)
+            with ir.InsertionPoint(_if_l0.then_block):
+                _memref.store(
+                    local_max, lds_red_view, [arith.index_cast(T.index, wave_i32)]
+                )
+                _scf.YieldOp([])
+            gpu.barrier()
+
+            # Every thread reads the nw wave-partials and reduces locally
+            # (no second barrier / broadcast round-trip).
+            row_max = _memref.load(lds_red_view, [arith.index_cast(T.index, c0_i32)])
+            for w in range_constexpr(nw - 1):
+                pw = _memref.load(
+                    lds_red_view,
+                    [arith.index_cast(T.index, arith.constant(w + 1, type=i32))],
+                )
+                row_max = arith.maximumf(row_max, pw)
+        row_scale = row_max * c_inv_dmax  # dequant scale = amax / 448
+        inv_scale = _llvm.call_intrinsic(
+            f32, "llvm.amdgcn.rcp.f32", [row_scale], [], []
+        )
+        is_tid0 = arith.cmpi(CmpIPredicate.eq, tid_i32, c0_i32)
+        _if_s = _scf.IfOp(is_tid0)
+        with ir.InsertionPoint(_if_s.then_block):
+            buffer_ops.buffer_store(row_scale, scale_rsrc, bid_i32)
+            _scf.YieldOp([])
+
+        # ── Pass 2: quant (reuse cached row) + fp8 pack/store ────────────────
+        for it in range_constexpr(num_iters):
+            x_f32, in_range, elem_off = x_cache[it]
+            sv = []
+            for vi in range_constexpr(VEC):
+                v = vector.extract(x_f32, static_position=[vi], dynamic_position=[])
+                sv.append(v * inv_scale)
+            packed0 = rocdl.cvt_pk_fp8_f32(i32, sv[0], sv[1], c0_i32, 0)
+            packed0 = rocdl.cvt_pk_fp8_f32(i32, sv[2], sv[3], packed0, 1)
+            packed1 = rocdl.cvt_pk_fp8_f32(i32, sv[4], sv[5], c0_i32, 0)
+            packed1 = rocdl.cvt_pk_fp8_f32(i32, sv[6], sv[7], packed1, 1)
+            packed_vec = vector.from_elements(T.vec(2, i32), [packed0, packed1])
+            _if_store = _scf.IfOp(in_range)
+            with ir.InsertionPoint(_if_store.then_block):
+                if use_ptr64:
+                    elem_idx_out = row_base_idx + arith.index_cast(
+                        T.index, arith.select(in_range, elem_off, c0_i32)
+                    )
+                    _ptr64_store(
+                        packed_vec, out_base_ptr, _ptr_ty_as1, elem_idx_out, 8
+                    )
+                else:
+                    buffer_ops.buffer_store(
+                        packed_vec, out_rsrc, elem_off, offset_is_bytes=True
+                    )
+                _scf.YieldOp([])
+
+        return bid_i32, tid_i32
+
+    def _finalize_lds():
+        allocator.finalized = False
+        ctx = CompilationContext.get_current()
+        with ir.InsertionPoint(ctx.gpu_module_body):
+            allocator.finalize()
+
+    @flyc.kernel
+    def per_token_fp8_quant_kernel(
+        inp: fx.Tensor,
+        out: fx.Tensor,
+        scale: fx.Tensor,
+    ):
+        _emit_quant(inp, out, scale)
+
+    @flyc.jit
+    def launch_per_token_fp8_quant(
+        inp: fx.Tensor,
+        out: fx.Tensor,
+        scale: fx.Tensor,
+        rows: Int32,
+        stream: fx.Stream = fx.Stream(None),
+    ):
+        _finalize_lds()
+        rows_idx = arith.index_cast(T.index, rows)
+        per_token_fp8_quant_kernel(inp, out, scale).launch(
+            grid=(rows_idx, 1, 1), block=(bt, 1, 1), stream=stream
+        )
+
+    return launch_per_token_fp8_quant
+
+
+@functools.lru_cache(maxsize=None)
+def _build_per_token_fp8_quant_blk_valid_impl(
+    cols: int,
+    in_dtype: str = "bf16",
+    use_ptr64: bool = False,
+    pool_depth: int = 0,
+    block_threads: int = 256,
+    block_m: int = 128,
+    topk: int = 8,
+):
+    """Impl for the per-token fp8 (E4M3) quant kernel FUSED with the a2-compact
+    per-M-block valid count. Do not call directly -- use
+    :func:`build_per_token_fp8_quant_blk_valid_module`.
+
+    Quant is identical to :func:`_build_per_token_fp8_quant_impl` (code is
+    intentionally duplicated for a clean, self-contained kernel); additionally
+    the first ``num_blocks`` WGs (thread 0) count their sorted M-block into
+    ``per_block_count`` (piggybacks on the quant grid since rows >> num_blocks).
+    """
+    if cols <= 0 or (cols % VEC) != 0:
+        raise ValueError(f"cols must be a positive multiple of VEC={VEC}, got {cols}")
+    if in_dtype not in ("bf16", "fp16", "f16"):
+        raise ValueError(f"unsupported input dtype: {in_dtype!r}")
+
+    bt = int(block_threads)
+    if bt <= 0 or bt % WARP_SIZE != 0:
+        raise ValueError(f"block_threads must be a positive multiple of {WARP_SIZE}")
+    nw = bt // WARP_SIZE  # waves per WG
+
+    elem_bytes_in = 2
+    inv_dtype_max_val = 1.0 / _FP8_E4M3_MAX
+    cols_per_iter = bt * VEC
+    num_iters = (cols + cols_per_iter - 1) // cols_per_iter
+
+    gpu_arch = get_hip_arch()
+    sym_tag = f"pt_fp8_blk_lds_{cols}_{in_dtype}_bt{bt}_bm{block_m}_tk{topk}"
+    allocator = SmemAllocator(None, arch=gpu_arch, global_sym_name=sym_tag)
+    lds_red_offset = allocator._align(allocator.ptr, 16)
+    allocator.ptr = lds_red_offset + max(nw, 1) * 4  # nw f32 amax partials
+    lds_cnt_offset = allocator._align(allocator.ptr, 16)
+    allocator.ptr = lds_cnt_offset + max(nw, 1) * 4  # nw i32 count partials
+
+    def _emit_quant(inp, out, scale):
+        """Emit the per-token fp8 quant body; returns (bid_i32, tid_i32)."""
+        from flydsl._mlir.dialects import memref as _memref
+
+        bid = fx.block_idx.x
+        tid = fx.thread_idx.x
+        f32 = T.f32
+        i32 = T.i32
+        in_elem_ty = _input_elem_mlir_type(in_dtype)
+        in_vec_ty = T.vec(VEC, in_elem_ty)
+
+        c0_i32 = arith.constant(0, type=i32)
+        c1_i32 = arith.constant(1, type=i32)
+        c64_i32 = arith.constant(WARP_SIZE, type=i32)
+        c0_f32 = arith.constant(0.0, type=f32)
+        c_inv_dmax = arith.constant(inv_dtype_max_val, type=f32)
+        cols_i32 = arith.constant(cols, type=i32)
+        vec_i32 = arith.constant(VEC, type=i32)
+
+        in_rsrc = buffer_ops.create_buffer_resource(inp, max_size=True)
+        out_rsrc = buffer_ops.create_buffer_resource(out, max_size=True)
+        scale_rsrc = buffer_ops.create_buffer_resource(scale, max_size=True)
+
+        tid_i32 = ArithValue(tid)
+        bid_i32 = ArithValue(bid)
+        row_elem_base = bid_i32 * cols_i32
+
+        if use_ptr64:
+            inp_base_ptr, _ptr_ty_as1 = _global_base_ptr(inp)
+            out_base_ptr, _ = _global_base_ptr(out)
+            row_base_idx = arith.index_cast(T.index, bid_i32) * arith.constant(
+                cols, type=T.index
+            )
+        vec_dw = VEC * elem_bytes_in // 4  # 4 dwords for VEC=8 bf16
+
+        # ── Pass 1: prefetched (ping-pong / pooled) row loads + per-thread amax
+        _pd = num_iters if pool_depth <= 0 else min(int(pool_depth), num_iters)
+
+        def _issue_load(it):
+            col_thread = tid_i32 * vec_i32 + arith.constant(
+                it * cols_per_iter, type=i32
+            )
+            in_range = arith.cmpi(CmpIPredicate.ult, col_thread, cols_i32)
+            elem_off = row_elem_base + col_thread
+            if use_ptr64:
+                safe_col_idx = arith.index_cast(
+                    T.index, arith.select(in_range, col_thread, c0_i32)
+                )
+                raw = _ptr64_load_dwords(
+                    inp_base_ptr, _ptr_ty_as1, row_base_idx + safe_col_idx,
+                    elem_bytes_in, vec_dw,
+                )
+            else:
+                safe_elem_off = arith.select(in_range, elem_off, row_elem_base)
+                raw = buffer_ops.buffer_load(
+                    in_rsrc, safe_elem_off >> c1_i32, vec_width=vec_dw, dtype=i32
+                )
+            return raw, in_range, elem_off
+
+        # Prime the pool: issue the first _pd loads (all kept in flight).
+        inflight = []
+        for j in range_constexpr(_pd):
+            inflight.append(_issue_load(j))
+
+        x_cache = [None] * num_iters
+        local_max = c0_f32
+        for it in range_constexpr(num_iters):
+            raw_i32, in_range, elem_off = inflight[it % _pd]
+            nxt = it + _pd
+            if nxt < num_iters:
+                # Issue the next load before consuming current -> overlap.
+                inflight[it % _pd] = _issue_load(nxt)
+            x_f32 = vector.bitcast(in_vec_ty, raw_i32).extf(T.vec(VEC, f32))
+            x_cache[it] = (x_f32, in_range, elem_off)
+            for vi in range_constexpr(VEC):
+                v = vector.extract(x_f32, static_position=[vi], dynamic_position=[])
+                abs_v = _llvm.call_intrinsic(f32, "llvm.fabs.f32", [v], [], [])
+                local_max = arith.maximumf(
+                    local_max, arith.select(in_range, abs_v, c0_f32)
+                )
+
+        # ── Row amax reduce: intra-wave shuffle-xor + ONE-barrier cross-wave ──
+        for sh in [32, 16, 8, 4, 2, 1]:
+            peer = local_max.shuffle_xor(arith.constant(sh, type=i32), c64_i32)
+            local_max = arith.maximumf(local_max, peer)
+
+        if nw == 1:
+            row_max = local_max
+        else:
+            base_ptr = allocator.get_base()
+            lds_red_view = SmemPtr(
+                base_ptr, lds_red_offset, T.f32, shape=(nw,)
+            ).get()
+            lane_i32 = tid_i32 & arith.constant(WARP_SIZE - 1, type=i32)
+            wave_i32 = tid_i32 >> arith.constant(6, type=i32)
+            is_lane0 = arith.cmpi(CmpIPredicate.eq, lane_i32, c0_i32)
+            _if_l0 = _scf.IfOp(is_lane0)
+            with ir.InsertionPoint(_if_l0.then_block):
+                _memref.store(
+                    local_max, lds_red_view, [arith.index_cast(T.index, wave_i32)]
+                )
+                _scf.YieldOp([])
+            gpu.barrier()
+            row_max = _memref.load(lds_red_view, [arith.index_cast(T.index, c0_i32)])
+            for w in range_constexpr(nw - 1):
+                pw = _memref.load(
+                    lds_red_view,
+                    [arith.index_cast(T.index, arith.constant(w + 1, type=i32))],
+                )
+                row_max = arith.maximumf(row_max, pw)
+        row_scale = row_max * c_inv_dmax  # dequant scale = amax / 448
+        inv_scale = _llvm.call_intrinsic(
+            f32, "llvm.amdgcn.rcp.f32", [row_scale], [], []
+        )
+        is_tid0 = arith.cmpi(CmpIPredicate.eq, tid_i32, c0_i32)
+        _if_s = _scf.IfOp(is_tid0)
+        with ir.InsertionPoint(_if_s.then_block):
+            buffer_ops.buffer_store(row_scale, scale_rsrc, bid_i32)
+            _scf.YieldOp([])
+
+        # ── Pass 2: quant (reuse cached row) + fp8 pack/store ────────────────
+        for it in range_constexpr(num_iters):
+            x_f32, in_range, elem_off = x_cache[it]
+            sv = []
+            for vi in range_constexpr(VEC):
+                v = vector.extract(x_f32, static_position=[vi], dynamic_position=[])
+                sv.append(v * inv_scale)
+            packed0 = rocdl.cvt_pk_fp8_f32(i32, sv[0], sv[1], c0_i32, 0)
+            packed0 = rocdl.cvt_pk_fp8_f32(i32, sv[2], sv[3], packed0, 1)
+            packed1 = rocdl.cvt_pk_fp8_f32(i32, sv[4], sv[5], c0_i32, 0)
+            packed1 = rocdl.cvt_pk_fp8_f32(i32, sv[6], sv[7], packed1, 1)
+            packed_vec = vector.from_elements(T.vec(2, i32), [packed0, packed1])
+            _if_store = _scf.IfOp(in_range)
+            with ir.InsertionPoint(_if_store.then_block):
+                if use_ptr64:
+                    elem_idx_out = row_base_idx + arith.index_cast(
+                        T.index, arith.select(in_range, elem_off, c0_i32)
+                    )
+                    _ptr64_store(
+                        packed_vec, out_base_ptr, _ptr_ty_as1, elem_idx_out, 8
+                    )
+                else:
+                    buffer_ops.buffer_store(
+                        packed_vec, out_rsrc, elem_off, offset_is_bytes=True
+                    )
+                _scf.YieldOp([])
+
+        return bid_i32, tid_i32
+
+    def _emit_blk_count(
+        bid_i32, tid_i32, arg_sorted, arg_count, arg_nvi,
+        i32_num_tokens, i32_n, i32_num_blocks,
+    ):
+        """First num_blocks WGs count their sorted M-block's valid rows IN
+        PARALLEL (each thread one+ entries -> intra-wave shuffle-xor sum ->
+        cross-wave LDS), thread 0 stores it; host cumsum -> blk_valid_start."""
+        from flydsl._mlir.dialects import memref as _memref
+        i32 = T.i32
+        c0 = arith.constant(0, type=i32)
+        c1 = arith.constant(1, type=i32)
+        c24 = arith.constant(24, type=i32)
+        c64_i32 = arith.constant(WARP_SIZE, type=i32)
+        mask24 = arith.constant(0xFFFFFF, type=i32)
+        topk_c = arith.constant(int(topk), type=i32)
+        bm_c = arith.constant(int(block_m), type=i32)
+        s_rsrc = buffer_ops.create_buffer_resource(
+            arg_sorted, max_size=False,
+            num_records_bytes=arith.index_cast(T.index, i32_n) * arith.index(4),
+        )
+        c_rsrc = buffer_ops.create_buffer_resource(
+            arg_count, max_size=False,
+            num_records_bytes=arith.index_cast(T.index, i32_num_blocks) * arith.index(4),
+        )
+        nvi_rsrc = buffer_ops.create_buffer_resource(arg_nvi, max_size=True)
+        # nb_ok is uniform across the WG (all threads share bid), so the barrier
+        # below is safe.
+        nb_ok = arith.cmpi(CmpIPredicate.ult, bid_i32, i32_num_blocks)
+        _if_c = _scf.IfOp(nb_ok)
+        with ir.InsertionPoint(_if_c.then_block):
+            nvi = buffer_ops.buffer_load(nvi_rsrc, c0, vec_width=1, dtype=i32)
+            # Each thread accumulates its strided entries (n_strides=1 when
+            # block_m <= block_threads, i.e. the tp2 case).
+            n_strides = (block_m + bt - 1) // bt
+            my = c0
+            for st in range_constexpr(n_strides):
+                k_i32 = tid_i32 + arith.constant(st * bt, type=i32)
+                in_bm = arith.cmpi(CmpIPredicate.ult, k_i32, bm_c)
+                idx_i32 = bid_i32 * bm_c + k_i32
+                safe_idx = arith.select(in_bm, idx_i32, c0)
+                fused = buffer_ops.buffer_load(s_rsrc, safe_idx, vec_width=1, dtype=i32)
+                tok = fused & mask24
+                slot = fused >> c24
+                pos_ok = arith.cmpi(CmpIPredicate.ult, safe_idx, nvi)
+                tok_ok = arith.cmpi(CmpIPredicate.ult, tok, i32_num_tokens)
+                slot_ok = arith.cmpi(CmpIPredicate.ult, slot, topk_c)
+                v = in_bm & pos_ok & tok_ok & slot_ok
+                my = my + arith.select(v, c1, c0)
+            # intra-wave sum reduce
+            for sh in [32, 16, 8, 4, 2, 1]:
+                my = my + my.shuffle_xor(arith.constant(sh, type=i32), c64_i32)
+            if nw == 1:
+                total = my
+            else:
+                base_ptr = allocator.get_base()
+                lds_cnt = SmemPtr(base_ptr, lds_cnt_offset, T.i32, shape=(nw,)).get()
+                lane_i32 = tid_i32 & arith.constant(WARP_SIZE - 1, type=i32)
+                wave_i32 = tid_i32 >> arith.constant(6, type=i32)
+                is_lane0 = arith.cmpi(CmpIPredicate.eq, lane_i32, c0)
+                _if_l = _scf.IfOp(is_lane0)
+                with ir.InsertionPoint(_if_l.then_block):
+                    _memref.store(my, lds_cnt, [arith.index_cast(T.index, wave_i32)])
+                    _scf.YieldOp([])
+                gpu.barrier()
+                total = _memref.load(lds_cnt, [arith.index_cast(T.index, c0)])
+                for w in range_constexpr(nw - 1):
+                    pw = _memref.load(
+                        lds_cnt,
+                        [arith.index_cast(T.index, arith.constant(w + 1, type=i32))],
+                    )
+                    total = total + pw
+            is_t0 = arith.cmpi(CmpIPredicate.eq, tid_i32, c0)
+            _if_t0 = _scf.IfOp(is_t0)
+            with ir.InsertionPoint(_if_t0.then_block):
+                buffer_ops.buffer_store(total, c_rsrc, bid_i32)
+                _scf.YieldOp([])
+            _scf.YieldOp([])
+
+    def _finalize_lds():
+        allocator.finalized = False
+        ctx = CompilationContext.get_current()
+        with ir.InsertionPoint(ctx.gpu_module_body):
+            allocator.finalize()
+
+    @flyc.kernel
+    def per_token_fp8_quant_blk_kernel(
+        inp: fx.Tensor,
+        out: fx.Tensor,
+        scale: fx.Tensor,
+        arg_sorted_ids: fx.Tensor,
+        arg_count: fx.Tensor,
+        arg_num_valid_ids: fx.Tensor,
+        i32_num_tokens: fx.Int32,
+        i32_n: fx.Int32,
+        i32_num_blocks: fx.Int32,
+    ):
+        bid_i32, tid_i32 = _emit_quant(inp, out, scale)
+        _emit_blk_count(
+            bid_i32, tid_i32, arg_sorted_ids, arg_count, arg_num_valid_ids,
+            i32_num_tokens, i32_n, i32_num_blocks,
+        )
+
+    @flyc.jit
+    def launch_per_token_fp8_quant_blk(
+        inp: fx.Tensor,
+        out: fx.Tensor,
+        scale: fx.Tensor,
+        arg_sorted_ids: fx.Tensor,
+        arg_count: fx.Tensor,
+        arg_num_valid_ids: fx.Tensor,
+        rows: Int32,
+        i32_num_tokens: fx.Int32,
+        i32_n: fx.Int32,
+        i32_num_blocks: fx.Int32,
+        stream: fx.Stream = fx.Stream(None),
+    ):
+        _finalize_lds()
+        rows_idx = arith.index_cast(T.index, rows)
+        per_token_fp8_quant_blk_kernel(
+            inp, out, scale, arg_sorted_ids, arg_count, arg_num_valid_ids,
+            i32_num_tokens, i32_n, i32_num_blocks,
+        ).launch(grid=(rows_idx, 1, 1), block=(bt, 1, 1), stream=stream)
+
+    return launch_per_token_fp8_quant_blk
+
+
+def build_per_token_fp8_quant_module(
+    cols: int,
+    in_dtype: str = "bf16",
+    use_ptr64: bool = False,
+    pool_depth: int = 0,
+    block_threads: int = 256,
+):
+    """Per-token (per-row) dynamic fp8 (E4M3) quant launcher (pure quant).
+
+    Launcher signature: ``(inp, out, scale, rows, stream)``. See
+    :func:`_build_per_token_fp8_quant_impl` for the kernel details.
+    """
+    return _build_per_token_fp8_quant_impl(
+        cols=cols,
+        in_dtype=in_dtype,
+        use_ptr64=use_ptr64,
+        pool_depth=pool_depth,
+        block_threads=block_threads,
+    )
+
+
+def build_per_token_fp8_quant_blk_valid_module(
+    cols: int,
+    in_dtype: str = "bf16",
+    use_ptr64: bool = False,
+    pool_depth: int = 0,
+    block_threads: int = 256,
+    block_m: int = 128,
+    topk: int = 8,
+):
+    """Per-token fp8 quant **fused** with the a2-compact per-M-block valid count.
+
+    Same quant as :func:`build_per_token_fp8_quant_module`, plus: the first
+    ``num_blocks`` WGs (thread 0) count their sorted M-block into
+    ``per_block_count`` (piggybacks on the quant grid since rows >> num_blocks).
+    Launcher signature: ``(inp, out, scale, sorted_ids, per_block_count,
+    num_valid_ids, rows, num_tokens, n, num_blocks, stream)``.
+    """
+    return _build_per_token_fp8_quant_blk_valid_impl(
+        cols=cols,
+        in_dtype=in_dtype,
+        use_ptr64=use_ptr64,
+        pool_depth=pool_depth,
+        block_threads=block_threads,
+        block_m=block_m,
+        topk=topk,
+    )
+
+
 # MXFP4 per-1x32 dynamic quant (CUDA dynamic_per_group_scaled_quant): 1
 # thread/32-elem group -> absMax -> E8M0 (next-pow2 RNE) -> cvt fp4, 1 launch.
 
