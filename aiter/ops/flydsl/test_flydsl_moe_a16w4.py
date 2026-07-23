@@ -250,17 +250,17 @@ def test_e2e(token, model_dim, inter_dim, E, topk, block_m=32):
 
 
 def _time_cuda(fn, iters=50, warmup=5):
-    for _ in range(warmup):
-        fn()
-    torch.cuda.synchronize()
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    start.record()
-    for _ in range(iters):
-        fn()
-    end.record()
-    torch.cuda.synchronize()
-    return start.elapsed_time(end) / iters * 1000.0  # us
+    """Per-iter latency (us) via aiter.test_common.run_perftest.
+
+    Uses run_perftest's default torch.profiler path -> DEVICE kernel time (sum of
+    GPU kernel execution, excludes host launch / Python overhead), so all timings in
+    this file and test_flydsl_moe_a8w4.py match test_moe_lowbit_compare.py's metric.
+    (Set AITER_LOG_MORE=1 to fall back to cuda.Event wall-clock inside run_perftest.)
+    """
+    from aiter.test_common import run_perftest
+
+    _, us = run_perftest(fn, num_iters=iters, num_warmup=warmup)
+    return us
 
 
 def compare_triton(token, model_dim, inter_dim, E, topk, block_m=32, iters=50):
@@ -479,9 +479,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--stage", choices=["stage1", "stage2", "e2e", "all"], default="all")
     ap.add_argument("-t", "--tokens", type=int, action="append", default=None)
-    ap.add_argument("--model-dim", type=int, default=4096)
-    ap.add_argument("--inter-dim", type=int, default=512)
-    ap.add_argument("-E", "--experts", type=int, default=256)
+    ap.add_argument("--model-dim", type=int, default=7168)
+    ap.add_argument("--inter-dim", type=int, default=384)
+    ap.add_argument("-E", "--experts", type=int, default=384)
     ap.add_argument("--topk", type=int, default=6)
     ap.add_argument("--compare-triton", action="store_true")
     ap.add_argument("--compare-e2e", action="store_true",
