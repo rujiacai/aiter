@@ -62,19 +62,228 @@ def prep_a8w4_w4(wq_fp4x2, e8m0_scale, N, K):
 
 ---
 
-## 3. MFMA 布局基础：K64 micro-step 与 per-32 scale
+## 3. 权重数据流与布局：fp4 → shuffle → load → fp8 MFMA（为何一条 MFMA 横跨两个 scale block）
 
-内核基座是 `moe_gemm_2stage.py`（与 a16w4 同一套 pipeline）。用的是 `mfma_f32_16x16x32_fp8_fp8`（K=32）。关键结构：
+内核基座是 `moe_gemm_2stage.py`（与 a16w4 同一套 pipeline），用 `mfma_f32_16x16x32_fp8_fp8`。本节从头到尾把「权重从 HBM 的 fp4 到喂进 MFMA 的 fp8」这条链讲清，并推导出 straddle（一条 MFMA 横跨两个 scale block）的精确成因。
 
-- **一个 K64 micro-step = 2 个 K32 MFMA operand**（记作 `r0`, `r1`）。
-- 每个 lane 持有一个 K32 operand 的 8 个 fp8 元素；`lane_div_16 ∈ {0,1,2,3}` 是 K-octet 号，octet j → operand-K `[j*8 : j*8+8]`。
-- **权重的 per-32 E8M0 scale**：每 32 个 K 一个 scale。一个 dword 打包 2 个相邻 block 的 bf16 scale（block `2ku` 和 `2ku+1`）。
+### 3.1 这条 MFMA 指令（fp8）
+一条指令算一个小块：**C[16×16] += A[16×32] × B[32×16]**（M=16, N=16, **K=32**，fp8 输入 / f32 累加），由一个 wavefront 的 **64 个 lane 协同**完成。A、B 各 512 个 fp8，512/64 = **每个 lane 装 8 个 fp8**。
 
-**关键事实（用 `aiter_logs/derive_mapping.py` 打 marker 实测得到）**：传统 preshuffle 布局（`shuffle_weight(16,16)`）下，**一个 K32 operand 的 32 个元素横跨 2 个 scale block**：
-- `lane_div_16 ∈ {0,1}`（octet 0,1，前 16 个 K）→ block A
-- `lane_div_16 ∈ {2,3}`（octet 2,3，后 16 个 K）→ block B
+> **命名**：MFMA `C = A × B` 里 **A = 激活(M×K)、B = 权重(K×N)**。preshuffle（`shuffle_weight`）**只作用于 weight(B)**；激活 A 从不 preshuffle。
 
-这就是 §5 需要 fold、§6 要做 aligned 的根本原因。
+### 3.2 operand-K 与 octet
+- **operand-K**：这一条 MFMA 指令内部的 K 索引 **0..31**（"逻辑 K"，**不是** HBM 里的原始 K）。MFMA 算 `Σ_{k=0..31} A[m,k]·B[k,n]`，A/B **共享**同一个 operand-K —— 同一个 k 必须是同一个原始 K 才乘得对（§6 "A+B 协同"的根源）。
+- **octet**：64 lane 按 `octet = lane//16` 分 4 组（各 16 lane），每 lane 的 8 个 fp8 = operand-K 的一段 `[octet*8 : +8]`；`lane%16` = A 的行 M / B 的列 N。
+
+| octet=lane//16 | 持有的 operand-K | | lane 例 | lane%16 | octet | B 侧含义 |
+|---|---|---|---|---|---|---|
+| 0 | `[0:8]`   | | 0  | 0 | 0 | B[K0–7, n=0]  |
+| 1 | `[8:16]`  | | 16 | 0 | 1 | B[K8–15, n=0] |
+| 2 | `[16:24]` | | 33 | 1 | 2 | B[K16–23, n=1]|
+| 3 | `[24:32]` | | 48 | 0 | 3 | B[K24–31, n=0]|
+
+代码里 `lane_div_16` = octet，`lane_mod_16` = M/N。
+
+### 3.3 权重的四个阶段（表示 / 打包 / 排布）
+
+| 阶段 | 表示 | 打包 | 一个 lane·一个 operand |
+|---|---|---|---|
+| ① HBM 原始 | e2m1 **fp4** | 2 码/字节 (fp4x2) | 8 码 = 4 字节 |
+| ② host shuffle 后 | e2m1 **fp4** | 2 码/字节 | 同上（只重排字节） |
+| ③ load 进寄存器 | e2m1 **fp4** | dwordx2=8 字节 | 8 字节 = 16 码 = r0(8)+r1(8) |
+| ④ dequant 后 | **fp8** | 1 值/字节 | 8 fp8 = 8 字节(i64) |
+
+- **① 原始 mxfp4**：权重 `(E, N, K)` 的 e2m1 码，K 连续；**per-32 E8M0 scale**：block `b` = 原始 K `[b*32 : (b+1)*32]`。
+- **② host shuffle**（`prep_a8w4_w4` = `shuffle_weight(16,16)` + `pack`）：
+  - `shuffle_weight(16,16)`：`view(E, N/16, 16, K/32, 2, 16)` → `permute` → 内存序 **`(n0, k0=K/32, kk=2, n=16, k_in=16)`**，原始 K = **`k0*32 + kk*16 + k_in`**。
+  - `pack_int8_to_packed_int4`：每连续 8 码 → 4 字节（偶低/奇高，见 §7.1）。
+- **③ load**（`make_preshuffle_b_layout`，`kpack_bytes=8`）：内核按 **64-K 单位** 布局 **`(n0, k0'=K/64, klane=4, n=16, kpack=8字节)`**。一次 wide load 取一个 lane 的 8 字节 = 16 码 = `r0`(前 4 字节) + `r1`(后 4 字节)。
+- **④ dequant**（`unpack_b_w4a16_mxfp4_to_fp8*`，§4）：e2m1 码 → fp8 值，**逐元素、无损、不重排 K**（第 i 码 → 第 i 个 fp8）。每 lane 8 fp8 = 一个 K32 operand 的该 lane 数据 → 喂 MFMA。
+
+**要点**：K 的归属（哪个原始 K 落到哪个 `(operand, octet, 位置)`）在 **② host shuffle** 就定死了；③ load 只搬运、④ dequant 只换数值精度，**都不重排**。所以 straddle 与 fp4→fp8 无关，是 ② 的布局决定的。
+
+#### 3.3.1 ③ load 展开：layout 5 维 + stride 怎么算
+
+`make_preshuffle_b_layout(kpack_bytes=8)` 构造的是一个 **5 维连续 layout**，告诉 buffer_load 每个 lane 该读哪几个字节：
+
+```227:229:/data/aiter/aiter/ops/flydsl/kernels/mfma_preshuffle_pipeline.py
+    layout_b = fx.make_layout(
+        (n0_i32, c_k0_i32, klane_dim, 16, kpack_elems_static), stride_b
+    )
+```
+
+| 维（外→内） | 值 | 含义 |
+|---|---|---|
+| `n0` | `N/16` | N 方向每 16 行一组 |
+| `k0'` | `K/64` | K 方向**每 64 个一步**（一个 K64 micro-step）|
+| `klane` | `4` | 组内 4 个 klane = 4 个 **octet**（lane//16），每 octet 管 16 K |
+| `n` | `16` | 组内 16 行 N（lane%16）|
+| `kpack` | `8 字节` | 一个 lane 持有 **8 字节 = 16 nibble = 16 个 e2m1 码** |
+
+**stride = 「该维索引 +1 时，线性字节地址跳多少字节」**。因为字节连续无空洞，铁律是「**外层维 stride = 它内部所有维 size 连乘**」，于是从最内维往外累乘：
+
+```210:216:/data/aiter/aiter/ops/flydsl/kernels/mfma_preshuffle_pipeline.py
+        c64 = fx.Index(64)
+        c4 = fx.Index(4)
+        c_k0 = c_k_bytes // c64
+        klane_dim = 4
+        stride_klane = c16 * stride_nlane
+        stride_k0 = c4 * stride_klane
+        stride_n0 = c_k0 * stride_k0
+```
+
+```
+维:      kpack(8)   n(16)      klane(4)     k0'(K/64)      n0(N/16)
+stride:    1     →    8    →     128     →     512      →  (K/64)·512
+累乘:      起点  ×kpack=8  ×n=16→128   ×klane=4→512   ×k0'
+含义:  连续字节  跳1个lane  跳16行×8B   跳4个octet     跳整个K维
+              的kpack    (一个octet)  (一个64-K组)
+```
+
+- `kpack` stride=1：一个 lane 的 8 字节相邻。
+- `n`   stride=8：走下一行 N，跳过上一行那个 lane 的整 8 字节 kpack → 16 行占 `16×8=128` B。
+- `klane` stride=128：走下一个 octet，跳过里面整个 `n×kpack` 块（`16×8=128`）→ 4 octet 占 `4×128=512` B。
+- `k0'` stride=512：走下一个 64-K 组，跳过里面整个 `klane×n×kpack` 块（`4×128=512`）。
+- `n0`  stride=`(K/64)·512`：走下一个 N 组，跳过它覆盖的全部 K。
+
+**校验一个 `(n0,k0')` tile**：`4(klane)×16(n)×8(kpack) = 512 B = 1024 nibble`，覆盖 `16 行 N × 64 K = 1024` 码 ✓（无空洞、无重叠）。
+
+**地址例子**：`n0=0, k0'=1, klane=2, n=3, kpack=0` → `addr = 1·512 + 2·128 + 3·8 = 792` B；从此起一条 `dwordx2` 读 8 字节 = 该 lane 的 16 个码。
+
+**wide load**（`load_b_pack_k32_pair_raw`）：一条 `dwordx2` 读 8 字节 → bitcast 成 `vec(2,i32)`：
+
+```761:764:/data/aiter/aiter/ops/flydsl/kernels/mfma_preshuffle_pipeline.py
+    b_i32x2 = vector.bitcast(T.vec(2, T.i32), b8)
+    r0 = vector.extract(b_i32x2, static_position=[0], dynamic_position=[])
+    r1 = vector.extract(b_i32x2, static_position=[1], dynamic_position=[])
+    return r0, r1
+```
+
+- `r0` = 前 4 字节 = 8 码 = 第 1 个 K32 operand 该 lane 的数据
+- `r1` = 后 4 字节 = 8 码 = 第 2 个 K32 operand 该 lane 的数据
+
+**为什么 load 单位是 64-K（而非 32-K）**：纯访存指令数优化——一条 `dwordx2` 一次拉两个 K32 operand，B-load 指令数减半（旧版是两条 `dword`）。unpack 的 ALU 基本被 MFMA 掩盖，访存指令数才是 a8w4 Phase-1 的真实瓶颈。这个 64-K vs 32-K（scale/shuffle）的错配，正是 §3.4 straddle 的根源。
+
+#### 3.3.2 ④ dequant 展开：e2m1 码 → fp8（默认 perm-LUT 路径）
+
+**默认路径**（`AITER_A8W4_PERMLUT=1`，见 §4/§8）走 `unpack_b_w4a16_mxfp4_to_fp8_permlut`。它把一个 `packed32`（8 码）变成一个 `i64`（8 fp8）= 一个 K32 operand 该 lane 的 8 元素：
+
+```637:640:/data/aiter/aiter/ops/flydsl/kernels/mfma_preshuffle_pipeline.py
+    even, odd = _unpack_mxfp4_nibble_pair(packed32)
+    fe = _e2m1x4_in_i32_to_fp8x4_i32_permlut(even, arith, vector, ratios=ratios_even)
+    fo = _e2m1x4_in_i32_to_fp8x4_i32_permlut(odd, arith, vector, ratios=ratios_odd)
+    return _pack_i32_pair_to_i64(fe, fo, vector)
+```
+
+**1. 拆 nibble** `_unpack_mxfp4_nibble_pair`：`even = packed32 & 0x0F0F0F0F`（每字节低 4 位 → 前 4 fp8）、`odd = (packed32>>4) & 0x0F0F0F0F`（高 4 位 → 后 4 fp8）。e2m1 码是**无符号 0–15**，只 mask、**不做符号扩展**（区别于 int4）。这与 §7.1 pack 的「偶低/奇高」互为逆运算。
+
+**2. 每 4 码 → 4 fp8** `_e2m1x4_in_i32_to_fp8x4_i32_permlut`：**查表(3× `v_perm_b32`) +（可选）scheme B fold**。
+
+先用 16 项常量 LUT（e2m1 码 → e4m3fnuz 字节，4 个 dword）3 次 `v_perm_b32` 直接把码翻成 fp8 字节：
+
+```604:609:/data/aiter/aiter/ops/flydsl/kernels/mfma_preshuffle_pipeline.py
+    sel = v & fx.Int32(0x07070707)
+    res_lo = fx.Int32(rocdl.perm_b32(lut_lo_hi, lut_lo_lo, sel))  # codes 0..7
+    res_hi = fx.Int32(rocdl.perm_b32(lut_hi_hi, lut_hi_lo, sel))  # codes 8..15
+    # blend by bit3 of each code: output byte i from res_lo (sel i) or res_hi (i+4).
+    blend_sel = fx.Int32(0x03020100) | ((v >> fx.Int32(1)) & fx.Int32(0x04040404))
+    fp8x4 = rocdl.perm_b32(res_hi, res_lo, blend_sel)
+```
+
+- `sel = code & 0x07`：码低 3 位选 8 字节池内的字节；`res_lo` 查 codes 0–7、`res_hi` 查 codes 8–15。
+- `blend_sel` 按每个码的 **bit3** 在 `res_lo`/`res_hi` 间挑选 → 得到 4 个 fp8 字节 `fp8x4`。
+- 这就替掉了旧版 `_e2m1x4_in_i32_to_fp8x4_i32` 的 ~15 int-op/nibble 位构造，**直接码→fp8**。
+
+##### 展开：3× `v_perm_b32` 为什么能当 16 项 LUT 用
+
+**先记住 `perm_b32(A, B, sel)` 的语义**（AMD 字节重排指令）：把低位操作数 `B` 的 4 字节 + 高位操作数 `A` 的 4 字节拼成一个 **8 字节池** `pool[0..7]`（`pool[0..3]=B`、`pool[4..7]=A`）；输出 4 字节，**第 i 个输出字节 = `pool[sel 的第 i 个字节]`**（sel 每字节是 0–7 的下标）。即「按下标从 8 字节里挑 4 个」。
+
+**为什么要拆两半**：LUT 有 16 项、但一条 `perm` 的池只有 8 字节装不下，所以拆成「码 0–7」和「码 8–15」两半各查一次，最后按 bit3 合并。4 个 LUT 常量按 little-endian 摊成字节（下标 = e2m1 码）：
+
+```
+lut_lo_lo = 0x44403800 → [00, 38, 40, 44]   ← 码 0,1,2,3 的 fp8
+lut_lo_hi = 0x54504C48 → [48, 4c, 50, 54]   ← 码 4,5,6,7
+lut_hi_lo = 0xC4C0B800 → [00, b8, c0, c4]   ← 码 8,9,10,11
+lut_hi_hi = 0xD4D0CCC8 → [c8, cc, d0, d4]   ← 码 12,13,14,15
+```
+
+**具体走一遍**（设 `val_i32` 的 4 个码字节 = `3, 10, 1, 15`，期望 fp8 = `44, c0, 38, d4`）：
+
+```
+① sel = v & 0x07             码低 3 位 → 池内下标
+   3→3, 10→2, 1→1, 15→7      sel = [3,2,1,7]
+
+② res_lo = perm(lut_lo_hi, lut_lo_lo, sel)   假设"全是低半区码 0–7"
+   池 = [00,38,40,44, 48,4c,50,54]
+   pool[3,2,1,7] → res_lo = [44, 40, 38, 54]
+
+③ res_hi = perm(lut_hi_hi, lut_hi_lo, sel)   假设"全是高半区码 8–15"
+   池 = [00,b8,c0,c4, c8,cc,d0,d4]
+   pool[3,2,1,7] → res_hi = [c4, c0, b8, d4]
+
+④ blend_sel = 0x03020100 | ((v>>1) & 0x04040404)
+   base    = [0,1,2,3]        含义:"输出 i 取 res_lo[i]"（池低 4 字节 = res_lo）
+   (v>>1)&4= [0,4,0,4]        取每个码的 bit3(值8→>>1→值4)；属高半区就 +4 改取 res_hi
+   blend_sel= [0,5,2,7]
+
+⑤ fp8x4 = perm(res_hi, res_lo, blend_sel)    逐字节二选一
+   池 = [44,40,38,54, c4,c0,b8,d4]  (低4=res_lo, 高4=res_hi)
+   pool[0,5,2,7] → [44, c0, 38, d4]  ✓ 与期望一致
+```
+
+**三步一句话**：`res_lo`=「全按低半区算一遍」、`res_hi`=「全按高半区算一遍」、`blend`=「按每个码 bit3 逐字节挑正确那套」。整个转换只读每字节的 bit0–3（上游 `& 0x0F` 拆码保证高 4 位为 0），bit4–7 从不参与。
+
+然后按 `ratios` 分两种：
+
+```610:630:/data/aiter/aiter/ops/flydsl/kernels/mfma_preshuffle_pipeline.py
+    if ratios is None:
+        return fp8x4
+    # scheme B: fp8 -> f32 -> *ratio -> fp8 (reuse the reliable f32 fold).
+    c_pzero = fx.Float32(0.0)
+    f_lo = rocdl.cvt_pk_f32_fp8(T.vec(2, T.f32), fp8x4, False)  # fp8 elems 0,1
+    f_hi = rocdl.cvt_pk_f32_fp8(T.vec(2, T.f32), fp8x4, True)   # fp8 elems 2,3
+```
+
+- `ratios is None`（aligned / no-fold）：**直接返回裸 `fp8x4`**，scale 走 post-MFMA。
+- `ratios` 非空（默认 fold 路径，straddle）：**scheme B** —— `fp8 → f32`（`cvt_pk_f32_fp8`）→ `×ratio` → 归一 -0 → `cvt_pk_fp8_f32` 重打包。只把「码→数值」前端换成 LUT，后端仍复用可靠的 f32 ratio-fold。
+
+**3. 拼 i64** `_pack_i32_pair_to_i64`：`fe`(前4) + `fo`(后4) → i64（8 fp8）直接喂 MFMA。
+
+**为什么"逐元素、无损、不重排 K"**：
+
+- **不重排**：第 `i` 码 → 第 `i` fp8，顺序原样；K 归属仍由 ② 决定。
+- **无损**：LUT `_A8W4_FP8_LUT` 是对全部 16 个 e2m1 码验证过 **byte-exact** 的 e4m3fnuz 编码（e2m1 尾数只有 `{0,1}` bit，在 e4m3fnuz normal range 内可精确表示）。
+- **逐元素**：8 码各自独立查表转换。
+
+**`ratios_even/odd`（fold 在此注入）**：默认 fold 路径传入 §5 的 per-element `2^(exp-base)` 因子（straddle 时把 A/B 两块归一到公共 base，**顺带在 dequant 乘掉、不额外加 pass**）；aligned 路径传 `None`（出裸 fp8、scale 走 post-MFMA）。
+
+**备选路径**（非默认，见 §8 env）：`AITER_A8W4_PERMLUT=0` → `unpack_b_w4a16_mxfp4_to_fp8`（`_e2m1x4_in_i32_to_fp8x4_i32` 位构造 e2m1→bf16→f32→×ratio→`cvt_pk_fp8`）；`AITER_A8W4_BITFOLD=1`（override）→ `unpack_b_w4a16_mxfp4_to_fp8_bitfold`（纯整数，ratio 折进 fp8 指数、无 cvt）。
+
+### 3.4 为什么一条 MFMA 横跨两个 scale block（精确推导）
+
+矛盾点：scale block、MFMA operand 都是 32-K，为什么还跨两块？—— 因为 **② shuffle 的分块单位是 32-K（`k0=K/32`，块内再 `kk=2` 分成 2×16），而 ③ load 的单位是 64-K（`k0'=K/64`，`klane=4`）**，两者错配。把二者的线性 K 索引对齐（`load 的 k0'×4+klane` = `shuffle 的 k0×2+kk`）展开：
+
+| load 的 klane(=octet) | = shuffle `(k0, kk)` | 原始 K 段（相对 `64k0'`）| 属 scale block |
+|---|---|---|---|
+| 0 | `(2k0', 0)`   | `[0:16]`  | **block 2k0'  (A)** |
+| 1 | `(2k0', 1)`   | `[16:32]` | **block 2k0'  (A)** |
+| 2 | `(2k0'+1, 0)` | `[32:48]` | **block 2k0'+1 (B)** |
+| 3 | `(2k0'+1, 1)` | `[48:64]` | **block 2k0'+1 (B)** |
+
+（推导：原始 K = `k0*32+kk*16+k_in`。klane0=`(2k0',0)`→`64k0'+[0:16]`；klane2=`(2k0'+1,0)`→`64k0'+32+[0:16]` …）
+
+结论：**内核 64-K 单位里，`klane{0,1}` 落在 scale block A、`klane{2,3}` 落在 block B**（`derive_mapping.py` 打 marker 实测一致）。而 klane = octet，**一条 K32 MFMA operand 要用满全部 4 个 octet**（operand-K 0–31）→ 它同时碰到 block A(octet 0,1) 和 block B(octet 2,3)：
+
+```
+r0 这一条 MFMA 的 32 个 operand-K：
+  octet 0,1 (operand-K 0–15)  → block A 的 K（scale sA）
+  octet 2,3 (operand-K 16–31) → block B 的 K（scale sB）
+```
+
+### 3.5 后果 → fold / aligned
+MFMA 把这 32 项累加成**一个数**，post-MFMA 只能乘**一个** scale；但里面前 16 属 A(sA)、后 16 属 B(sB) → 摆不平：
+- **§5 fold**（`shuffle_weight(16,16)`，block 分界在 **octet 轴**）：dequant 时先把 A/B 的值各按 `ratio=2^(exp-base)` 归一到公共 base，再统一乘 `2^base`。
+- **§6 aligned**（`shuffle_weight_NK(16,32)`，把 block 分界挪到 **r0/r1 轴**：r0=整块 A、r1=整块 B）：一条 MFMA = 一个 32-block → 各乘各的 scale，**免 fold**。
 
 ---
 
@@ -88,7 +297,7 @@ def prep_a8w4_w4(wq_fp4x2, e8m0_scale, N, K):
 | **perm-LUT（默认）** | `AITER_A8W4_PERMLUT=1` | 3× `v_perm_b32` 字节 LUT 查 e2m1→fp8 | **unpack int-op ~8× 更少** |
 | bitfold | `AITER_A8W4_BITFOLD=1` | 纯整数位构造 e2m1→fp8，ratio 折进指数 | 无 f32 往返 |
 
-**perm-LUT 核心**：把 16 个 e2m1 码 → fp8 字节的映射做成 4 个常量 dword 的 LUT，用 3 条 `v_perm_b32` 完成（低 8 码一组、高 8 码一组，再按 bit3 blend），替代每 nibble ~15 条整数指令：
+**perm-LUT 核心**：把 16 个 e2m1 码 → fp8 字节的映射做成 4 个常量 dword 的 LUT，用 3 条 `v_perm_b32` 完成（低 8 码一组、高 8 码一组，再按 bit3 blend），替代每 nibble ~15 条整数指令（`perm_b32` 8 字节池语义 + 逐码走一遍的详细推导见 §3.3.2「展开：3× `v_perm_b32` 为什么能当 16 项 LUT 用」）：
 
 ```586:611:/data/aiter/aiter/ops/flydsl/kernels/mfma_preshuffle_pipeline.py
 def _e2m1x4_in_i32_to_fp8x4_i32_permlut(val_i32, arith, vector, ratios=None):
@@ -241,6 +450,122 @@ def prep_a8w4_w4_aligned(wq_fp4x2, e8m0_scale, N, K):
 > **注意：这三个都是 host 端的一次性权重预处理，不在 kernel/dispatch 调用链内。**
 > GPU kernel 不调它们；`fused_moe` 运行时也**不**调它们（`fused_moe.py:2181` 只在注释里提了一句 `# ...prepared by moe_kernels.prep_a8w4_w4`）。这是 aiter 的标准约定：**权重离线预 shuffle 一次**，把 shuffle 好的权重 + scale 传给 `fused_moe`，运行时不再做 prep。
 > 实际调用者都是 host 侧脚本：`aiter_logs/test_a8w4_phase1.py`、`aiter_logs/test_fused_moe_flydsl.py`、`aiter_logs/prof_a8_trigger.py`、benchmark harness `run_moe_bench.py::_prepare_flydsl_weights`。生产中则由离线权重转换流程调用。
+
+### 7.1 weight 怎么 shuffle（`prep_a8w4_w4` = `prep_a16w4_weight`）
+
+```52:63:/data/aiter/aiter/ops/flydsl/moe_kernels.py
+def prep_a16w4_weight(wq_fp4x2, N, K):
+    # ...
+    codes = _mxfp4_codes_i8(wq_fp4x2, N, K)
+    shuf = pack_int8_to_packed_int4(shuffle_weight(codes.view(dtypes.i8), (16, 16)))
+    return shuf.view(E, N, K // 2).view(dtypes.fp4x2)
+```
+
+**总览**（全程搬"码 index"，不碰数值；形状标注在每一步右侧）：
+
+```
+  wq_fp4x2 (E, N, K/2)  fp4x2        每字节 = [ 高4位 hi | 低4位 lo ] = [ K_odd | K_even ]
+      │
+      │ ① _mxfp4_codes_i8            拆码：低半→偶K位、高半→奇K位（low nibble first）
+      ▼
+  codes   (E, N, K)  int8            1 码/字节，值 0–15（是"码 index"，不是数值/不是 fp8）
+      │
+      │ ② shuffle_weight(16,16)      view+permute，按【单个码】重排到 MFMA 布局
+      ▼                              内存序 (n0=N/16, k0=K/32, kk=2, n=16, k_in=16)
+  shuf    (E, N, K)  int8            每个 (n0,k0) tile = 16 行 N × 32 连续 K = 一个 K32 operand
+      │
+      │ ③ pack_int8_to_packed_int4   每 8 码打回 4 字节（间隔-4 配对，见下图）
+      ▼
+  out     (E, N, K/2)  fp4x2         2 码/字节，正是核内 load + unpack（§4）期望的字节序
+```
+
+输入 `wq_fp4x2` `(E, N, K/2)`（每字节 2 个 e2m1 码），**三步**：
+
+1. **拆码** `_mxfp4_codes_i8`：fp4x2 → e2m1 codes `int8 (E,N,K)`，低半字节在前（`codes[...,0::2]`=低 4 位、`[...,1::2]`=高 4 位）。此时 1 码占 1 字节，值 0–15。
+2. **MFMA preshuffle** `shuffle_weight(codes, (16,16))`（use_int4 路径，BK=32）：把 `(N,K)` 重排为
+   `(E, N/16, K/32, klane=?, n=16, kPerLane)` —— 每个 `(n0=N/16, k0=K/32)` tile = **16 行 N × 32 连续 K**，正好是一个 K32 MFMA operand 的数据摆放（lane 读连续的 K 段）。这一步把权重摆成 kernel 期望的 register/LDS 布局。
+3. **重打包成 4-bit** `pack_int8_to_packed_int4`：每连续 8 码 `[v0..v7]` → 4 字节 `b_i = v_i | (v_{i+4}<<4)`。即一个 lane 在一个 K32 operand 上持有的 8 个码，**偶数码进低半字节（对应前 4 个 fp8）、奇数码进高半字节（对应后 4 个 fp8）** —— 正是核内 unpack（perm-LUT / fold，§4）读取的字节布局。
+
+**第 3 步「间隔-4 打包」示意**（一个 lane 在一个 K32 operand 上持有的 8 个码 `[v0..v7]`）：
+
+```
+  拆码后 8 个 int8 码:   v0  v1  v2  v3   v4  v5  v6  v7
+                        └───前 4 个───┘   └───后 4 个───┘
+                              │  │  │  │     │   │   │   │
+                              │  │  │  └──┐  │   │   │   │   (v_i 配 v_{i+4})
+                              ▼  ▼  ▼     ▼  ▼   ▼   ▼   ▼
+  pack 成 4 字节:   b0 = v0 | (v4<<4)     低半:v0  高半:v4
+                   b1 = v1 | (v5<<4)     低半:v1  高半:v5
+                   b2 = v2 | (v6<<4)     低半:v2  高半:v6
+                   b3 = v3 | (v7<<4)     低半:v3  高半:v7
+
+  核内 unpack（逆）: even = b & 0x0F0F0F0F        → [v0 v1 v2 v3]（前 4 个 fp8）
+                    odd  = (b >> 4) & 0x0F0F0F0F  → [v4 v5 v6 v7]（后 4 个 fp8）
+```
+
+> 第 1 步「拆码」的字节例子：某字节 `0x5A` → 低 4 位 `0xA` = 码 10（偶数 K 位）、高 4 位 `0x5` = 码 5（奇数 K 位）。"low nibble first" = 低半字节对应更小的 K 索引。
+
+**为什么走「拆码 → shuffle → 再打包」这条弯路（而不是直接对 `fp4x2` shuffle）？**
+
+- **`shuffle_weight` 只能按"元素（字节）"搬**（本质是 `view + permute`）。打包的 `fp4x2` 是 **2 码/字节**，一个字节里两个 e2m1 码被"绑"在一起，`permute` 拆不开、没法把单个 4-bit 码搬到不同的 `(klane, 位置)`。所以先 **拆成"1 码 1 字节"的 int8**（`_mxfp4_codes_i8`）让每个码可独立寻址、按码重排；重排完再 `pack` **压回 4-bit**（恢复 0.5 B/elem 紧凑存储 + 摆成内核 unpack 期望的字节序）。
+- **全程搬的是"码 index (0–15)"，不是数值**：中间的 int8 只是"码的可搬运形态"，**不是 fp8**；e2m1 码 → fp8 值的 dequant 在**内核 unpack（§4）**才做，host prep 完全不碰数值。
+- 之所以能直接复用这套 `shuffle_weight + pack_int8_to_packed_int4`：mxfp4 与 int4（W4A16）的**字节布局完全一样**，只是码值含义不同（e2m1 vs 有符号 int4）—— 见 `prep_a16w4_weight` 的 docstring「Byte layout is identical to the int4_bf16 path; only the code values are e2m1」。
+
+> aligned 版（§6）把第 2 步换成 `shuffle_weight_NK(16,32)`，让一个 K32 operand 恰好对齐**单个 32-block**（而非 (16,16) 的横跨 2 block）。
+
+### 7.2 scale 怎么 shuffle（`prep_a16w4_scale`）
+
+```66:74:/data/aiter/aiter/ops/flydsl/moe_kernels.py
+def prep_a16w4_scale(e8m0_scale, N, K, scale_mul=1.0):
+    # ...
+    scale_f32 = torch.pow(2.0, ws_u8.float() - 127.0) * scale_mul
+    scale_bf16 = scale_f32.permute(0, 2, 1).contiguous().to(torch.bfloat16)  # (E,K/32,N)
+    return shuffle_scale_for_int4(scale_bf16, group_size=32).view(-1).contiguous()
+```
+
+输入 `e8m0_scale` `(E, N, K/32)` uint8（每个 `(N, 32-K-block)` 一个 E8M0 指数），**四步**：
+
+1. **解码** E8M0 → f32：`2^(u-127)`（E8M0 是纯 2 的幂指数，解码无损）。
+2. **转置** `(E,N,G) → (E,G,N)`（`G=K/32`），转 bf16。
+3. **打包** `shuffle_scale_for_int4`（bf16 分支）：`(E,G,N) → view(E,G/2,2,N) → permute → (E, G/2, N, 2)` —— **同一 N 位置、相邻两个 K-block `(g, g+1)` 打进一个 dword**（末维 `2` = 2 个 bf16 = 1 dword）。
+4. **flatten** 成 1D contiguous。
+
+**总览**（`G = K/32` = 每行 N 的 per-32 K-block 数）：
+
+```
+  e8m0_scale (E, N, G)  uint8         每个 (N, 32-K-block) 一个 E8M0 指数 u
+      │
+      │ ① 解码  2^(u-127)              E8M0 是纯 2 的幂，解码无损
+      ▼
+  scale_f32  (E, N, G)  f32
+      │
+      │ ② 转置 (E,N,G)→(E,G,N) + →bf16  让 K-block 维在前，对齐 kernel 访问序
+      ▼
+  scale_bf16 (E, G, N)  bf16
+      │
+      │ ③ shuffle_scale_for_int4       view(E,G/2,2,N)→permute→(E, G/2, N, 2)
+      ▼                                末维 2 = 相邻两 K-block (g,g+1) = 1 dword
+  packed     (E, G/2, N, 2)  bf16
+      │
+      │ ④ flatten → 1D contiguous
+      ▼
+  out        (E * G/2 * N * 2,)  bf16
+```
+
+**第 ③ 步「相邻两块打进一个 dword」示意**（固定某个 N 位置，沿 K-block 方向）：
+
+```
+  转置后 (沿 g):   g0   g1   g2   g3   g4   g5  ...   每个 = 该 N 行、一个 32-K-block 的 bf16 scale
+                  └──┬──┘   └──┬──┘   └──┬──┘
+                     ▼         ▼         ▼
+  打成 dword:     [g0|g1]   [g2|g3]   [g4|g5]        末维 2：低 16 位 = 偶块 g、高 16 位 = 奇块 g+1
+
+  核内一次 dword load 拿到 [g|g+1]：
+      extract_bf16_scale(sc, 0) → scA = block g
+      extract_bf16_scale(sc, 1) → scB = block g+1
+```
+
+这个「`(g,g+1)` 一个 dword」正是内核里 `extract_bf16_scale(sc, 0)`/`(sc, 1)` 读到的 `scA`(block g) / `scB`(block g+1) —— 一次 dword load 拿到相邻两块的 per-32 scale，喂给 fold 的 ratio-fold（fold 路径 §5）或直接做 per-operand 后乘（aligned / mxfp8 路径 §6）。
 
 ---
 
