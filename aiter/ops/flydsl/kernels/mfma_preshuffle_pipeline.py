@@ -670,6 +670,67 @@ def unpack_b_w4a16_mxfp4_to_fp8(packed32, arith, vector, ratios_even=None, ratio
     return _pack_i32_pair_to_i64(fe, fo, vector)
 
 
+def make_aligned_b_layout(arith, *, c_n: ir.Value, c_k: ir.Value):
+    """B layout for a8w4 ALIGNED: one K32 fp8-MFMA operand == one per-32 block.
+
+    Matches shuffle_weight_NK(inst_N=16, inst_K=32) packed byte order
+    ``(n0=N/16, k0=K/32, klane=4, n=16, kpack=4bytes)`` (4 bytes = 8 nibbles =
+    8 e2m1 = the 8 K-elements one lane holds for a K32 operand). Unlike the
+    64-K straddle layout, klane(4)*kpack(8 K-elem)=32 K all fall in one block, so
+    the kernel can unpack with a plain perm-LUT (no fold) and apply the raw
+    per-32 scale post-MFMA.
+    """
+    c16 = fx.Index(16)
+    c32 = fx.Index(32)
+    c4 = fx.Index(4)
+    n0 = c_n // c16
+    k0 = c_k // c32            # one 32-K block per operand slot
+    # contiguous byte strides for (n0, k0, klane=4, n=16, kpack=4 bytes)
+    stride_n = c4                        # inner n stride = kpack bytes (4)
+    stride_klane = c16 * stride_n        # 64
+    stride_k0 = c4 * stride_klane        # 256 (klane_dim=4)
+    stride_n0 = k0 * stride_k0
+    n0_i32 = arith.index_cast(T.i32, n0)
+    k0_i32 = arith.index_cast(T.i32, k0)
+    stride_n0_i32 = arith.index_cast(T.i32, stride_n0)
+    stride_k0_i32 = arith.index_cast(T.i32, stride_k0)
+    stride_klane_i32 = arith.index_cast(T.i32, stride_klane)
+    stride_n_i32 = arith.index_cast(T.i32, stride_n)
+    stride_b = (stride_n0_i32, stride_k0_i32, stride_klane_i32, stride_n_i32, 1)
+    layout_b = fx.make_layout((n0_i32, k0_i32, 4, 16, 4), stride_b)
+    return PreshuffleBLayout(layout_b=layout_b, kpack_bytes=4)
+
+
+def load_b_operand_aligned(
+    buffer_ops,
+    arith,
+    vector,
+    *,
+    b_rsrc,
+    layout_b,
+    k0: ir.Value,
+    n_blk: ir.Value,
+    n_intra: ir.Value,
+    lane_div_16: ir.Value,
+    elem_type: ir.Type,
+):
+    """Load ONE aligned K32 operand (= one 32-K block) as raw packed32.
+
+    Reads the 4 packed bytes (8 e2m1 nibbles) this lane holds for block ``k0`` at
+    coord (n_blk, k0, klane=lane_div_16, n_intra). Caller unpacks with a plain
+    perm-LUT (no fold). Returns packed32 (i32, 8 nibble codes).
+    """
+    coord = (n_blk, k0, lane_div_16, n_intra, fx.Index(0))
+    idx = crd2idx(tuple(fx.Int32(c) for c in coord), layout_b)
+    b4 = _buffer_load_vec(
+        buffer_ops, vector, b_rsrc, idx,
+        elem_type=elem_type, vec_elems=4, elem_bytes=1, offset_in_bytes=True,
+    )
+    return vector.extract(
+        vector.bitcast(T.vec(1, T.i32), b4), static_position=[0], dynamic_position=[]
+    )
+
+
 def load_b_pack_k32_pair_raw(
     buffer_ops,
     arith,

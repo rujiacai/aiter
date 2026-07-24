@@ -59,6 +59,8 @@ from .mfma_preshuffle_pipeline import (
     unpack_b_w4a16_mxfp4_to_fp8_bitfold,
     unpack_b_w4a16_mxfp4_to_fp8_permlut,
     load_b_pack_k32_pair_raw,
+    make_aligned_b_layout,
+    load_b_operand_aligned,
     load_b_raw_w4a16_groupwise,
     _load_groupwise_scale,
     extract_bf16_scale,
@@ -419,6 +421,12 @@ def compile_moe_gemm1(
     lds_alloc_offset = allocator._align(allocator.ptr, 16)
     allocator.ptr = lds_alloc_offset + lds_alloc_bytes
 
+    # a8w4 ALIGNED gate: computed in the OUTER (compile) scope so it is a closure
+    # scalar captured by moe_gemm1 -> folded into FlyDSL's disk cache key
+    # (_collect_closure_scalar_vals). Otherwise aligned/fold share a key and the
+    # cache silently serves the wrong binary when both run for the same shape.
+    _a8w4_aligned = is_mxfp4_fp8 and os.environ.get("AITER_A8W4_ALIGNED", "0") == "1"
+
     if True:
 
         @flyc.kernel
@@ -503,15 +511,22 @@ def compile_moe_gemm1(
             # B preshuffle layout: match GEMM test helper exactly.
             c_n_total = arith.index(experts * (2 * inter_dim))
             # For packed int4 (W4A8/W4A16/W4A_FP8), kpack_bytes=8.
-            kpack_bytes = 8 if w_is_int4 else 16
+            # a8w4 ALIGNED (AITER_A8W4_ALIGNED=1): one K32 operand == one 32-block
+            # (shuffle_weight_NK(16,32) layout, kpack=4) -> no in-kernel fold.
+            # (_a8w4_aligned computed in the outer scope for cache-key correctness.)
             w_elem_bytes = 1 if w_is_int4 else elem_bytes
-            b_layout = make_preshuffle_b_layout(
-                arith,
-                c_n=c_n_total,
-                c_k=k_in,
-                kpack_bytes=kpack_bytes,
-                elem_bytes=w_elem_bytes,
-            )
+            if const_expr(_a8w4_aligned):
+                kpack_bytes = 4
+                b_layout = make_aligned_b_layout(arith, c_n=c_n_total, c_k=k_in)
+            else:
+                kpack_bytes = 8 if w_is_int4 else 16
+                b_layout = make_preshuffle_b_layout(
+                    arith,
+                    c_n=c_n_total,
+                    c_k=k_in,
+                    kpack_bytes=kpack_bytes,
+                    elem_bytes=w_elem_bytes,
+                )
             layout_b = b_layout.layout_b
             (k_in * arith.index(int(elem_bytes))) // fx.Index(64)
 
@@ -948,6 +963,42 @@ def compile_moe_gemm1(
                         # So fold every element by 2^(exp_g - base) (base=max of the pair)
                         # and apply 2^base post-MFMA (sc_out packs base into both halves).
                         _uw = arith._to_raw
+                        _aligned = os.environ.get("AITER_A8W4_ALIGNED", "0") == "1"
+                        if const_expr(_aligned):
+                            # ALIGNED: one K32 operand == one 32-block. r0=block(2*ku),
+                            # r1=block(2*ku+1); plain perm-LUT (NO fold); raw per-32 scale
+                            # pair (sc0=block g, sc1=block g+1) applied post-MFMA (reuses
+                            # the mxfp8 compute path unchanged).
+                            _k0b = base_k // fx.Index(32)
+                            raw_data = []
+                            for ku in range_constexpr(k_unroll):
+                                raw_ku = []
+                                for ni in range_constexpr(num_acc_n):
+                                    r0 = load_b_operand_aligned(
+                                        buffer_ops, arith, vector, b_rsrc=w_rsrc,
+                                        layout_b=layout_b, k0=_k0b + fx.Index(2 * ku),
+                                        n_blk=blk_list[ni], n_intra=intra_list[ni],
+                                        lane_div_16=lane_div_16, elem_type=w_elem,
+                                    )
+                                    r1 = load_b_operand_aligned(
+                                        buffer_ops, arith, vector, b_rsrc=w_rsrc,
+                                        layout_b=layout_b, k0=_k0b + fx.Index(2 * ku + 1),
+                                        n_blk=blk_list[ni], n_intra=intra_list[ni],
+                                        lane_div_16=lane_div_16, elem_type=w_elem,
+                                    )
+                                    b0 = unpack_b_w4a16_mxfp4_to_fp8_permlut(r0, arith, vector)
+                                    b1 = unpack_b_w4a16_mxfp4_to_fp8_permlut(r1, arith, vector)
+                                    sc = _load_groupwise_scale(
+                                        buffer_ops, arith, scale_rsrc=sw_rsrc,
+                                        expert_offset=expert_off_idx,
+                                        n_blk=blk_list[ni], n_intra=intra_list[ni],
+                                        k_pos=base_k + fx.Index(ku * 64),
+                                        num_groups=num_groups, group_size=group_size,
+                                        n_per_expert=2 * inter_dim, scale_dtype=scale_dtype,
+                                    )
+                                    raw_ku.append((b0, b1, sc))
+                                raw_data.append(raw_ku)
+                            return raw_data
                         _bitfold = os.environ.get("AITER_A8W4_BITFOLD", "0") == "1"
                         _wideload = os.environ.get("AITER_A8W4_WIDELOAD", "1") == "1"
                         _permlut = os.environ.get("AITER_A8W4_PERMLUT", "1") == "1"
@@ -1086,6 +1137,41 @@ def compile_moe_gemm1(
                     a1 = vector.extract(
                         a_i64x2, static_position=[1], dynamic_position=[]
                     )
+                    return a0, a1
+
+                def lds_load_packs_k64_aligned(curr_row_a_lds, ku, lds_base):
+                    # a8w4 ALIGNED activation: each K32 operand == ONE 32-K block so
+                    # it pairs with shuffle_weight_NK(16,32) (no in-kernel fold). With
+                    # octet=lane_div_16 the operands map to:
+                    #   a0 = block(2*ku)   -> K[ku*64 + octet*8 : +8]
+                    #   a1 = block(2*ku+1) -> K[ku*64 + 32 + octet*8 : +8]
+                    # i.e. two 8B swizzled ds_loads replace the single 16B contiguous
+                    # load whose a0/a1 straddled two scale blocks (octet{0,1}->blkA,
+                    # {2,3}->blkB) and forced the ratio-fold.
+                    octet8 = lane_div_16 * arith.index(8)
+                    ku64 = arith.index(int(ku) * 64)
+
+                    def _load8(col_bytes):
+                        col_swz_bytes = swizzle_xor16(
+                            curr_row_a_lds, col_bytes, k_blocks16
+                        )
+                        col_swz = (
+                            col_swz_bytes
+                            if elem_bytes == 1
+                            else (col_swz_bytes // arith.index(int(elem_bytes)))
+                        )
+                        idx = crd2idx(
+                            (fx.Int32(curr_row_a_lds), fx.Int32(col_swz)), layout_lds
+                        )
+                        idx = idx + lds_base
+                        loaded = vector.load_op(vec8_x, lds_x, [idx])
+                        a_i64 = vector.bitcast(T.vec(1, T.i64), loaded)
+                        return vector.extract(
+                            a_i64, static_position=[0], dynamic_position=[]
+                        )
+
+                    a0 = _load8(ku64 + octet8)
+                    a1 = _load8(ku64 + octet8 + arith.index(32))
                     return a0, a1
 
                 def compute_tile(
@@ -1341,7 +1427,12 @@ def compile_moe_gemm1(
                             for mi in range_constexpr(m_repeat):
                                 mi_val = arith.index(mi * 16)
                                 curr_row_a_lds = row_a_lds + mi_val
-                                if const_expr(
+                                if const_expr(_a8w4_aligned):
+                                    # aligned: 2x 8B loads, one 32-K block per operand
+                                    a0, a1 = lds_load_packs_k64_aligned(
+                                        curr_row_a_lds, ku, lds_base
+                                    )
+                                elif const_expr(
                                     (a0_prefetch is not None) and (ku == 0) and (mi == 0)
                                 ):
                                     a0, a1 = a0_prefetch
@@ -2543,6 +2634,10 @@ def compile_moe_gemm2(
     lds_alloc_offset = allocator._align(allocator.ptr, 16)
     allocator.ptr = lds_alloc_offset + lds_alloc_bytes
 
+    # a8w4 ALIGNED gate: outer-scope closure scalar so it is folded into FlyDSL's
+    # disk cache key (see stage1 twin) -> aligned/fold never share a binary.
+    _a8w4_aligned = is_mxfp4_fp8 and os.environ.get("AITER_A8W4_ALIGNED", "0") == "1"
+
     if True:
 
         @flyc.kernel
@@ -2615,15 +2710,22 @@ def compile_moe_gemm2(
             # B preshuffle layout: [experts*model_dim, inter_dim]
             c_n_total = arith.index(experts * model_dim)
             # For packed int4 (W4A8/W4A16/W4A_FP8), kpack_bytes=8.
-            kpack_bytes = 8 if w_is_int4 else 16
+            # a8w4 ALIGNED (AITER_A8W4_ALIGNED=1): one K32 operand == one 32-block
+            # (shuffle_weight_NK(16,32) layout, kpack=4) -> no in-kernel fold.
+            # (_a8w4_aligned computed in the outer scope for cache-key correctness.)
             w_elem_bytes = 1 if w_is_int4 else elem_bytes
-            b_layout = make_preshuffle_b_layout(
-                arith,
-                c_n=c_n_total,
-                c_k=k_in,
-                kpack_bytes=kpack_bytes,
-                elem_bytes=w_elem_bytes,
-            )
+            if const_expr(_a8w4_aligned):
+                kpack_bytes = 4
+                b_layout = make_aligned_b_layout(arith, c_n=c_n_total, c_k=k_in)
+            else:
+                kpack_bytes = 8 if w_is_int4 else 16
+                b_layout = make_preshuffle_b_layout(
+                    arith,
+                    c_n=c_n_total,
+                    c_k=k_in,
+                    kpack_bytes=kpack_bytes,
+                    elem_bytes=w_elem_bytes,
+                )
             layout_b = b_layout.layout_b
             (k_in * arith.index(int(elem_bytes))) // fx.Index(64)
 
@@ -3004,6 +3106,40 @@ def compile_moe_gemm2(
                         # in-kernel per-pair ratio-fold. Mapping (derive_mapping.py):
                         # lane_div_16 {0,1}->group A (sc0), {2,3}->group B (sc1).
                         _uw = arith._to_raw
+                        _aligned = os.environ.get("AITER_A8W4_ALIGNED", "0") == "1"
+                        if const_expr(_aligned):
+                            # ALIGNED: one K32 operand == one 32-block; plain perm-LUT
+                            # (no fold); raw per-32 scale pair post-MFMA.
+                            _k0b = base_k // fx.Index(32)
+                            raw_data = []
+                            for ku in range_constexpr(k_unroll):
+                                raw_ku = []
+                                for ni in range_constexpr(num_acc_n):
+                                    r0 = load_b_operand_aligned(
+                                        buffer_ops, arith, vector, b_rsrc=w_rsrc,
+                                        layout_b=layout_b, k0=_k0b + fx.Index(2 * ku),
+                                        n_blk=n_blk_list[ni], n_intra=n_intra_list[ni],
+                                        lane_div_16=lane_div_16, elem_type=w_elem,
+                                    )
+                                    r1 = load_b_operand_aligned(
+                                        buffer_ops, arith, vector, b_rsrc=w_rsrc,
+                                        layout_b=layout_b, k0=_k0b + fx.Index(2 * ku + 1),
+                                        n_blk=n_blk_list[ni], n_intra=n_intra_list[ni],
+                                        lane_div_16=lane_div_16, elem_type=w_elem,
+                                    )
+                                    b0 = unpack_b_w4a16_mxfp4_to_fp8_permlut(r0, arith, vector)
+                                    b1 = unpack_b_w4a16_mxfp4_to_fp8_permlut(r1, arith, vector)
+                                    sc = _load_groupwise_scale(
+                                        buffer_ops, arith, scale_rsrc=sw_rsrc,
+                                        expert_offset=expert_off_idx,
+                                        n_blk=n_blk_list[ni], n_intra=n_intra_list[ni],
+                                        k_pos=base_k + fx.Index(ku * 64),
+                                        num_groups=num_groups, group_size=group_size,
+                                        n_per_expert=model_dim, scale_dtype=scale_dtype,
+                                    )
+                                    raw_ku.append((b0, b1, sc))
+                                raw_data.append(raw_ku)
+                            return raw_data
                         _bitfold = os.environ.get("AITER_A8W4_BITFOLD", "0") == "1"
                         _wideload = os.environ.get("AITER_A8W4_WIDELOAD", "1") == "1"
                         _permlut = os.environ.get("AITER_A8W4_PERMLUT", "1") == "1"
@@ -3135,6 +3271,37 @@ def compile_moe_gemm2(
                     a1 = vector.extract(
                         a_i64x2, static_position=[1], dynamic_position=[]
                     )
+                    return a0, a1
+
+                def lds_load_packs_k64_aligned(curr_row_a_lds, ku, lds_base):
+                    # a8w4 ALIGNED activation (see stage1 twin): each K32 operand ==
+                    # ONE 32-K block to pair with shuffle_weight_NK(16,32) (no fold).
+                    #   a0 = block(2*ku)   -> K[ku*64 + octet*8 : +8]
+                    #   a1 = block(2*ku+1) -> K[ku*64 + 32 + octet*8 : +8]
+                    octet8 = lane_div_16 * arith.index(8)
+                    ku64 = arith.index(int(ku) * 64)
+
+                    def _load8(col_bytes):
+                        col_swz_bytes = swizzle_xor16(
+                            curr_row_a_lds, col_bytes, k_blocks16
+                        )
+                        col_swz = (
+                            col_swz_bytes
+                            if elem_bytes == 1
+                            else (col_swz_bytes // arith.index(int(elem_bytes)))
+                        )
+                        idx = crd2idx(
+                            (fx.Int32(curr_row_a_lds), fx.Int32(col_swz)), layout_lds
+                        )
+                        idx = idx + lds_base
+                        loaded = vector.load_op(vec8_x, lds_x, [idx])
+                        a_i64 = vector.bitcast(T.vec(1, T.i64), loaded)
+                        return vector.extract(
+                            a_i64, static_position=[0], dynamic_position=[]
+                        )
+
+                    a0 = _load8(ku64 + octet8)
+                    a1 = _load8(ku64 + octet8 + arith.index(32))
                     return a0, a1
 
                 def compute_tile(
@@ -3347,7 +3514,12 @@ def compile_moe_gemm2(
                             for mi in range_constexpr(m_repeat):
                                 mi_val = arith.index(mi * 16)
                                 curr_row_a_lds = row_a_lds + mi_val
-                                if const_expr(
+                                if const_expr(_a8w4_aligned):
+                                    # aligned: 2x 8B loads, one 32-K block per operand
+                                    a0, a1 = lds_load_packs_k64_aligned(
+                                        curr_row_a_lds, ku, lds_base
+                                    )
+                                elif const_expr(
                                     (a0_prefetch is not None) and (ku == 0) and (mi == 0)
                                 ):
                                     a0, a1 = a0_prefetch
