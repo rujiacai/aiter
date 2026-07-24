@@ -111,6 +111,50 @@ def prep_a8w4_w4(wq_fp4x2, e8m0_scale, N, K):
     return prep_a16w4_weight(wq_fp4x2, N, K), prep_a16w4_scale(e8m0_scale, N, K)
 
 
+def prep_a8w4_w4_aligned(wq_fp4x2, e8m0_scale, N, K):
+    """a8w4 Phase-1 ALIGNED: K32 MFMA operand == one per-32 scale block, NO fold.
+
+    Uses shuffle_weight_NK(inst_N=16, inst_K=32) so each K32 fp8-MFMA operand maps
+    to a single 32-K scale block (verified in aiter_logs/proto_a8w4_aligned.py),
+    instead of the (16,16)/64-K layout that straddles two blocks and forces the
+    in-kernel ratio-fold. With alignment the kernel can unpack with a plain
+    perm-LUT (no f32 ratio round-trip) and apply the raw per-32 E8M0 scale
+    post-MFMA (reusing the mxfp8 compute path). Returns (w4_packed[fp4x2],
+    scale_bf16_flat) laid out to match shuffle_weight_NK(16,32).
+    """
+    from aiter.ops.shuffle import shuffle_weight_NK, pack_int8_to_packed_int4
+
+    dtypes = _get_dtypes()
+    E = wq_fp4x2.shape[0]
+    codes = _mxfp4_codes_i8(wq_fp4x2, N, K)  # (E,N,K) e2m1 codes int8
+    shuf = pack_int8_to_packed_int4(shuffle_weight_NK(codes.view(dtypes.i8), 16, 32))
+    w4 = shuf.view(E, N, K // 2).view(dtypes.fp4x2)
+    # per-32 E8M0 scale: reuse the proven a16w4 scale layout (shuffle_scale_for_int4,
+    # (E,G//2,N,2) bf16) that _load_groupwise_scale reads. Block order (k0=K//32)
+    # matches shuffle_weight_NK(16,32), so per-block scale lands correctly.
+    scale = prep_a16w4_scale(e8m0_scale, N, K)
+    return w4, scale
+
+
+def _prep_a8w4_scale_aligned(e8m0_scale, N, K):
+    """Per-32 E8M0 -> bf16 scale in shuffle_weight_NK(16,32) block/operand order.
+
+    Weight is shuffled to (N/16, K/32, klane=4, n=16, kPerLane=8); one K32 operand
+    = one (n0, k0=K/32) tile sharing a single per-32 scale. So the scale only needs
+    (E, N, K/32) reordered to (E, N/16, K/32, 16) matching the weight's n0/k0/n
+    nesting, then flattened. bf16 (E, G//2, N, 2)-style packing keeps two adjacent
+    K-blocks (operands r0,r1) in one dword for the kernel's extract_bf16_scale.
+    """
+    import torch as _torch
+    G = K // 32
+    ws_u8 = e8m0_scale.view(_torch.uint8).view(-1, N, G)
+    E = ws_u8.shape[0]
+    scale_bf16 = _torch.pow(2.0, ws_u8.float() - 127.0).to(_torch.bfloat16)  # (E,N,G)
+    # (E,N,G) -> (E, N/16, 16, G) -> (E, N/16, G, 16) so operand (n0,k0) is contiguous
+    s = scale_bf16.view(E, N // 16, 16, G).permute(0, 1, 3, 2).contiguous()  # (E,N/16,G,16)
+    return s.view(-1).contiguous()
+
+
 _SUFFIX_RE = re.compile(
     r"(?:_kw(?P<kw>\d+))?(?P<fp4>_fp4)?(?P<fp8>_fp8)?(?:_sbm(?P<sbm>\d+))?$"
 )
