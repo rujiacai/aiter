@@ -1021,6 +1021,11 @@ def _flydsl_stage1_wrapper(
         # AITER_MOE_A2_COMPACT: expert-major compacted a2 output (gated upstream).
         a2_compact=_kwargs.get("a2_compact", False),
         blk_valid_start=_kwargs.get("blk_valid_start", None),
+        # StreamK (persistent-grid) params parsed from the kernel name
+        # (``_sk<mode>`` / ``_skw<N>``); default off for non-StreamK names.
+        streamk=parsed.get("streamk", False),
+        streamk_num_wg=parsed.get("streamk_num_wg", 0),
+        streamk_mode=parsed.get("streamk_mode", None),
     )
 
 
@@ -1078,6 +1083,11 @@ def _flydsl_stage2_wrapper(
         # AITER_MOE_A2_COMPACT: read expert-major compacted a2 (gated upstream).
         a2_compact=_kwargs.get("a2_compact", False),
         blk_valid_start=_kwargs.get("blk_valid_start", None),
+        # StreamK (persistent-grid) params parsed from the kernel name
+        # (``_sk<mode>`` / ``_skw<N>``); default off for non-StreamK names.
+        streamk=parsed.get("streamk", False),
+        streamk_num_wg=parsed.get("streamk_num_wg", 0),
+        streamk_mode=parsed.get("streamk_mode", None),
     )
 
 

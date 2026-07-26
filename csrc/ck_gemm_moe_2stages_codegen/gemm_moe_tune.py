@@ -510,6 +510,10 @@ class FmoeTuner(TunerCommon):
             out=kparams.get("a2c_out", None),
             a2_compact=kparams.get("a2_compact", False),
             blk_valid_start=kparams.get("blk_valid_start", None),
+            # StreamK dispatch (AITER_TUNE_MOE_STREAMK): _sk{mode}/_skw{N} tokens.
+            streamk=kparams.get("streamk", False),
+            streamk_mode=kparams.get("streamk_mode", None),
+            streamk_num_wg=kparams.get("streamk_num_wg", 0),
         )
         if isinstance(result, tuple):
             out_raw = result[0]
@@ -590,6 +594,11 @@ class FmoeTuner(TunerCommon):
             # expert-major a2 (caller passes an already-compacted inter_states).
             a2_compact=kparams.get("a2_compact", False),
             blk_valid_start=kparams.get("blk_valid_start", None),
+            # StreamK dispatch (AITER_TUNE_MOE_STREAMK): persistent-grid dispatch
+            # variants encoded as _sk{mode}/_skw{N} name tokens.
+            streamk=kparams.get("streamk", False),
+            streamk_mode=kparams.get("streamk_mode", None),
+            streamk_num_wg=kparams.get("streamk_num_wg", 0),
         )
 
     @staticmethod

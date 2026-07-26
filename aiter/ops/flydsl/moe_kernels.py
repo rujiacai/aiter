@@ -172,6 +172,14 @@ def _parse_flydsl_kernel_name(name: str) -> Optional[Dict]:
             params["scale_nt"] = 2
         elif token == "ont":
             params["out_nt"] = 2
+        elif stage in (1, 2) and token.startswith("skw") and token[3:].isdigit():
+            # StreamK num_wg (persistent grid size); must precede the sk<mode>
+            # check since "skw..." also starts with "sk".
+            params["streamk"] = True
+            params["streamk_num_wg"] = int(token[3:])
+        elif stage in (1, 2) and token.startswith("sk") and token[2:] in _SK_TAG_TO_MODE:
+            params["streamk"] = True
+            params["streamk_mode"] = _SK_TAG_TO_MODE[token[2:]]
         else:
             return None
     return params
@@ -346,6 +354,69 @@ def _persist_n_candidates() -> list[int]:
             continue
         if iv > 1 and iv not in out:
             out.append(iv)
+    return out
+
+
+# StreamK dispatch modes <-> name-token aliases (aliases must be underscore-free
+# so they survive the "_"-split kernel-name tokenizer).
+_SK_MODE_TO_TAG = {
+    "mfocus": "mfocus",
+    "affine": "affine",
+    "flat": "flat",
+    "lockstep": "lockstep",
+    "lockstep_mouter": "mouter",
+    "xcd_nsplit": "nsplit",
+}
+_SK_TAG_TO_MODE = {v: k for k, v in _SK_MODE_TO_TAG.items()}
+
+
+def _streamk_candidates():
+    """Yield (name_tag, params) StreamK dispatch candidates for stage2 tuning.
+
+    StreamK swaps the fixed 2D grid for a persistent grid of ``streamk_num_wg``
+    WGs that sweep the output tiles in a chosen dispatch order (``mode``). It is a
+    distinct dispatch axis: atomic-only, mutually exclusive with split-K /
+    persist_m / persist_n. Default OFF -> returns [] so the candidate set is
+    byte-identical. Enable via:
+      AITER_TUNE_MOE_STREAMK=1                 # all modes, auto num_wg (occ2)
+      AITER_TUNE_MOE_STREAMK=mfocus,affine     # specific modes
+    Persistent-grid size is swept as a single knob -- OCCUPANCY (num_wg = num_cu *
+    occ), which sets the in-flight wave count, is GPU-portable, and always yields a
+    CU (hence NUM_XCD) multiple:
+      AITER_TUNE_MOE_STREAMK_OCC=2,4,8
+    Absent/0 => auto (streamk_default_num_wg). Names get a ``_sk{mode}`` token
+    (+ ``_skw{N}`` when occ is pinned; N is the resolved absolute num_wg).
+    """
+    vals = _tune_csv("AITER_TUNE_MOE_STREAMK", ["0"])
+    tokens = [str(v).strip().lower() for v in vals if str(v).strip()]
+    if not tokens or tokens[0] in ("0", "off", "false", "no"):
+        return []
+    if tokens[0] in ("1", "all", "true", "yes", "on"):
+        modes = list(_SK_MODE_TO_TAG)
+    else:
+        modes = [t for t in tokens if t in _SK_MODE_TO_TAG]
+    # Single grid-size knob: occupancy (num_wg = num_cu * occ). Absent => [0] (auto).
+    wgs: list[int] = []
+    _occ_vals = _tune_csv("AITER_TUNE_MOE_STREAMK_OCC", [])
+    if _occ_vals:
+        from aiter.jit.utils.chip_info import get_cu_num
+        _ncu = int(get_cu_num())
+        for o in _occ_vals:
+            try:
+                iocc = int(o)
+            except ValueError:
+                continue
+            if iocc > 0 and _ncu * iocc not in wgs:
+                wgs.append(_ncu * iocc)
+    if not wgs:
+        wgs = [0]
+    out = []
+    for m in modes:
+        for wg in wgs:
+            tag = f"_sk{_SK_MODE_TO_TAG[m]}" + (f"_skw{wg}" if wg else "")
+            out.append(
+                (tag, {"streamk": True, "streamk_mode": m, "streamk_num_wg": wg})
+            )
     return out
 
 
@@ -668,6 +739,30 @@ def get_flydsl_stage1_kernels(
                                                         "persist_m": 1,
                                                         **pp,
                                                     }
+                                            # StreamK dispatch variants (stage1;
+                                            # AITER_TUNE_MOE_STREAMK, default off).
+                                            # kb==1 only (mutually exclusive with
+                                            # split-K/persist). Inherits tile/wpe/bnt/
+                                            # mfma/async; adds mode x num_wg (+ pool
+                                            # for tn<=128). Dropped by the tuner's cos
+                                            # check if a combo is invalid.
+                                            if kb == 1:
+                                                for sktag, skp in _streamk_candidates():
+                                                    kernels[v_name + ktag + sktag] = {
+                                                        **v_base, **kp,
+                                                        "persist_m": 1, **skp,
+                                                    }
+                                                    if tn <= 128:
+                                                        for ptag, pp in _pool_variants():
+                                                            if not pp:
+                                                                continue
+                                                            kernels[
+                                                                v_name + ktag + ptag + sktag
+                                                            ] = {
+                                                                **v_base, **kp,
+                                                                "persist_m": 1,
+                                                                **pp, **skp,
+                                                            }
     return kernels
 
 
@@ -834,6 +929,29 @@ def get_flydsl_stage2_kernels(
                                                                 **pp,
                                                                 "persist_n": pn,
                                                             }
+                                                    # StreamK dispatch variants
+                                                    # (AITER_TUNE_MOE_STREAMK; default
+                                                    # off). Mutually exclusive with
+                                                    # split-K/persist, so only on the
+                                                    # pm==1/kb==1 path; works for both
+                                                    # atomic and reduce (full-K per
+                                                    # tile -> no cross-WG K-partials).
+                                                    # Hung here => inherits the swept
+                                                    # tile/wpe/bnt/mfma/async/pool
+                                                    # knobs; the sweep adds mode x
+                                                    # num_wg on top. Wrong combos are
+                                                    # dropped by the tuner's cos check.
+                                                    if pm == 1 and kb == 1:
+                                                        for sktag, skp in _streamk_candidates():
+                                                            kernels[
+                                                                v_name + ktag + pmtag + ptag + sktag
+                                                            ] = {
+                                                                **v_params,
+                                                                **kp,
+                                                                "persist_m": pm,
+                                                                **pp,
+                                                                **skp,
+                                                            }
     return kernels
 
 
@@ -886,6 +1004,9 @@ def compile_flydsl_moe_stage1(
     x_pool_depth: int = 0,
     mfma_variant: Optional[str] = None,
     a2_compact: bool = False,
+    streamk: bool = False,
+    streamk_num_wg: int = 0,
+    streamk_mode: str = "mfocus",
 ):
     """Compile stage1 kernel (cached via underlying lru_cache)."""
     if b_dtype == "fp4":
@@ -945,6 +1066,9 @@ def compile_flydsl_moe_stage1(
             x_pool_depth=x_pool_depth,
             mfma_variant=mfma_variant,
             a2_compact=a2_compact,
+            streamk=streamk,
+            streamk_num_wg=streamk_num_wg,
+            streamk_mode=streamk_mode,
         )
 
 
@@ -977,6 +1101,9 @@ def compile_flydsl_moe_stage2(
     x_pool_depth: int = 0,
     persist_n: int = 0,
     a2_compact: bool = False,
+    streamk: bool = False,
+    streamk_num_wg: int = 0,
+    streamk_mode: str = "mfocus",
 ):
     """Compile stage2 kernel (cached via underlying lru_cache)."""
     if b_dtype == "fp4":
@@ -1030,6 +1157,9 @@ def compile_flydsl_moe_stage2(
             persist_n=persist_n,
             mfma_variant=mfma_variant,
             a2_compact=a2_compact,
+            streamk=streamk,
+            streamk_num_wg=streamk_num_wg,
+            streamk_mode=streamk_mode,
         )
 
 
@@ -1260,6 +1390,9 @@ def flydsl_moe_stage1(
     mfma_variant: Optional[str] = None,
     a2_compact: bool = False,
     blk_valid_start: Optional[torch.Tensor] = None,
+    streamk: bool = False,
+    streamk_num_wg: int = 0,
+    streamk_mode: Optional[str] = None,
 ):
     """Fused MOE stage1 GEMM.
 
@@ -1341,6 +1474,32 @@ def flydsl_moe_stage1(
     _is_splitk = k_batch > 1
 
     dev = a.device
+    # streamk (stage1): persistent-grid dispatch, N axis = inter_dim. flat/affine
+    # need the even-split wg_unit_start schedule (n_tiles = inter_dim/tile_n,
+    # k_tiles=1) carried in the arg_blk_valid_start slot; lockstep/mfocus/nsplit
+    # compute their dispatch in-kernel. See compile_moe_gemm1.
+    _sk_mode = (
+        streamk_mode
+        if streamk_mode is not None
+        else os.environ.get("AITER_MOE_STREAMK_MODE", "mfocus")
+    ).lower()
+    _sk_num_wg = 0
+    _sk_wg_start = None
+    if streamk:
+        from .kernels.streamk_schedule import (
+            streamk_default_num_wg,
+            flydsl_streamk_schedule,
+        )
+        _sk_num_wg = (
+            int(streamk_num_wg)
+            if streamk_num_wg and int(streamk_num_wg) > 0
+            else streamk_default_num_wg()
+        )
+        if _sk_mode in ("flat", "affine"):
+            _sk_s1_n_tiles = inter_dim // tile_n
+            _sk_wg_start = flydsl_streamk_schedule(
+                num_valid_ids, _sk_num_wg, tile_m, _sk_s1_n_tiles, 1
+            )
     _splitk_fq = _is_splitk and fuse_fp4_quant
 
     _splitk_out_cols = inter_dim * (2 if use_g1u1 else 1)
@@ -1442,7 +1601,7 @@ def flydsl_moe_stage1(
             dev,
         )
     else:
-        _bvs1 = blk_valid_start
+        _bvs1 = _sk_wg_start if _sk_wg_start is not None else blk_valid_start
         if _bvs1 is None:
             _bvs1 = torch.zeros(1, dtype=torch.int32, device=a.device)
         args = _s1_args_std(
@@ -1496,6 +1655,9 @@ def flydsl_moe_stage1(
         x_pool_depth=x_pool_depth,
         mfma_variant=mfma_variant,
         a2_compact=a2_compact,
+        streamk=streamk,
+        streamk_num_wg=_sk_num_wg,
+        streamk_mode=_sk_mode,
     )
     _run_compiled(exe, args)
 
@@ -1587,6 +1749,9 @@ def flydsl_moe_stage2(
     persist_n: int = 0,
     a2_compact: bool = False,
     blk_valid_start: Optional[torch.Tensor] = None,
+    streamk: bool = False,
+    streamk_num_wg: int = 0,
+    streamk_mode: Optional[str] = None,
 ) -> torch.Tensor:
     """Down-projection GEMM (MOE stage2). Supports atomic/reduce modes.
 
@@ -1629,6 +1794,38 @@ def flydsl_moe_stage2(
         )
 
     dev = inter_states.device
+    # streamk: precompute per-WG unit ranges on-device (schedule kernel) and carry
+    # them in the arg_blk_valid_start slot (streamk is mutually exclusive with
+    # a2_compact). num_wg defaults to num_cu when unset. n_tiles=model_dim/tile_n,
+    # k_tiles=inter_dim/tile_k (same as the in-kernel unit decode).
+    _sk_num_wg = 0
+    _sk_mode = (
+        streamk_mode
+        if streamk_mode is not None
+        else os.environ.get("AITER_MOE_STREAMK_MODE", "mfocus")
+    ).lower()
+    _sk_wg_start = None
+    if streamk:
+        from .kernels.streamk_schedule import (
+            streamk_default_num_wg,
+            flydsl_streamk_schedule,
+        )
+        _sk_num_wg = (
+            int(streamk_num_wg)
+            if streamk_num_wg and int(streamk_num_wg) > 0
+            else streamk_default_num_wg()
+        )
+        # lockstep computes its (m_block, n_tile) dispatch IN-KERNEL from
+        # blockIdx.x + num_valid (no schedule kernel).  flat / affine need the
+        # even-split wg_unit_start boundaries: run the tiny schedule kernel with
+        # k_tiles=1 so each unit is one full-K output tile (matches the in-kernel
+        # decode u -> (n_tile=u%n_tiles, m_block=u//n_tiles)); carry it in the
+        # arg_blk_valid_start kernarg slot.
+        if _sk_mode in ("flat", "affine"):
+            _sk_n_tiles = model_dim // tile_n
+            _sk_wg_start = flydsl_streamk_schedule(
+                num_valid_ids, _sk_num_wg, tile_m, _sk_n_tiles, 1
+            )
     flat_a_scale = _expand_per_tensor_scale(a2_scale, token_num * topk, 1)
     if flat_a_scale is None:
         flat_a_scale = torch.empty(0, device=dev)
@@ -1695,8 +1892,10 @@ def flydsl_moe_stage2(
         )
     else:
         # arg_blk_valid_start is a trailing kernarg on every stage2 kernel (ABI6).
-        # Unused unless a2_compact; pass a 1-elem dummy when not compacting.
-        _bvs = blk_valid_start
+        # Used by a2_compact, and by streamk flat/affine (carries wg_unit_start);
+        # lockstep streamk computes its dispatch in-kernel so it leaves this unused.
+        # Pass a 1-elem dummy when none of those apply.
+        _bvs = _sk_wg_start if _sk_wg_start is not None else blk_valid_start
         if _bvs is None:
             _bvs = torch.zeros(1, dtype=torch.int32, device=inter_states.device)
         args = _s2_args_std(
@@ -1745,6 +1944,9 @@ def flydsl_moe_stage2(
         x_pool_depth=x_pool_depth,
         persist_n=persist_n,
         a2_compact=a2_compact,
+        streamk=streamk,
+        streamk_num_wg=_sk_num_wg,
+        streamk_mode=_sk_mode,
     )
     _run_compiled(exe, args)
 
