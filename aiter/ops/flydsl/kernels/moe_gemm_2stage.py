@@ -2536,6 +2536,11 @@ def compile_moe_gemm2(
         _e_vec = 2
     else:
         _e_vec = 8 if int(tile_n) % (_cshuffle_nlane * 8) == 0 else 2
+        # Experiment knob: force the CShuffle read-back / store width (elements per
+        # lane) to attribute how much the reduce path owes to wide stores.
+        _e_vec_env = int(os.environ.get("FLYDSL_MOE_STAGE2_EVEC", "0") or "0")
+        if _e_vec_env > 0:
+            _e_vec = _e_vec_env
         _cshuffle_stride = _cshuffle_nlane * _e_vec
         if int(tile_n) % _cshuffle_stride != 0:
             raise ValueError(
