@@ -736,3 +736,141 @@ def fused_init(
 
 # Backward-compat alias: stage1 caller imported ``fused_stage1_init`` historically.
 fused_stage1_init = fused_init
+
+
+# ==============================================================================
+# Sorted-row partial layout (stage2 reduce mode)
+# ==============================================================================
+# The default reduce path has gemm2 write each partial row at
+# ``real_token * topk + slot``. After moe_sorting, real_token is effectively random
+# within a block, so those writes scatter across the whole partial buffer; round 5
+# of the stage2 investigation measured ~531us of pure write-transaction overhead at
+# token=32768 (address-capping showed the cost is transaction count, not bandwidth).
+#
+# Writing partials in *sorted row order* instead makes each workgroup's stores fully
+# sequential and moves the permutation to the reduce's read side, which gathers via
+# an inverted index. ``_invert_sorted_ids_kernel`` builds that index without a host
+# sync: the valid-row bound is read from device memory, and the padded tail of
+# sorted_ids is skipped, so garbage sentinel rows can never map onto a real token.
+
+
+@triton.jit
+def _invert_sorted_ids_kernel(
+    sorted_ids_ptr,
+    num_valid_ptr,
+    loc_ptr,
+    n_rows,
+    token_num,
+    TOPK: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """loc[token, slot] = sorted row holding that (token, slot) pair.
+
+    sorted_ids packs the pair as ``slot << 24 | token`` (same encoding the stage2
+    epilogue decodes). Rows at or past num_valid are padding and are skipped.
+    """
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    in_range = offs < n_rows
+    num_valid = tl.load(num_valid_ptr)
+    fused = tl.load(sorted_ids_ptr + offs, mask=in_range, other=0)
+    token = fused & 0xFFFFFF
+    slot = fused >> 24
+    ok = in_range & (offs < num_valid) & (token < token_num) & (slot < TOPK)
+    tl.store(loc_ptr + token * TOPK + slot, offs.to(tl.int32), mask=ok)
+
+
+@triton.jit
+def _topk_sum_gather_kernel(
+    out_ptr,
+    target_ptr,
+    loc_ptr,
+    token_num,
+    model_dim,
+    TOPK: tl.constexpr,
+    OUT_BF16: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """Per-(token, col-tile): gather the token's TOPK partial rows and sum them.
+
+    Same contract as ``_topk_sum_kernel`` except the partial rows are located
+    through ``loc`` instead of being contiguous per token. Row indices are widened
+    to int64 before scaling because ``sorted_rows * model_dim`` overflows int32 at
+    large token counts.
+    """
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask = offs < model_dim
+
+    s = tl.zeros([BLOCK_N], dtype=tl.float32)
+    for k in tl.static_range(TOPK):
+        row = tl.load(loc_ptr + pid_m * TOPK + k)
+        # -1 marks a (token, slot) that never appeared in sorted_ids; contribute 0
+        # rather than reading a bogus row.
+        row_ok = row >= 0
+        base = target_ptr + row.to(tl.int64) * model_dim
+        v = tl.load(base + offs, mask=mask & row_ok, other=0.0)
+        s += v.to(tl.float32)
+
+    y = s.to(tl.bfloat16) if OUT_BF16 else s.to(tl.float16)
+    tl.store(out_ptr + pid_m.to(tl.int64) * model_dim + offs, y, mask=mask)
+
+
+def build_sorted_partial_index(
+    sorted_token_ids: torch.Tensor,
+    num_valid_ids: torch.Tensor,
+    *,
+    token_num: int,
+    topk: int,
+) -> torch.Tensor:
+    """Return an int32 ``(token_num, topk)`` map from (token, slot) to sorted row."""
+    loc = torch.full(
+        (token_num * topk,), -1, dtype=torch.int32, device=sorted_token_ids.device
+    )
+    n_rows = sorted_token_ids.numel()
+    block = 256
+    _invert_sorted_ids_kernel[(triton.cdiv(n_rows, block),)](
+        sorted_token_ids,
+        num_valid_ids,
+        loc,
+        n_rows,
+        token_num,
+        TOPK=topk,
+        BLOCK=block,
+    )
+    return loc
+
+
+def fused_topk_sum_gather(
+    out: torch.Tensor,
+    target: torch.Tensor,
+    loc: torch.Tensor,
+    *,
+    token_num: int,
+    topk: int,
+    model_dim: int,
+) -> None:
+    """``out[t] = sum_k target[loc[t, k]]`` -- reduce over a sorted-row partial buffer."""
+    assert out.dtype in (torch.bfloat16, torch.float16), (
+        f"out dtype must be bf16/fp16, got {out.dtype}"
+    )
+    assert target.dtype == out.dtype, (
+        f"target/out dtype mismatch: {target.dtype} vs {out.dtype}"
+    )
+    assert target.is_contiguous(), "target must be contiguous"
+
+    block_n, num_warps = _pick_topk_sum_config(token_num, model_dim)
+    grid = (token_num, triton.cdiv(model_dim, block_n))
+    _topk_sum_gather_kernel[grid](
+        out,
+        target,
+        loc,
+        token_num,
+        model_dim,
+        TOPK=topk,
+        OUT_BF16=(out.dtype == torch.bfloat16),
+        BLOCK_N=block_n,
+        num_warps=num_warps,
+    )

@@ -7,6 +7,22 @@ import functools
 import os
 import re
 
+
+def _stage2_sorted_partial() -> bool:
+    """Whether stage2 reduce mode uses the sorted-row partial layout.
+
+    Must stay in sync with the identically named flag in
+    ``kernels/moe_gemm_2stage.py``: the kernel decides where partial rows land and
+    this side sizes the buffer and picks the matching reduce.
+    """
+    return os.environ.get("AITER_FLYDSL_STAGE2_SORTED_PARTIAL", "0") in (
+        "1",
+        "true",
+        "True",
+        "YES",
+        "yes",
+    )
+
 from typing import Dict, Optional
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.utility import dtypes
@@ -2081,12 +2097,31 @@ def flydsl_moe_stage2(
     _k_in = inter_dim
 
     target = out
+    _sorted_partial_loc = None
     if not accumulate:
-        target = torch.empty(
-            (token_num * topk * model_dim,),
-            device=out.device,
-            dtype=out.dtype,
-        )
+        if _stage2_sorted_partial():
+            # Sorted-row layout: one partial row per sorted (token, slot) slot,
+            # including moe_sorting's per-expert padding, so the buffer is sized by
+            # sorted rows rather than token_num*topk.
+            from aiter.ops.flydsl._fused_post import build_sorted_partial_index
+
+            target = torch.empty(
+                (sorted_token_ids.numel() * model_dim,),
+                device=out.device,
+                dtype=out.dtype,
+            )
+            _sorted_partial_loc = build_sorted_partial_index(
+                sorted_token_ids,
+                num_valid_ids,
+                token_num=token_num,
+                topk=topk,
+            )
+        else:
+            target = torch.empty(
+                (token_num * topk * model_dim,),
+                device=out.device,
+                dtype=out.dtype,
+            )
 
     if is_fp4:
         args = _s2_args_fp4(
@@ -2160,7 +2195,20 @@ def flydsl_moe_stage2(
             is_topk_sum_disabled as _fused_topk_disabled,
         )
 
-        if _fused_topk_disabled():
+        if _sorted_partial_loc is not None:
+            # Sorted-row partials are not contiguous per token; gather through the
+            # inverted index instead of the plain topk-slab sum.
+            from aiter.ops.flydsl._fused_post import fused_topk_sum_gather
+
+            fused_topk_sum_gather(
+                out,
+                target,
+                _sorted_partial_loc,
+                token_num=token_num,
+                topk=topk,
+                model_dim=model_dim,
+            )
+        elif _fused_topk_disabled():
             torch.sum(target.view(token_num, topk, model_dim), dim=1, out=out)
         else:
             _fused_topk_sum(

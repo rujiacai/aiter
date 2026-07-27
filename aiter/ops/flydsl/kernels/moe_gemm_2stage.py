@@ -2430,6 +2430,19 @@ def compile_moe_gemm2(
         "yes",
     )
 
+    # Sorted-row partial layout for reduce mode (accumulate=False): index partial
+    # rows by their sorted row number instead of real_token*topk+slot, making the
+    # epilogue's global stores sequential per workgroup. The caller must size the
+    # partial buffer by sorted rows and reduce through the inverted index, so this
+    # flag has to agree with AITER_FLYDSL_STAGE2_SORTED_PARTIAL in moe_kernels.py.
+    _SORTED_PARTIAL = os.environ.get("AITER_FLYDSL_STAGE2_SORTED_PARTIAL", "0") in (
+        "1",
+        "true",
+        "True",
+        "YES",
+        "yes",
+    )
+
     # Deep B/W2 prefetch: issue ALL K-tiles' W2 loads up front (instead of the
     # default 1-tile-ahead software pipeline) so all global W2 loads overlap and
     # hide HBM latency, asm-style. Costs more VGPR (all B tiles live at once); for
@@ -3990,6 +4003,14 @@ def compile_moe_gemm2(
                             ts_idx = t_idx * fx.Index(topk) + s_idx
                             if bool(accumulate):
                                 row_byte_base = out_base_idx + t_idx * fx.Index(
+                                    model_dim * out_elem_bytes
+                                )
+                            elif _SORTED_PARTIAL:
+                                # Partial rows keep sorted order, so a workgroup's stores
+                                # cover one contiguous row range instead of scattering over
+                                # the whole buffer; the reduce gathers via the inverted
+                                # index (see _fused_post.build_sorted_partial_index).
+                                row_byte_base = out_base_idx + row * fx.Index(
                                     model_dim * out_elem_bytes
                                 )
                             else:
