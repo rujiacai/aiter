@@ -740,6 +740,42 @@ def get_flydsl_stage1_kernels(
     return kernels
 
 
+def _stage2_persist_n_candidates(
+    is_fp4: bool,
+    mode: str,
+    waves_per_eu: int,
+    n_per_wave: int,
+    tile_n: int,
+    n_dim: Optional[int],
+) -> list[int]:
+    """persist_n values worth enumerating for a stage2 tile config.
+
+    ``0`` means full persist (one WG covers every N-tile); a positive value is
+    the number of consecutive N-tiles per WG, so grid.x shrinks to
+    ``n_tiles / persist_n``.  Smaller persist_n keeps more WGs resident and
+    balances better; larger persist_n reuses the staged X tile more.  The
+    optimum is shape-dependent, hence the sweep.
+
+    The candidate set is deliberately narrow (atomic mode, default
+    ``waves_per_eu``/``n_per_wave``) so enabling persist does not multiply the
+    stage2 autotune space: persist trades against occupancy, not against the
+    per-EU / per-wave knobs, and every tuned persistent config observed so far
+    uses the defaults.
+    """
+    if is_fp4 or mode != "atomic":
+        return []
+    if waves_per_eu != 0 or n_per_wave != 32:
+        return []
+    if n_dim is None or n_dim % tile_n != 0:
+        return []
+    n_tiles = n_dim // tile_n
+    if n_tiles < 2:
+        return []
+    # 0 == full persist; a partial persist_n must divide n_tiles and leave at
+    # least 2 WGs along N (pn == n_tiles is just full persist under another name).
+    return [0] + [pn for pn in (2, 4, 8, 16) if n_tiles % pn == 0 and pn < n_tiles]
+
+
 def get_flydsl_stage2_kernels(
     a_dtype: str,
     b_dtype: str,
@@ -852,6 +888,61 @@ def get_flydsl_stage2_kernels(
                                         if mfma_variant_tag:
                                             base_params["mfma_variant"] = mfma_variant_tag
                                         kernels[base_name] = base_params
+
+                                    # ---- Persistent-N variants ----
+                                    # One WG sweeps `persist_n` consecutive N-tiles
+                                    # and reuses the X tile it already staged in
+                                    # LDS, so the per-WG prologue is paid once per
+                                    # persist_n output tiles instead of once per
+                                    # tile.  That prologue dominates stage2 whenever
+                                    # K (= inter_dim) is small: for Hunyuan-V3
+                                    # (inter_dim=192, tile_k=64 -> 3 K-tiles) the
+                                    # persistent variants cut stage2 by up to 60%
+                                    # at 32..512 tokens.  Persist is incompatible
+                                    # with split-K, so these are kb == 1 only.
+                                    for pn in _stage2_persist_n_candidates(
+                                        is_fp4, mode, wpe, npw, tn, n_dim
+                                    ):
+                                        p_name = flydsl_kernel_name(
+                                            2,
+                                            a_dtype,
+                                            b_dtype,
+                                            out_dtype,
+                                            tm,
+                                            tn,
+                                            tk,
+                                            mode,
+                                        )
+                                        if async_copy:
+                                            p_name += "_async"
+                                        if mfma_variant_tag:
+                                            p_name += f"_{mfma_variant_tag}"
+                                        p_name += "_persist"
+                                        if pn:
+                                            p_name += f"_pn{pn}"
+                                        if bnt != 2:
+                                            p_name += f"_bnt{bnt}"
+                                        p_params = {
+                                            "stage": 2,
+                                            "a_dtype": a_dtype,
+                                            "b_dtype": b_dtype,
+                                            "out_dtype": out_dtype,
+                                            "tile_m": tm,
+                                            "tile_n": tn,
+                                            "tile_k": tk,
+                                            "mode": mode,
+                                            "MPerBlock": tm,
+                                            "use_async_copy": async_copy,
+                                            "waves_per_eu": wpe,
+                                            "b_nt": bnt,
+                                            "n_per_wave": npw,
+                                            "k_batch": 1,
+                                            "persist": True,
+                                            "persist_n": pn,
+                                        }
+                                        if mfma_variant_tag:
+                                            p_params["mfma_variant"] = mfma_variant_tag
+                                        kernels[p_name] = p_params
     if (
         a_dtype == "fp8"
         and b_dtype == "fp8"
@@ -1953,6 +2044,24 @@ def flydsl_moe_stage2(
     )
 
     _sbm = sort_block_m if sort_block_m > 0 else tile_m
+    # `_sbm` must be the block_size moe_sorting actually used, otherwise the
+    # m_blocks / row-offset math below silently addresses the wrong sorted rows
+    # and the kernel returns plausible-looking garbage (no crash, no NaN).
+    # sorted_token_ids is one row per sorted slot, sorted_expert_ids one entry
+    # per block, so their ratio recovers the real block size.
+    _n_sort_blocks = sorted_expert_ids.shape[0]
+    if _n_sort_blocks > 0:
+        _actual_sbm = round(sorted_token_ids.shape[0] / _n_sort_blocks)
+        if _actual_sbm != _sbm:
+            raise ValueError(
+                f"flydsl_moe_stage2: sort_block_m mismatch -- kernel assumes "
+                f"{_sbm} (tile_m={tile_m}, sort_block_m={sort_block_m}) but "
+                f"moe_sorting used block_size={_actual_sbm} "
+                f"(sorted_token_ids={sorted_token_ids.shape[0]}, "
+                f"sorted_expert_ids={_n_sort_blocks}). Pass sort_block_m="
+                f"{_actual_sbm} (kernel-name tag `_sbm{_actual_sbm}`) or pick a "
+                f"stage2 tile_m equal to the sorting block_m."
+            )
     if _sbm == tile_m:
         m_blocks = min(sorted_expert_ids.shape[0], token_num * topk)
     else:
