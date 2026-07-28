@@ -166,93 +166,90 @@ stride:    1     →    8    →     128     →     512      →  (K/64)·512
 
 #### 3.3.2 ④ dequant 展开：e2m1 码 → fp8（默认 perm-LUT 路径）
 
-**默认路径**（`AITER_A8W4_PERMLUT=1`，见 §4/§8）走 `unpack_b_w4a16_mxfp4_to_fp8_permlut`。它把一个 `packed32`（8 码）变成一个 `i64`（8 fp8）= 一个 K32 operand 该 lane 的 8 元素：
+**默认路径**（`AITER_A8W4_PERMLUT=1`，见 §4/§8）走 `unpack_b_w4a16_mxfp4_to_fp8_permlut`。它把一个 `packed32`（8 码）变成一个 `i64`（8 fp8）= 一个 K32 operand 该 lane 的 8 元素，**每个 operand 只花 9 条 VALU**：
 
-```637:640:/data/aiter/aiter/ops/flydsl/kernels/mfma_preshuffle_pipeline.py
-    even, odd = _unpack_mxfp4_nibble_pair(packed32)
-    fe = _e2m1x4_in_i32_to_fp8x4_i32_permlut(even, arith, vector, ratios=ratios_even)
-    fo = _e2m1x4_in_i32_to_fp8x4_i32_permlut(odd, arith, vector, ratios=ratios_odd)
-    return _pack_i32_pair_to_i64(fe, fo, vector)
+```657:660:/data/aiter/aiter/ops/flydsl/kernels/mfma_preshuffle_pipeline.py
+    fe = _e2m1x4_from_packed_to_fp8x4_permlut(packed32, 0, arith, vector,
+                                              ratios=ratios_even)
+    fo = _e2m1x4_from_packed_to_fp8x4_permlut(packed32, 1, arith, vector,
+                                              ratios=ratios_odd)
 ```
 
-**1. 拆 nibble** `_unpack_mxfp4_nibble_pair`：`even = packed32 & 0x0F0F0F0F`（每字节低 4 位 → 前 4 fp8）、`odd = (packed32>>4) & 0x0F0F0F0F`（高 4 位 → 后 4 fp8）。e2m1 码是**无符号 0–15**，只 mask、**不做符号扩展**（区别于 int4）。这与 §7.1 pack 的「偶低/奇高」互为逆运算。
+注意**没有独立的「拆 nibble」步骤**：两个 nibble 组（`nib=0` 低半→前 4 fp8、`nib=1` 高半→后 4 fp8）都直接从 `packed32` 里取，省掉了 `& 0x0F0F0F0F` 提取。
 
-**2. 每 4 码 → 4 fp8** `_e2m1x4_in_i32_to_fp8x4_i32_permlut`：**查表(3× `v_perm_b32`) +（可选）scheme B fold**。
+**每 4 码 → 4 fp8** `_e2m1x4_from_packed_to_fp8x4_permlut`：**1 次查表 + 1 次贴符号 +（可选）scheme B fold**。
 
-先用 16 项常量 LUT（e2m1 码 → e4m3fnuz 字节，4 个 dword）3 次 `v_perm_b32` 直接把码翻成 fp8 字节：
-
-```604:609:/data/aiter/aiter/ops/flydsl/kernels/mfma_preshuffle_pipeline.py
-    sel = v & fx.Int32(0x07070707)
-    res_lo = fx.Int32(rocdl.perm_b32(lut_lo_hi, lut_lo_lo, sel))  # codes 0..7
-    res_hi = fx.Int32(rocdl.perm_b32(lut_hi_hi, lut_hi_lo, sel))  # codes 8..15
-    # blend by bit3 of each code: output byte i from res_lo (sel i) or res_hi (i+4).
-    blend_sel = fx.Int32(0x03020100) | ((v >> fx.Int32(1)) & fx.Int32(0x04040404))
-    fp8x4 = rocdl.perm_b32(res_hi, res_lo, blend_sel)
+```634:646:/data/aiter/aiter/ops/flydsl/kernels/mfma_preshuffle_pipeline.py
+    lut_lo = fx.Int32(_A8W4_FP8_LUT[0])  # codes 0..3
+    lut_hi = fx.Int32(_A8W4_FP8_LUT[1])  # codes 4..7
+    p = fx.Int32(packed32)
+    sh = 4 * int(nib)
+    base = p if sh == 0 else (p >> fx.Int32(sh))
+    sel = base & fx.Int32(0x07070707)
+    mag = fx.Int32(rocdl.perm_b32(lut_hi, lut_lo, sel))
+    # sign = code bit3 -> fp8 bit7; for the high nibble it is already in place.
+    if sh == 0:
+        sign = (p & fx.Int32(0x08080808)) << fx.Int32(4)
+    else:
+        sign = p & fx.Int32(0x80808080)
+    fp8x4 = mag | sign
 ```
 
-- `sel = code & 0x07`：码低 3 位选 8 字节池内的字节；`res_lo` 查 codes 0–7、`res_hi` 查 codes 8–15。
-- `blend_sel` 按每个码的 **bit3** 在 `res_lo`/`res_hi` 间挑选 → 得到 4 个 fp8 字节 `fp8x4`。
-- 这就替掉了旧版 `_e2m1x4_in_i32_to_fp8x4_i32` 的 ~15 int-op/nibble 位构造，**直接码→fp8**。
-
-##### 展开：3× `v_perm_b32` 为什么能当 16 项 LUT 用
+##### 展开：为什么 8 项 LUT + 符号位就够（省掉一半 perm）
 
 **先记住 `perm_b32(A, B, sel)` 的语义**（AMD 字节重排指令）：把低位操作数 `B` 的 4 字节 + 高位操作数 `A` 的 4 字节拼成一个 **8 字节池** `pool[0..7]`（`pool[0..3]=B`、`pool[4..7]=A`）；输出 4 字节，**第 i 个输出字节 = `pool[sel 的第 i 个字节]`**（sel 每字节是 0–7 的下标）。即「按下标从 8 字节里挑 4 个」。
 
-**为什么要拆两半**：LUT 有 16 项、但一条 `perm` 的池只有 8 字节装不下，所以拆成「码 0–7」和「码 8–15」两半各查一次，最后按 bit3 合并。4 个 LUT 常量按 little-endian 摊成字节（下标 = e2m1 码）：
+一条 perm 的池只有 8 字节，而 e2m1 码有 16 个 —— 看上去必须查两次再按 bit3 合并（那就是 3 条 perm）。但把码表摊开就会发现**上半区就是下半区置上符号位**：
 
 ```
-lut_lo_lo = 0x44403800 → [00, 38, 40, 44]   ← 码 0,1,2,3 的 fp8
-lut_lo_hi = 0x54504C48 → [48, 4c, 50, 54]   ← 码 4,5,6,7
-lut_hi_lo = 0xC4C0B800 → [00, b8, c0, c4]   ← 码 8,9,10,11
-lut_hi_hi = 0xD4D0CCC8 → [c8, cc, d0, d4]   ← 码 12,13,14,15
+码 0–7  (低半区，幅值):  00, 38, 40, 44, 48, 4c, 50, 54
+码 8–15 (高半区，负值):  00, b8, c0, c4, c8, cc, d0, d4
+                         ↑    ↑
+                    例外!  0x38|0x80 = 0xb8 ✓  0x40|0x80 = 0xc0 ✓ …
 ```
 
-**具体走一遍**（设 `val_i32` 的 4 个码字节 = `3, 10, 1, 15`，期望 fp8 = `44, c0, 38, d4`）：
+除了**码 8**，其余每一项都严格满足 `LUT[c+8] == LUT[c] | 0x80`。所以只要能处理掉码 8，就可以「查 8 项拿幅值 + 把 bit3 搬到 bit7 当符号」，**一条 perm 就够**。
+
+**码 8 的例外**：它是 `-0.0`，而 e4m3fnuz 的 `0x80` 是 NaN，所以码表里写的是 `0x00` 而非 `0x80`。解法在 host 端：`_mxfp4_codes_i8` 把码 8 归一成码 0（两者数值都是 `0.0`，严格等价，且只在 prep 时做一次、零运行时成本），例外就消失了。
+
+**具体走一遍**（设低 nibble 的 4 个码 = `3, 10, 1, 15`，期望 fp8 = `44, c0, 38, d4`）：
 
 ```
-① sel = v & 0x07             码低 3 位 → 池内下标
+① sel = p & 0x07             码低 3 位 → 池内下标（不需要先 & 0x0F）
    3→3, 10→2, 1→1, 15→7      sel = [3,2,1,7]
 
-② res_lo = perm(lut_lo_hi, lut_lo_lo, sel)   假设"全是低半区码 0–7"
-   池 = [00,38,40,44, 48,4c,50,54]
-   pool[3,2,1,7] → res_lo = [44, 40, 38, 54]
+② mag = perm(lut_hi, lut_lo, sel)     一次查 8 项幅值表
+   池 = [00,38,40,44, 48,4c,50,54]    (低4=lut_lo=码0-3, 高4=lut_hi=码4-7)
+   pool[3,2,1,7] → mag = [44, 40, 38, 54]
 
-③ res_hi = perm(lut_hi_hi, lut_hi_lo, sel)   假设"全是高半区码 8–15"
-   池 = [00,b8,c0,c4, c8,cc,d0,d4]
-   pool[3,2,1,7] → res_hi = [c4, c0, b8, d4]
+③ sign = (p & 0x08) << 4              码 bit3 → fp8 bit7
+   码 3,10,1,15 的 bit3 = 0,1,0,1  →  sign = [00, 80, 00, 80]
 
-④ blend_sel = 0x03020100 | ((v>>1) & 0x04040404)
-   base    = [0,1,2,3]        含义:"输出 i 取 res_lo[i]"（池低 4 字节 = res_lo）
-   (v>>1)&4= [0,4,0,4]        取每个码的 bit3(值8→>>1→值4)；属高半区就 +4 改取 res_hi
-   blend_sel= [0,5,2,7]
-
-⑤ fp8x4 = perm(res_hi, res_lo, blend_sel)    逐字节二选一
-   池 = [44,40,38,54, c4,c0,b8,d4]  (低4=res_lo, 高4=res_hi)
-   pool[0,5,2,7] → [44, c0, 38, d4]  ✓ 与期望一致
+④ fp8x4 = mag | sign
+   [44, 40|80, 38, 54|80] → [44, c0, 38, d4]   ✓ 与期望一致
 ```
 
-**三步一句话**：`res_lo`=「全按低半区算一遍」、`res_hi`=「全按高半区算一遍」、`blend`=「按每个码 bit3 逐字节挑正确那套」。整个转换只读每字节的 bit0–3（上游 `& 0x0F` 拆码保证高 4 位为 0），bit4–7 从不参与。
+高 nibble（`nib=1`）只差一点：`sel` 要先 `p >> 4` 再取低 3 位，而符号位**已经天然落在 bit7**（码 bit3 = 字节 bit7），所以直接 `p & 0x80808080` 即可，连移位都省了。
+
+**代价与收益**：整条路径从「3 perm + blend 构造 + 先拆 nibble」的 17 条 VALU 降到 **9 条**。因为 a8w4 是 VALU-bound（tile_m=32 时 VALU 占 72.8% SIMD 周期，MFMA 只占 23.8%），这是直接的端到端收益。
 
 然后按 `ratios` 分两种：
 
-```610:630:/data/aiter/aiter/ops/flydsl/kernels/mfma_preshuffle_pipeline.py
+```645:646:/data/aiter/aiter/ops/flydsl/kernels/mfma_preshuffle_pipeline.py
     if ratios is None:
         return fp8x4
-    # scheme B: fp8 -> f32 -> *ratio -> fp8 (reuse the reliable f32 fold).
-    c_pzero = fx.Float32(0.0)
-    f_lo = rocdl.cvt_pk_f32_fp8(T.vec(2, T.f32), fp8x4, False)  # fp8 elems 0,1
-    f_hi = rocdl.cvt_pk_f32_fp8(T.vec(2, T.f32), fp8x4, True)   # fp8 elems 2,3
+    return _fold_fp8x4_by_ratios(fp8x4, ratios, arith, vector)
 ```
 
 - `ratios is None`（aligned / no-fold）：**直接返回裸 `fp8x4`**，scale 走 post-MFMA。
 - `ratios` 非空（默认 fold 路径，straddle）：**scheme B** —— `fp8 → f32`（`cvt_pk_f32_fp8`）→ `×ratio` → 归一 -0 → `cvt_pk_fp8_f32` 重打包。只把「码→数值」前端换成 LUT，后端仍复用可靠的 f32 ratio-fold。
 
-**3. 拼 i64** `_pack_i32_pair_to_i64`：`fe`(前4) + `fo`(后4) → i64（8 fp8）直接喂 MFMA。
+**拼 i64** `_pack_i32_pair_to_i64`：`fe`(前4) + `fo`(后4) → i64（8 fp8）直接喂 MFMA。
 
 **为什么"逐元素、无损、不重排 K"**：
 
 - **不重排**：第 `i` 码 → 第 `i` fp8，顺序原样；K 归属仍由 ② 决定。
-- **无损**：LUT `_A8W4_FP8_LUT` 是对全部 16 个 e2m1 码验证过 **byte-exact** 的 e4m3fnuz 编码（e2m1 尾数只有 `{0,1}` bit，在 e4m3fnuz normal range 内可精确表示）。
+- **无损**：`_A8W4_FP8_LUT` 是对全部 16 个 e2m1 码验证过 **byte-exact** 的 e4m3fnuz 码表（e2m1 尾数只有 `{0,1}` bit，在 e4m3fnuz normal range 内可精确表示）；「查低 8 项 + 贴符号」与查完整 16 项等价（唯一例外码 8 已在 host 端折成码 0，见上）。
 - **逐元素**：8 码各自独立查表转换。
 
 **`ratios_even/odd`（fold 在此注入）**：默认 fold 路径传入 §5 的 per-element `2^(exp-base)` 因子（straddle 时把 A/B 两块归一到公共 base，**顺带在 dequant 乘掉、不额外加 pass**）；aligned 路径传 `None`（出裸 fp8、scale 走 post-MFMA）。
@@ -294,22 +291,25 @@ MFMA 把这 32 项累加成**一个数**，post-MFMA 只能乘**一个** scale�
 | 路径 | 环境变量 | 做法 | 相对开销 |
 |---|---|---|---|
 | f32 construct | `AITER_A8W4_PERMLUT=0` | e2m1→bf16 位构造→f32→(×ratio)→`cvt_pk_fp8` | 基线 |
-| **perm-LUT（默认）** | `AITER_A8W4_PERMLUT=1` | 3× `v_perm_b32` 字节 LUT 查 e2m1→fp8 | **unpack int-op ~8× 更少** |
+| **perm-LUT（默认）** | `AITER_A8W4_PERMLUT=1` | 1× `v_perm_b32` 查 8 项幅值 LUT + 贴符号位 | **每 operand 17→9 条 VALU** |
 | bitfold | `AITER_A8W4_BITFOLD=1` | 纯整数位构造 e2m1→fp8，ratio 折进指数 | 无 f32 往返 |
 
-**perm-LUT 核心**：把 16 个 e2m1 码 → fp8 字节的映射做成 4 个常量 dword 的 LUT，用 3 条 `v_perm_b32` 完成（低 8 码一组、高 8 码一组，再按 bit3 blend），替代每 nibble ~15 条整数指令（`perm_b32` 8 字节池语义 + 逐码走一遍的详细推导见 §3.3.2「展开：3× `v_perm_b32` 为什么能当 16 项 LUT 用」）：
+**perm-LUT 核心**：e2m1 码表的上半区恰好等于下半区置上符号位，所以只需 **1 条 `v_perm_b32` 查 8 项幅值表**，再把码 bit3 搬到 fp8 bit7 当符号；nibble 也直接从 packed dword 取，不必先 `& 0x0F`。替代每 nibble ~15 条整数位构造（完整推导、码 8 的例外处理、逐码走一遍见 §3.3.2「展开：为什么 8 项 LUT + 符号位就够」）：
 
-```586:611:/data/aiter/aiter/ops/flydsl/kernels/mfma_preshuffle_pipeline.py
-def _e2m1x4_in_i32_to_fp8x4_i32_permlut(val_i32, arith, vector, ratios=None):
-    # ...
-    sel = v & fx.Int32(0x07070707)
-    res_lo = fx.Int32(rocdl.perm_b32(lut_lo_hi, lut_lo_lo, sel))  # codes 0..7
-    res_hi = fx.Int32(rocdl.perm_b32(lut_hi_hi, lut_hi_lo, sel))  # codes 8..15
-    # blend by bit3 of each code: output byte i from res_lo (sel i) or res_hi (i+4).
-    blend_sel = fx.Int32(0x03020100) | ((v >> fx.Int32(1)) & fx.Int32(0x04040404))
-    fp8x4 = rocdl.perm_b32(res_hi, res_lo, blend_sel)
-    if ratios is None:
-        return fp8x4
+```634:646:/data/aiter/aiter/ops/flydsl/kernels/mfma_preshuffle_pipeline.py
+    lut_lo = fx.Int32(_A8W4_FP8_LUT[0])  # codes 0..3
+    lut_hi = fx.Int32(_A8W4_FP8_LUT[1])  # codes 4..7
+    p = fx.Int32(packed32)
+    sh = 4 * int(nib)
+    base = p if sh == 0 else (p >> fx.Int32(sh))
+    sel = base & fx.Int32(0x07070707)
+    mag = fx.Int32(rocdl.perm_b32(lut_hi, lut_lo, sel))
+    # sign = code bit3 -> fp8 bit7; for the high nibble it is already in place.
+    if sh == 0:
+        sign = (p & fx.Int32(0x08080808)) << fx.Int32(4)
+    else:
+        sign = p & fx.Int32(0x80808080)
+    fp8x4 = mag | sign
     # scheme B: fp8 -> f32 -> *ratio -> fp8 (reuse the reliable f32 fold).
 ```
 
@@ -585,12 +585,12 @@ def prep_a16w4_scale(e8m0_scale, N, K, scale_mul=1.0):
 |---|---|---|
 | `moe_kernels.py` | `prep_a8w4_weight_scale` / `prep_a8w4_w4` / `prep_a8w4_w4_aligned` | 三条 host prep（§7）|
 | `mfma_preshuffle_pipeline.py` | `_e2m1x4_in_i32_to_fp8x4_i32` (546) | f32 位构造 unpack |
-| | `_e2m1x4_in_i32_to_fp8x4_i32_permlut` (586) | **perm-LUT unpack（默认）** |
-| | `_e2m1_code_to_fp8_byte_fold` (767) | bitfold 纯整数 unpack |
-| | `make_aligned_b_layout` (657) / `load_b_operand_aligned` (688) | aligned B 布局/加载 |
+| | `_e2m1x4_from_packed_to_fp8x4_permlut` (615) | **perm-LUT unpack（默认，9 VALU/operand）** |
+| | `_e2m1_code_to_fp8_byte_fold` (791) | bitfold 纯整数 unpack |
+| | `make_aligned_b_layout` (681) / `load_b_operand_aligned` (712) | aligned B 布局/加载 |
 | | `shuffle_weight_NK`（`shuffle.py:218`）| aligned 权重 preshuffle |
 | `moe_gemm_2stage.py` | `_mxfp4_fp8_fold_operands` (75) | fold（unpack + ratio-fold + sc_out）|
-| | `lds_load_packs_k64_aligned` (1142/3276) | **aligned 激活 loader（2×8B）** |
+| | `lds_load_packs_k64_aligned` (1147/3288) | **aligned 激活 loader（2×8B）** |
 | | per-operand scale compute (1448) | `mfma → zero-acc → ×scale FMA` |
 | | aligned raw-load 分支 (977/3118) | 无 fold 路径 |
 

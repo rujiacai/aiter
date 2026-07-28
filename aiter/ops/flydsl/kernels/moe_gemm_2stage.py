@@ -170,6 +170,7 @@ def compile_moe_gemm1(
     use_cshuffle_epilog: bool | None = None,
     scale_is_bf16: bool = False,
     k_batch: int = 1,
+    waves_per_eu: int = 0,
 ):
     """Compile stage1 kernel (`moe_gemm1`) and return the compiled executable.
 
@@ -186,6 +187,10 @@ def compile_moe_gemm1(
     scale_is_bf16: When True, groupwise scales are bf16 (halves scale bandwidth).
     k_batch: Split-K factor. When >1, K is partitioned across k_batch CTAs that
       atomically accumulate gate/up partials. Caller must pre-zero output.
+    waves_per_eu: when >0, sets ``rocdl.waves_per_eu`` so the backend caps register
+      usage to fit that many waves per SIMD. At tile_m>=64 the a8w4 path otherwise
+      needs ~500 VGPRs and drops to 1 wave/SIMD, which leaves the SIMD idle 35-60%
+      of the time waiting on memory (see aiter_logs/prof_a8w4_breakdown.py).
     """
 
     gpu_arch = get_hip_arch()
@@ -2339,7 +2344,7 @@ def compile_moe_gemm1(
         gx = inter_in // fx.Index(tile_n)
         gy = size_expert_ids_in
 
-        moe_gemm1(
+        _k1 = moe_gemm1(
             arg_out,
             arg_x,
             arg_w,
@@ -2353,7 +2358,14 @@ def compile_moe_gemm1(
             i32_inter_in,
             i32_k_in,
             i32_size_expert_ids_in,
-        ).launch(
+        )
+        if const_expr(waves_per_eu > 0):
+            for op in ctx.gpu_module_body.operations:
+                if hasattr(op, "attributes") and op.OPERATION_NAME == "gpu.func":
+                    op.attributes["rocdl.waves_per_eu"] = ir.IntegerAttr.get(
+                        T.i32, int(waves_per_eu)
+                    )
+        _k1.launch(
             grid=(gx, gy, k_batch),
             block=(256, 1, 1),
             stream=stream,
