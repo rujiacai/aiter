@@ -44,6 +44,12 @@ def _mxfp4_codes_i8(wq_fp4x2, N, K):
     codes = torch.empty((E, N, K), dtype=torch.int8, device=wq_fp4x2.device)
     codes[..., 0::2] = (u & 0x0F).to(torch.int8)
     codes[..., 1::2] = ((u >> 4) & 0x0F).to(torch.int8)
+    # Code 8 is -0.0, numerically identical to code 0 (+0.0). Folding it away makes
+    # the top half of the codebook exactly the bottom half OR'd with the sign bit,
+    # which lets the a8w4 kernel decode with an 8-entry LUT + sign instead of a
+    # 16-entry LUT + blend (see _e2m1x4_from_packed_to_fp8x4_permlut). Every other
+    # consumer reads the same value either way.
+    codes[codes == 8] = 0
     return codes
 
 
@@ -846,6 +852,7 @@ def compile_flydsl_moe_stage1(
             in_dtype="mxfp4_fp8",
             group_size=32,
             out_dtype=out_dtype,
+            waves_per_eu=waves_per_eu,
             use_cshuffle_epilog=_use_cshuffle,
             scale_is_bf16=True,
             k_batch=k_batch,

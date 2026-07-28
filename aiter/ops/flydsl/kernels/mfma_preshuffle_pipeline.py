@@ -596,36 +596,18 @@ def _e2m1x4_in_i32_to_fp8x4_i32(val_i32, arith, vector, ratios=None):
 # (little-endian). Byte-exact vs torch ``.to(float8_e4m3fnuz)`` (verified over all
 # 16^4 combos in aiter_logs/proto_perm_lut.py):
 #   [0x00,0x38,0x40,0x44, 0x48,0x4c,0x50,0x54, 0x00,0xb8,0xc0,0xc4, 0xc8,0xcc,0xd0,0xd4]
+# Only the first two dwords (codes 0..7, the magnitudes) are read: the upper half
+# is the lower half OR'd with the sign bit, so decoders apply bit3 as fp8 bit7
+# instead of looking it up. The full table is kept as the reference codebook --
+# note entry 8 (-0.0) is 0x00, not 0x80, which is why ``_mxfp4_codes_i8`` folds
+# code 8 to code 0 before that shortcut is valid.
 _A8W4_FP8_LUT = (0x44403800, 0x54504C48, 0xC4C0B800, 0xD4D0CCC8)
 
 
-def _e2m1x4_in_i32_to_fp8x4_i32_permlut(val_i32, arith, vector, ratios=None):
-    """perm_b32 byte-LUT variant of :func:`_e2m1x4_in_i32_to_fp8x4_i32`.
-
-    Looks up e2m1 code -> fp8(e4m3fnuz) byte with 3x ``v_perm_b32`` over a 16-entry
-    LUT (4 constant dwords) instead of the ~15-int-op/nibble bit-construction
-    (``_e2m1_byte_to_bf16_bits``). ``ratios`` is None (unscaled fp8 out) or 4 f32
-    fold factors: the unscaled fp8 is widened fp8->f32 (``cvt_pk_f32_fp8``), *ratio,
-    +0.0 (-0 norm), repacked f32->fp8 (scheme B -- reuses the reliable f32 fold and
-    only swaps the code->f32 front-end for the LUT).
-    """
+def _fold_fp8x4_by_ratios(fp8x4, ratios, arith, vector):
+    """scheme B fold: fp8x4 -> f32 -> *ratio -> +0.0 (-0 norm) -> repacked fp8x4."""
     from flydsl.expr import rocdl
 
-    lut_lo_lo = fx.Int32(_A8W4_FP8_LUT[0])
-    lut_lo_hi = fx.Int32(_A8W4_FP8_LUT[1])
-    lut_hi_lo = fx.Int32(_A8W4_FP8_LUT[2])
-    lut_hi_hi = fx.Int32(_A8W4_FP8_LUT[3])
-    v = fx.Int32(val_i32)
-    # code&7 selects a byte within an 8-byte pool; perm picks it per output byte.
-    sel = v & fx.Int32(0x07070707)
-    res_lo = fx.Int32(rocdl.perm_b32(lut_lo_hi, lut_lo_lo, sel))  # codes 0..7
-    res_hi = fx.Int32(rocdl.perm_b32(lut_hi_hi, lut_hi_lo, sel))  # codes 8..15
-    # blend by bit3 of each code: output byte i from res_lo (sel i) or res_hi (i+4).
-    blend_sel = fx.Int32(0x03020100) | ((v >> fx.Int32(1)) & fx.Int32(0x04040404))
-    fp8x4 = rocdl.perm_b32(res_hi, res_lo, blend_sel)
-    if ratios is None:
-        return fp8x4
-    # scheme B: fp8 -> f32 -> *ratio -> fp8 (reuse the reliable f32 fold).
     c_pzero = fx.Float32(0.0)
     f_lo = rocdl.cvt_pk_f32_fp8(T.vec(2, T.f32), fp8x4, False)  # fp8 elems 0,1
     f_hi = rocdl.cvt_pk_f32_fp8(T.vec(2, T.f32), fp8x4, True)   # fp8 elems 2,3
@@ -646,13 +628,55 @@ def _e2m1x4_in_i32_to_fp8x4_i32_permlut(val_i32, arith, vector, ratios=None):
     return p
 
 
+def _e2m1x4_from_packed_to_fp8x4_permlut(packed32, nib, arith, vector, ratios=None):
+    """perm_b32 byte-LUT decode of 4 e2m1 codes -> 4 fp8 (e4m3fnuz) bytes.
+
+    ``nib`` = 0 (low nibbles -> first 4 fp8) or 1 (high nibbles -> last 4 fp8).
+
+    Two things make this cheaper than the 16-entry blend form (17 -> 9 VALU per 8
+    codes), which matters because the a8w4 kernel is VALU-bound (72.8% of SIMD
+    cycles at tile_m=32):
+
+    1. No ``& 0x0F0F0F0F`` extraction -- both consumers only read low bits of each
+       code, so they can index the packed dword directly.
+    2. Only ONE perm over an 8-entry magnitude LUT instead of two perms over the
+       16-entry LUT plus a blend: the codebook's upper half is exactly its lower
+       half with the sign bit set, so the sign is just code bit3 moved to fp8 bit7.
+       This relies on ``_mxfp4_codes_i8`` folding code 8 (-0.0) to code 0, since
+       -0 is the one entry that breaks the pattern (e4m3fnuz 0x80 is NaN).
+    """
+    from flydsl.expr import rocdl
+
+    lut_lo = fx.Int32(_A8W4_FP8_LUT[0])  # codes 0..3
+    lut_hi = fx.Int32(_A8W4_FP8_LUT[1])  # codes 4..7
+    p = fx.Int32(packed32)
+    sh = 4 * int(nib)
+    base = p if sh == 0 else (p >> fx.Int32(sh))
+    sel = base & fx.Int32(0x07070707)
+    mag = fx.Int32(rocdl.perm_b32(lut_hi, lut_lo, sel))
+    # sign = code bit3 -> fp8 bit7; for the high nibble it is already in place.
+    if sh == 0:
+        sign = (p & fx.Int32(0x08080808)) << fx.Int32(4)
+    else:
+        sign = p & fx.Int32(0x80808080)
+    fp8x4 = mag | sign
+    if ratios is None:
+        return fp8x4
+    return _fold_fp8x4_by_ratios(fp8x4, ratios, arith, vector)
+
+
 def unpack_b_w4a16_mxfp4_to_fp8_permlut(
     packed32, arith, vector, ratios_even=None, ratios_odd=None
 ):
-    """perm_b32 byte-LUT variant of :func:`unpack_b_w4a16_mxfp4_to_fp8` (a8w4 P1)."""
-    even, odd = _unpack_mxfp4_nibble_pair(packed32)
-    fe = _e2m1x4_in_i32_to_fp8x4_i32_permlut(even, arith, vector, ratios=ratios_even)
-    fo = _e2m1x4_in_i32_to_fp8x4_i32_permlut(odd, arith, vector, ratios=ratios_odd)
+    """perm_b32 byte-LUT variant of :func:`unpack_b_w4a16_mxfp4_to_fp8` (a8w4 P1).
+
+    Byte-exact with the bit-construction form at 9 instead of 17 VALU per operand
+    (see :func:`_e2m1x4_from_packed_to_fp8x4_permlut`).
+    """
+    fe = _e2m1x4_from_packed_to_fp8x4_permlut(packed32, 0, arith, vector,
+                                              ratios=ratios_even)
+    fo = _e2m1x4_from_packed_to_fp8x4_permlut(packed32, 1, arith, vector,
+                                              ratios=ratios_odd)
     return _pack_i32_pair_to_i64(fe, fo, vector)
 
 
