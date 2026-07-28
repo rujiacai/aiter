@@ -25,6 +25,7 @@ from aiter.ops.flydsl.moe_kernels import (  # noqa: E402
     flydsl_moe_stage1,
     flydsl_moe_stage2,
     prep_a8w4_w4,
+    prep_a8w4_w4_aligned,
 )
 
 FP8 = torch.float8_e4m3fnuz
@@ -37,7 +38,12 @@ def _prep_a8w4(w_qt, w_scale, E, N, K, G=None):
     Thin wrapper over ``moe_kernels.prep_a8w4_w4`` (E and G are inferred internally);
     keeps the ``(E, N, K, G)`` call sites below unchanged. The kernel unpacks e2m1->fp8
     and does the per-pair ratio-fold in-kernel (paired with b_dtype="mxfp4").
+
+    ``AITER_A8W4_ALIGNED=1`` switches to the aligned weight layout, matching the
+    kernel-side gate of the same env var (both sides must agree or results are wrong).
     """
+    if os.environ.get("AITER_A8W4_ALIGNED", "0") == "1":
+        return prep_a8w4_w4_aligned(w_qt, w_scale, N, K)
     return prep_a8w4_w4(w_qt, w_scale, N, K)
 _HIPQ = get_hip_quant(QuantType.per_Token)  # bf16 -> fp8 e4m3fnuz, per-token scale=amax/240
 
@@ -239,19 +245,33 @@ def sweep(tokens, model_dim=4096, inter_dim=512, E=256, topk=6, iters=50,
     print(f"e2e sweep  dim=({model_dim},{inter_dim}) E={E} topk={topk}  "
           f"[shared bf16 input; a8w4 time INCLUDES HIP fp8 quant]")
     print(f"{'='*118}")
-    hdr = (f"{'token':>7} {'tile':>9} | {'a8w4_e2e':>9} {'a16_e2e':>8} {'tri_e2e':>8} | "
-           f"{'vs_a16':>6} {'vs_tri':>6} | {'a8_cos':>7} {'a16_cos':>7} {'tri_cos':>7}")
+    hdr = (f"{'token':>7} {'a8_tm':>6} {'a16_tile':>9} | {'a8w4_e2e':>9} {'a16_e2e':>8} "
+           f"{'tri_e2e':>8} | {'vs_a16':>6} {'vs_tri':>6} | "
+           f"{'a8_cos':>7} {'a16_cos':>7} {'tri_cos':>7}")
     print(hdr)
     print("-" * 118)
 
     rows = []
     for token in tokens:
         tile_m, tile_k = T._adaptive_tile_a16w4(token, topk, E)
+        # a8w4 must NOT reuse a16w4's adaptive tile_m: it needs ~500 VGPRs at
+        # tile_m>=64, so occupancy drops to 1 wave/SIMD (the backend even warns
+        # "failed to meet occupancy target") and the SIMD idles 35-60% on memory.
+        # tile_m=32 measured optimal at every token from 1 to 32768; matches the
+        # fused_moe dispatch. Needs its own moe_sorting since block_m differs.
+        tile_m_a8 = 32
         d = T._gen(token, model_dim, inter_dim, E, topk)
         inp = d["inp"]
         sorted_ids, sw, seid, nvi, _ = moe_sorting(
             d["topk_ids"], d["topk_weights"], E, model_dim, torch.bfloat16, tile_m
         )
+        if tile_m_a8 == tile_m:
+            s8_ids, s8_w, s8_eid, s8_nvi = sorted_ids, sw, seid, nvi
+        else:
+            s8_ids, s8_w, s8_eid, s8_nvi, _ = moe_sorting(
+                d["topk_ids"], d["topk_weights"], E, model_dim, torch.bfloat16,
+                tile_m_a8
+            )
 
         # ---- a8w4 setup (weights pre-folded; activation quant is INSIDE the timed chain) ----
         w1f8, w1s8 = _prep_a8w4(d["w1_qt"], d["w1_scale"], E, inter_dim * 2, model_dim, model_dim // 32)
@@ -259,15 +279,15 @@ def sweep(tokens, model_dim=4096, inter_dim=512, E=256, topk=6, iters=50,
 
         def a8_e2e():
             a1_fp8, a1_scale = _hipq_tokens(inp)                    # existing HIP quant (bf16->fp8)
-            s1 = flydsl_moe_stage1(a1_fp8, w1f8, sorted_ids, seid, nvi, topk=topk,
-                                   tile_m=tile_m, tile_n=128, tile_k=128, a_dtype="fp8",
+            s1 = flydsl_moe_stage1(a1_fp8, w1f8, s8_ids, s8_eid, s8_nvi, topk=topk,
+                                   tile_m=tile_m_a8, tile_n=128, tile_k=128, a_dtype="fp8",
                                    b_dtype="mxfp4", out_dtype="bf16", act="silu",
                                    w1_scale=w1s8, a1_scale=a1_scale)
             a2_fp8, a2_scale = _hipq_slots(s1)                      # existing HIP requant (bf16->fp8)
-            return flydsl_moe_stage2(a2_fp8, w2f8, sorted_ids, seid, nvi, topk=topk,
-                                     tile_m=tile_m, tile_n=256, tile_k=128, a_dtype="fp8",
+            return flydsl_moe_stage2(a2_fp8, w2f8, s8_ids, s8_eid, s8_nvi, topk=topk,
+                                     tile_m=tile_m_a8, tile_n=128, tile_k=128, a_dtype="fp8",
                                      b_dtype="mxfp4", out_dtype="bf16", w2_scale=w2s8,
-                                     a2_scale=a2_scale, sorted_weights=sw)
+                                     a2_scale=a2_scale, sorted_weights=s8_w)
 
         # ---- a16w4 setup (bf16 activation, no quant) ----
         w1w4 = T._prep_weight_for_kernel(d["w1_qt"], inter_dim * 2, model_dim)
@@ -353,7 +373,8 @@ def sweep(tokens, model_dim=4096, inter_dim=512, E=256, topk=6, iters=50,
 
         vs_a16 = t_a16 / t_a8
         vs_tri = (t_tri / t_a8) if t_tri else None
-        print(f"{token:>7} {f'{tile_m}x{tile_k}':>9} | {_fmt(t_a8)} {_fmt(t_a16)} {_fmt(t_tri)} | "
+        print(f"{token:>7} {tile_m_a8:>6} {f'{tile_m}x{tile_k}':>9} | "
+              f"{_fmt(t_a8)} {_fmt(t_a16)} {_fmt(t_tri)} | "
               f"{vs_a16:5.2f}x {(f'{vs_tri:4.2f}x' if vs_tri else '  n/a'):>6} | "
               f"{(f'{a8_cos:.4f}' if a8_cos is not None else '   n/a'):>7} "
               f"{(f'{a16_cos:.4f}' if a16_cos is not None else '   n/a'):>7} "

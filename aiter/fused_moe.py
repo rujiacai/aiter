@@ -2176,23 +2176,22 @@ def get_2stage_cfgs(
         # a8w4 Phase-1 (FlyDSL CDNA3): fp8 activation x 4bit-stored mxfp4 weight;
         # unpack e2m1->fp8 + in-kernel per-pair ratio-fold. 4-bit weight HBM (half
         # of Phase-0 mxfp8, = a16w4), native fp8 MFMA. AITER_FLYDSL_A8W4_W4=1.
-        # Big adaptive tile_m amortizes the mxfp4-unpack VALU over more M rows
-        # (same heuristic as a16w4; fixed small tile_m is ~2x slower). Weights/
-        # scales prepared by moe_kernels.prep_a8w4_w4 (= a16w4 4-bit layout).
+        # Weights/scales prepared by moe_kernels.prep_a8w4_w4 (= a16w4 4-bit layout).
+        # tile_m=32 measured optimal at EVERY token from 1 to 32768 (MI308X,
+        # model_dim=7168/inter_dim=384). Do NOT reuse a16w4's tokens-per-expert
+        # adaptive tile_m here: a8w4 needs ~500 VGPRs at tile_m>=64, which drops
+        # occupancy to 1 wave/SIMD and leaves the SIMD idle 35-60% waiting on
+        # memory -- that costs far more than the unpack amortization it buys
+        # (tile_m=128 was 1.75x slower at 16k). tile_k stays 128: it divides every
+        # 128-aligned shape (tile_k=256 would drop the K tail on e.g. inter_dim=384)
+        # and measured 2.4x slower than 128 even where it is legal.
         _out_str = "bf16"
-        _tpe = max(1, (token * topk + expert - 1) // expert)
-        _tile_m = max(32, min(1 << max(0, (_tpe - 1).bit_length()), 128))
-        # tile_k=256 only when it divides BOTH K dims (stage1 K=model_dim,
-        # stage2 K=inter_dim); else 128. Otherwise the K-loop drops the tail
-        # (e.g. inter_dim=384 with tile_k=256 -> only 256/384 computed -> outputs
-        # scaled by 0.67). 128 divides all 128-aligned shapes.
-        _tile_k = 256 if (_tile_m <= 32 and model_dim % 256 == 0
-                          and inter_dim % 256 == 0) else 128
+        _tile_m = 32
+        _tile_k = 128
         from aiter.ops.flydsl.moe_kernels import flydsl_kernel_name
 
         kn1 = flydsl_kernel_name(1, "fp8", "mxfp4", _out_str, _tile_m, 128, _tile_k)
-        # stage2 (down-proj, N=model_dim wide) prefers tile_n=256 when it tiles.
-        _s2_tile_n = 256 if model_dim % 256 == 0 else 128
+        _s2_tile_n = 128
         kn2 = flydsl_kernel_name(
             2, "fp8", "mxfp4", _out_str, _tile_m, _s2_tile_n, _tile_k, "atomic"
         )
