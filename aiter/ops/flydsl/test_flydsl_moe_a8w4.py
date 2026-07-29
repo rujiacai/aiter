@@ -25,20 +25,31 @@ from aiter.ops.flydsl.moe_kernels import (  # noqa: E402
     flydsl_moe_stage1,
     flydsl_moe_stage2,
     prep_a8w4_w4,
+    prep_a8w4_w4_aligned,
 )
 
 FP8 = torch.float8_e4m3fnuz
 torch.set_default_device("cuda")
 
+# The fold and aligned kernels read *different* weight layouts and neither validates
+# the other's, so a host/kernel mismatch is silently wrong output rather than an
+# error -- derive the host prep from the same env var the kernel dispatches on.
+A8W4_ALIGNED = os.environ.get("AITER_A8W4_ALIGNED", "0") == "1"
+
 
 def _prep_a8w4(w_qt, w_scale, E, N, K, G=None):
-    """mxfp4 weight -> PACKED 4-bit e2m1 (0.5B) + raw per-32 E8M0 bf16 scale (Phase-1 fold).
+    """mxfp4 weight -> PACKED 4-bit e2m1 (0.5B) + raw per-32 E8M0 bf16 scale.
 
     Thin wrapper over ``moe_kernels.prep_a8w4_w4`` (E and G are inferred internally);
     keeps the ``(E, N, K, G)`` call sites below unchanged. The kernel unpacks e2m1->fp8
     and does the per-pair ratio-fold in-kernel (paired with b_dtype="mxfp4").
+
+    Under ``AITER_A8W4_ALIGNED=1`` the weight instead goes out in the
+    shuffle_weight_NK(16,32) layout, where one K32 MFMA operand covers exactly one
+    per-32 scale block and the kernel skips the in-kernel fold.
     """
-    return prep_a8w4_w4(w_qt, w_scale, N, K)
+    prep = prep_a8w4_w4_aligned if A8W4_ALIGNED else prep_a8w4_w4
+    return prep(w_qt, w_scale, N, K)
 _HIPQ = get_hip_quant(QuantType.per_Token)  # bf16 -> fp8 e4m3fnuz, per-token scale=amax/240
 
 
@@ -237,6 +248,7 @@ def sweep(tokens, model_dim=4096, inter_dim=512, E=256, topk=6, iters=50,
 
     print(f"\n{'='*118}")
     print(f"e2e sweep  dim=({model_dim},{inter_dim}) E={E} topk={topk}  "
+          f"a8w4={'aligned' if A8W4_ALIGNED else 'fold'}  "
           f"[shared bf16 input; a8w4 time INCLUDES HIP fp8 quant]")
     print(f"{'='*118}")
     hdr = (f"{'token':>7} {'tile':>9} | {'a8w4_e2e':>9} {'a16_e2e':>8} {'tri_e2e':>8} | "
