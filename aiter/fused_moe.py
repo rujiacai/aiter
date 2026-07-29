@@ -1356,6 +1356,23 @@ def _flydsl_stage2_wrapper(
             a2_scale=a2_scale,
             split_reduce=parsed.get("split_reduce", False),
         )
+    if parsed.get("pr_prefill_1x4", False):
+        from aiter.ops.flydsl.moe_stage2_pr1x4 import flydsl_moe_stage2_pr1x4
+
+        return flydsl_moe_stage2_pr1x4(
+            inter_states=inter_states,
+            w2=w2,
+            sorted_token_ids=sorted_token_ids,
+            sorted_expert_ids=sorted_expert_ids,
+            num_valid_ids=num_valid_ids,
+            out=out,
+            topk=topk,
+            block_m=parsed["tile_m"],
+            tile_n=parsed["tile_n"],
+            w2_scale=w2_scale,
+            a2_scale=a2_scale,
+            sorted_weights=sorted_weights,
+        )
     return aiter.ops.flydsl.flydsl_moe_stage2(
         inter_states=inter_states,
         w2=w2,
@@ -1734,8 +1751,10 @@ def get_2stage_cfgs(
             )
             _p2 = aiter.ops.flydsl.moe_kernels.get_flydsl_kernel_params(kernelName2)
             if _p2:
-                _s2_reduce = _p2.get("mode") == "reduce" or bool(
-                    _p2.get("split_reduce", False)
+                _s2_reduce = (
+                    _p2.get("mode") == "reduce"
+                    or bool(_p2.get("split_reduce", False))
+                    or bool(_p2.get("pr_prefill_1x4", False))
                 )
         else:
             stage2_func = functools.partial(

@@ -333,6 +333,10 @@ def _parse_flydsl_kernel_name(name: str) -> Optional[Dict]:
             params["gate_only"] = True
         elif stage == 1 and token == "fq":
             params["fuse_fp4_quant"] = True
+        elif stage == 2 and token == "pr1x4":
+            # PR3987 down_prefill_1x4: stores into a padded per-sorted-slot buffer
+            # and scatters it back, instead of atomic-accumulating into the output.
+            params["pr_prefill_1x4"] = True
         elif stage == 2 and token == "persist":
             params["persist"] = True
         elif stage == 2 and token.startswith("pn") and token[2:].isdigit():

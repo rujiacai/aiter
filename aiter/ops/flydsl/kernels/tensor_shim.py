@@ -11,6 +11,22 @@ from flydsl.expr.typing import T
 from flydsl.expr import buffer_ops, range_constexpr, vector
 
 
+def _run_compiled(exe, *args):
+    """First call: ``flyc.compile(exe, *args)`` compiles **and** executes the kernel.
+    Subsequent calls: fast dispatch via the cached ``CompiledFunction``.
+    """
+    import flydsl.compiler as flyc
+
+    if not hasattr(flyc, "compile"):
+        exe(*args)
+        return
+    cf = getattr(exe, "_cf", None)
+    if cf is None:
+        exe._cf = flyc.compile(exe, *args)
+    else:
+        cf(*args)
+
+
 def _to_raw(v):
     """Convert ArithValue / Numeric (Int32, Boolean, …) to raw ir.Value."""
     if isinstance(v, ir.Value):
