@@ -366,6 +366,12 @@ _SK_MODE_TO_TAG = {
     "lockstep": "lockstep",
     "lockstep_mouter": "mouter",
     "xcd_nsplit": "nsplit",
+    # XCD-partition modes (probe-validated wg=xcd+NXCD*rank): split M or N
+    # evenly across XCDs; inner = which of (m,n) varies fastest within the XCD.
+    "msplit_minner": "msmi",
+    "msplit_ninner": "msni",
+    "nsplit_minner": "nsmi",
+    "nsplit_ninner": "nsni",
 }
 _SK_TAG_TO_MODE = {v: k for k, v in _SK_MODE_TO_TAG.items()}
 

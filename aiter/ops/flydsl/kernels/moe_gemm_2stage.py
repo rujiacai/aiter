@@ -521,11 +521,13 @@ def compile_moe_gemm1(
                 f"NUM_XCD ({MOE_NUM_XCD})"
             )
         if str(streamk_mode) not in (
-            "lockstep", "lockstep_mouter", "xcd_nsplit", "mfocus", "flat", "affine"
+            "lockstep", "lockstep_mouter", "xcd_nsplit", "mfocus", "flat", "affine",
+            "msplit_minner", "msplit_ninner", "nsplit_minner", "nsplit_ninner",
         ):
             raise ValueError(
                 "streamk_mode must be lockstep|lockstep_mouter|xcd_nsplit|mfocus|"
-                f"flat|affine, got {streamk_mode!r}"
+                "flat|affine|msplit_minner|msplit_ninner|nsplit_minner|nsplit_ninner"
+                f", got {streamk_mode!r}"
             )
 
     gpu_arch = get_hip_arch()
@@ -931,6 +933,14 @@ def compile_moe_gemm1(
             _sk_mfocus = bool(streamk) and _sk_mode == "mfocus"
             _sk_evensplit = bool(streamk) and _sk_mode in ("flat", "affine")
             _sk_affine = bool(streamk) and _sk_mode == "affine"
+            # XCD-partition modes: split M or N evenly across XCDs (probe-validated
+            # wg=xcd+NXCD*rank). (_sk_xs_msplit, _sk_xs_minner) select the variant.
+            _SK_XSPLIT_MODES = {
+                "msplit_minner": (True, True), "msplit_ninner": (True, False),
+                "nsplit_minner": (False, True), "nsplit_ninner": (False, False),
+            }
+            _sk_xsplit = bool(streamk) and _sk_mode in _SK_XSPLIT_MODES
+            _sk_xs_msplit, _sk_xs_minner = _SK_XSPLIT_MODES.get(_sk_mode, (True, True))
             if _sk_lockstep_any:
                 _sk_NXCD = int(MOE_NUM_XCD)
                 _sk_STRIDE = int(streamk_num_wg) // _sk_NXCD
@@ -1094,6 +1104,51 @@ def compile_moe_gemm1(
                 _sk_nrounds_idx = arith.index_cast(T.index, _sk_nrounds_i32)
                 _for_sk_u = scf.ForOp(
                     arith.constant(0, index=True), _sk_nrounds_idx,
+                    arith.constant(1, index=True),
+                )
+                _for_ip_sk_u = ir.InsertionPoint(_for_sk_u.body)
+                _for_ip_sk_u.__enter__()
+                _sk_k_idx = _for_sk_u.induction_variable
+                tx = _persist_anti_licm_tx(tx, _sk_k_idx)
+
+            if _sk_xsplit:
+                # XCD-partition dispatch (probe-validated): xcd=wg%NXCD,
+                # rank=wg//NXCD, W=num_wg//NXCD WGs per XCD. Split M (m-blocks) or N
+                # (n-tiles) evenly across XCDs; each WG grid-strides j=rank,rank+W,...
+                # over its XCD's tpx tasks (decode -> (bx,by) in the override below).
+                _sk_NXCD = int(MOE_NUM_XCD)
+                _sk_W = int(streamk_num_wg) // _sk_NXCD
+                _sk_NTILES = int(inter_dim) // int(tile_n)
+                _sk_c1_i32 = arith.constant(1, type=T.i32)
+                _sk_nxcd_c = arith.constant(_sk_NXCD, type=T.i32)
+                _sk_w_c = arith.constant(_sk_W, type=T.i32)
+                _sk_ntiles_c = arith.constant(_sk_NTILES, type=T.i32)
+                _sk_wg_i32 = arith.index_cast(T.i32, gpu.block_id("x"))
+                _sk_xcd_i32 = _sk_wg_i32 % _sk_nxcd_c
+                _sk_rank_i32 = _sk_wg_i32 // _sk_nxcd_c
+                _sk_nv_rsrc = buffer_ops.create_buffer_resource(
+                    arg_max_token_ids, max_size=False, num_records_bytes=fx.Index(4)
+                )
+                _sk_numvalid_i32 = buffer_ops.buffer_load(
+                    _sk_nv_rsrc, arith.constant(0, type=T.i32), vec_width=1, dtype=T.i32
+                )
+                _sk_tm_c = arith.constant(int(tile_m), type=T.i32)
+                _sk_vmb_i32 = (_sk_numvalid_i32 + _sk_tm_c - _sk_c1_i32) // _sk_tm_c
+                if _sk_xs_msplit:
+                    # S = ceil(vmb/NXCD) m-blocks per XCD ; other axis = n-tiles
+                    _sk_S_i32 = (_sk_vmb_i32 + _sk_nxcd_c - _sk_c1_i32) // _sk_nxcd_c
+                    _sk_other_i32 = _sk_ntiles_c
+                else:
+                    # S = ceil(NTILES/NXCD) n-tiles per XCD ; other axis = m-blocks
+                    _sk_S_i32 = arith.constant(
+                        (_sk_NTILES + _sk_NXCD - 1) // _sk_NXCD, type=T.i32
+                    )
+                    _sk_other_i32 = _sk_vmb_i32
+                _sk_tpx_i32 = _sk_S_i32 * _sk_other_i32
+                _sk_kmax_i32 = (_sk_tpx_i32 + _sk_w_c - _sk_c1_i32) // _sk_w_c
+                _sk_kmax_idx = arith.index_cast(T.index, _sk_kmax_i32)
+                _for_sk_u = scf.ForOp(
+                    arith.constant(0, index=True), _sk_kmax_idx,
                     arith.constant(1, index=True),
                 )
                 _for_ip_sk_u = ir.InsertionPoint(_for_sk_u.body)
@@ -1278,6 +1333,35 @@ def compile_moe_gemm1(
                 _sk_in_range = arith.cmpi(
                     arith.CmpIPredicate.ult, _sk_u_i32, _sk_x1_i32
                 )
+            if _sk_xsplit:
+                # j = rank + k*W ; decode to (bx=m-block, by=n-tile) per the split.
+                _sk_k_i32 = arith.index_cast(T.i32, _sk_k_idx)
+                _sk_j_i32 = _sk_rank_i32 + _sk_k_i32 * _sk_w_c
+                if _sk_xs_msplit:
+                    if _sk_xs_minner:      # m fastest
+                        _sk_ml_i32 = _sk_j_i32 % _sk_S_i32
+                        _sk_nn_i32 = _sk_j_i32 // _sk_S_i32
+                    else:                  # n fastest
+                        _sk_nn_i32 = _sk_j_i32 % _sk_ntiles_c
+                        _sk_ml_i32 = _sk_j_i32 // _sk_ntiles_c
+                    _sk_bx_i32 = _sk_xcd_i32 * _sk_S_i32 + _sk_ml_i32
+                    _sk_by_i32 = _sk_nn_i32
+                else:
+                    if _sk_xs_minner:      # m fastest
+                        _sk_mm_i32 = _sk_j_i32 % _sk_other_i32
+                        _sk_nl_i32 = _sk_j_i32 // _sk_other_i32
+                    else:                  # n fastest
+                        _sk_nl_i32 = _sk_j_i32 % _sk_S_i32
+                        _sk_mm_i32 = _sk_j_i32 // _sk_S_i32
+                    _sk_bx_i32 = _sk_mm_i32
+                    _sk_by_i32 = _sk_xcd_i32 * _sk_S_i32 + _sk_nl_i32
+                by = arith.index_cast(T.index, _sk_by_i32)
+                bx = arith.index_cast(T.index, _sk_bx_i32)
+                # in-range: this round's j is a real task (j<tpx) AND by<n_tiles.
+                # bx>=vmb (last XCD partial) is masked downstream by bx_m<max_token_id.
+                _sk_jlt = arith.cmpi(arith.CmpIPredicate.ult, _sk_j_i32, _sk_tpx_i32)
+                _sk_bylt = arith.cmpi(arith.CmpIPredicate.ult, _sk_by_i32, _sk_ntiles_c)
+                _sk_in_range = arith.andi(_sk_jlt, _sk_bylt)
             if streamk:
                 bx_m = bx * fx.Index(tile_m)
                 bx_m_i32 = arith.index_cast(T.i32, bx_m)
@@ -2915,7 +2999,7 @@ def compile_moe_gemm1(
                 _for_ip_sk_i.__exit__(None, None, None)   # close inner (n-group)
                 scf.YieldOp([])
                 _for_ip_sk_s.__exit__(None, None, None)   # close outer (m-block)
-            if _sk_evensplit or _sk_mfocus:
+            if _sk_evensplit or _sk_mfocus or _sk_xsplit:
                 gpu.barrier()
                 scf.YieldOp([])
                 _for_ip_sk_u.__exit__(None, None, None)
@@ -3283,11 +3367,13 @@ def compile_moe_gemm2(
         # chunks per XCD -> tighter L2 working set).  flat/affine need the
         # wg_unit_start schedule (carried in arg_blk_valid_start).
         if str(streamk_mode) not in (
-            "lockstep", "lockstep_mouter", "xcd_nsplit", "mfocus", "flat", "affine"
+            "lockstep", "lockstep_mouter", "xcd_nsplit", "mfocus", "flat", "affine",
+            "msplit_minner", "msplit_ninner", "nsplit_minner", "nsplit_ninner",
         ):
             raise ValueError(
                 "streamk_mode must be lockstep|lockstep_mouter|xcd_nsplit|mfocus|"
-                f"flat|affine, got {streamk_mode!r}"
+                "flat|affine|msplit_minner|msplit_ninner|nsplit_minner|nsplit_ninner"
+                f", got {streamk_mode!r}"
             )
     _force_16x16x32 = mfma_variant in ("16x16x32", "mfma16k32")
     _use_k128_mfma_fp8 = (
@@ -3554,6 +3640,13 @@ def compile_moe_gemm2(
             _sk_mfocus = bool(streamk) and _sk_mode == "mfocus"
             _sk_evensplit = bool(streamk) and _sk_mode in ("flat", "affine")
             _sk_affine = bool(streamk) and _sk_mode == "affine"
+            # XCD-partition modes (split M or N across XCDs; probe-validated).
+            _SK_XSPLIT_MODES = {
+                "msplit_minner": (True, True), "msplit_ninner": (True, False),
+                "nsplit_minner": (False, True), "nsplit_ninner": (False, False),
+            }
+            _sk_xsplit = bool(streamk) and _sk_mode in _SK_XSPLIT_MODES
+            _sk_xs_msplit, _sk_xs_minner = _SK_XSPLIT_MODES.get(_sk_mode, (True, True))
             if _sk_lockstep_any:
                 # Lockstep dispatch (no schedule kernel needed). HW sends WG w to XCD
                 # (w % NXCD); local = w // NXCD in [0, STRIDE). XCD x owns tile_n
@@ -3778,6 +3871,48 @@ def compile_moe_gemm2(
                 # Anti-LICM: keep tid-derived LDS addresses loop-variant.
                 tx = _persist_anti_licm_tx(tx, _sk_k_idx)
 
+            if _sk_xsplit:
+                # XCD-partition dispatch (probe-validated), stage2: N axis = model_dim.
+                # xcd=wg%NXCD, rank=wg//NXCD, W=num_wg//NXCD; split M (m-blocks) or N
+                # (n-tiles) across XCDs; grid-stride j=rank,rank+W,... over tpx tasks.
+                _sk_NXCD = int(MOE_NUM_XCD)
+                _sk_W = int(streamk_num_wg) // _sk_NXCD
+                _sk_NTILES = int(model_dim) // int(tile_n)
+                _sk_c1_i32 = arith.constant(1, type=T.i32)
+                _sk_nxcd_c = arith.constant(_sk_NXCD, type=T.i32)
+                _sk_w_c = arith.constant(_sk_W, type=T.i32)
+                _sk_ntiles_c = arith.constant(_sk_NTILES, type=T.i32)
+                _sk_wg_i32 = arith.index_cast(T.i32, gpu.block_id("x"))
+                _sk_xcd_i32 = _sk_wg_i32 % _sk_nxcd_c
+                _sk_rank_i32 = _sk_wg_i32 // _sk_nxcd_c
+                _sk_nv_rsrc = buffer_ops.create_buffer_resource(
+                    arg_num_valid_ids, max_size=False, num_records_bytes=fx.Index(4)
+                )
+                _sk_numvalid_i32 = buffer_ops.buffer_load(
+                    _sk_nv_rsrc, arith.constant(0, type=T.i32), vec_width=1, dtype=T.i32
+                )
+                _sk_tm_c = arith.constant(int(tile_m), type=T.i32)
+                _sk_vmb_i32 = (_sk_numvalid_i32 + _sk_tm_c - _sk_c1_i32) // _sk_tm_c
+                if _sk_xs_msplit:
+                    _sk_S_i32 = (_sk_vmb_i32 + _sk_nxcd_c - _sk_c1_i32) // _sk_nxcd_c
+                    _sk_other_i32 = _sk_ntiles_c
+                else:
+                    _sk_S_i32 = arith.constant(
+                        (_sk_NTILES + _sk_NXCD - 1) // _sk_NXCD, type=T.i32
+                    )
+                    _sk_other_i32 = _sk_vmb_i32
+                _sk_tpx_i32 = _sk_S_i32 * _sk_other_i32
+                _sk_kmax_i32 = (_sk_tpx_i32 + _sk_w_c - _sk_c1_i32) // _sk_w_c
+                _sk_kmax_idx = arith.index_cast(T.index, _sk_kmax_i32)
+                _for_sk_u = scf.ForOp(
+                    arith.constant(0, index=True), _sk_kmax_idx,
+                    arith.constant(1, index=True),
+                )
+                _for_ip_sk_u = ir.InsertionPoint(_for_sk_u.body)
+                _for_ip_sk_u.__enter__()
+                _sk_k_idx = _for_sk_u.induction_variable
+                tx = _persist_anti_licm_tx(tx, _sk_k_idx)
+
             _persist2 = persist_m > 1
             if _persist2:
                 _c_pm2 = arith.constant(persist_m, index=True)
@@ -3931,6 +4066,36 @@ def compile_moe_gemm2(
                 )
                 bx_in_range = _sk_u_ok
                 by_in_range = _sk_u_ok
+
+            if _sk_xsplit:
+                # j = rank + k*W ; decode -> (bx=m-block, by=n-tile) per the split.
+                _sk_k_i32 = arith.index_cast(T.i32, _sk_k_idx)
+                _sk_j_i32 = _sk_rank_i32 + _sk_k_i32 * _sk_w_c
+                if _sk_xs_msplit:
+                    if _sk_xs_minner:      # m fastest
+                        _sk_ml_i32 = _sk_j_i32 % _sk_S_i32
+                        _sk_nn_i32 = _sk_j_i32 // _sk_S_i32
+                    else:                  # n fastest
+                        _sk_nn_i32 = _sk_j_i32 % _sk_ntiles_c
+                        _sk_ml_i32 = _sk_j_i32 // _sk_ntiles_c
+                    _sk_bx_i32 = _sk_xcd_i32 * _sk_S_i32 + _sk_ml_i32
+                    _sk_by_i32 = _sk_nn_i32
+                else:
+                    if _sk_xs_minner:      # m fastest
+                        _sk_mm_i32 = _sk_j_i32 % _sk_other_i32
+                        _sk_nl_i32 = _sk_j_i32 // _sk_other_i32
+                    else:                  # n fastest
+                        _sk_nl_i32 = _sk_j_i32 % _sk_S_i32
+                        _sk_mm_i32 = _sk_j_i32 // _sk_S_i32
+                    _sk_bx_i32 = _sk_mm_i32
+                    _sk_by_i32 = _sk_xcd_i32 * _sk_S_i32 + _sk_nl_i32
+                by = arith.index_cast(T.index, _sk_by_i32)
+                bx = arith.index_cast(T.index, _sk_bx_i32)
+                _sk_jlt = arith.cmpi(arith.CmpIPredicate.ult, _sk_j_i32, _sk_tpx_i32)
+                _sk_bylt = arith.cmpi(arith.CmpIPredicate.ult, _sk_by_i32, _sk_ntiles_c)
+                _sk_xs_ok = arith.andi(_sk_jlt, _sk_bylt)
+                bx_in_range = _sk_xs_ok
+                by_in_range = _sk_xs_ok
 
             _xcd_debug_print(2, bx, by)
 
@@ -5502,8 +5667,9 @@ def compile_moe_gemm2(
                 scf.YieldOp([])
                 _for_ip_sk_s.__exit__(None, None, None)   # close outer (m-block)
 
-            if _sk_evensplit or _sk_mfocus:
-                # Close the single unit loop (even-split u-range, or mfocus rounds).
+            if _sk_evensplit or _sk_mfocus or _sk_xsplit:
+                # Close the single unit loop (even-split u-range, mfocus rounds, or
+                # xcd-split grid-stride rounds).
                 gpu.barrier()
                 scf.YieldOp([])
                 _for_ip_sk_u.__exit__(None, None, None)
