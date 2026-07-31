@@ -1336,6 +1336,45 @@ def mla_reduce_v1(
 ) -> None: ...
 
 
+@compile_ops("module_mla_decode_v4_bf16")
+def mla_decode_v4_bf16(
+    q: torch.Tensor,
+    unified_kv: torch.Tensor,
+    kv_indices: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    attn_sink: torch.Tensor,
+    softmax_scale: float,
+    kv_splits: int = 0,
+) -> torch.Tensor: ...
+
+
+def mla_decode_v4_bf16_supported(
+    q_dtype: torch.dtype,
+    kv_dtype: torch.dtype,
+    num_heads: int,
+    head_dim: int,
+) -> bool:
+    """Whether `mla_decode_v4_bf16` can serve this shape.
+
+    The kernel is tuned around gfx942: it uses v_mfma_f32_16x16x16bf16_1k, which
+    gfx950 replaces with a 16x16x32 form, and it budgets 64 KiB of LDS, which is
+    a quarter of what gfx950 offers. Both are correctness-neutral but leave it
+    far off the pace there, so the gate is deliberately arch-exact.
+
+    Heads only have to be a multiple of the MFMA tile; the launcher picks how
+    many head tiles share a workgroup from `num_heads`, so a TP=8 rank holding
+    16 of 128 heads is as valid as an undivided 128.
+    """
+    return (
+        get_gfx() == "gfx942"
+        and q_dtype == dtypes.bf16
+        and kv_dtype == dtypes.bf16
+        and head_dim == 512
+        and num_heads > 0
+        and num_heads % 16 == 0
+    )
+
+
 @triton.jit(do_not_specialize=["tile_reduce_cnt"])
 def decode_update_mla_metadata_v1_kernel(
     seqlens_qo_indptr,

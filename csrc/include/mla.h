@@ -67,6 +67,20 @@ get_mla_metadata_v1_no_redundant(const torch::Tensor& seqlens_qo_indptr, // [bat
                                  const bool is_causal,
                                  const int32_t kv_granularity);
 
+// bf16 MLA paged decode over a unified KV pool (page_size=1, K and V share the
+// 512-wide row) indexed by per-token CSR slot lists. Query token t attends over
+// kv_indices[kv_indptr[t] : kv_indptr[t+1]] and nothing else, so any causality
+// the caller wants -- MTP draft masking, sliding windows, per-token compressed
+// slot selection -- is expressed by which slots it puts in each row.
+// gfx942 only. kv_splits=0 picks the split count from the CU count.
+torch::Tensor mla_decode_v4_bf16(torch::Tensor q,           // [T, H, 512] bf16
+                                 torch::Tensor unified_kv,  // [num_slots, 512] bf16
+                                 torch::Tensor kv_indices,  // [nnz] int32
+                                 torch::Tensor kv_indptr,   // [T+1] int32
+                                 torch::Tensor attn_sink,   // [H] fp32
+                                 double softmax_scale,
+                                 int64_t kv_splits);
+
 void mla_reduce_v1(const torch::Tensor& partial_output,
                    const torch::Tensor& partial_lse,
                    const torch::Tensor& reduce_indptr,

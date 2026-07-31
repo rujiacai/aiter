@@ -1465,6 +1465,22 @@
         "verbose": "False",
         "blob_gen_cmd": "''"
     },
+    "module_mla_decode_v4_bf16": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/mla_decode_v4_bf16_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/decode_v4_bf16.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [
+            "'-mllvm --amdgpu-mfma-vgpr-form'",
+            "'-mllvm -enable-post-misched=1'",
+            "'-ffast-math'"
+        ],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
+    },
     "module_mla_reduce": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/mla_reduce_pybind.cu'",

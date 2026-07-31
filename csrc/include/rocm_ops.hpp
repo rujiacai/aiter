@@ -2114,6 +2114,18 @@ namespace py = pybind11;
           py::arg("block_size")        = 1,   \
           py::arg("is_causal")         = true);
 
+#define MLA_DECODE_V4_BF16_PYBIND                       \
+    m.def("mla_decode_v4_bf16",                         \
+          &mla_decode_v4_bf16,                          \
+          "bf16 MLA paged decode over unified_kv (gfx942)", \
+          py::arg("q"),                                 \
+          py::arg("unified_kv"),                        \
+          py::arg("kv_indices"),                        \
+          py::arg("kv_indptr"),                         \
+          py::arg("attn_sink"),                         \
+          py::arg("softmax_scale"),                     \
+          py::arg("kv_splits") = 0);
+
 #define MLA_REDUCE_PYBIND                \
     m.def("mla_reduce_v1",               \
           &mla_reduce_v1,                \
