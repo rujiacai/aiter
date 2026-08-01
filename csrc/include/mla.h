@@ -81,6 +81,28 @@ torch::Tensor mla_decode_v4_bf16(torch::Tensor q,           // [T, H, 512] bf16
                                  double softmax_scale,
                                  int64_t kv_splits);
 
+// bf16 MLA sparse paged prefill over two KV sources: a paged `unified_kv` pool
+// holding the prefix (page_size=1, K and V share the 512-wide row) and a flat
+// `kv` holding this forward's own K. Each is indexed by its own per-token CSR
+// slot list, and query token t attends over the concatenation of
+//   unified_kv[kv_indices_prefix[kv_indptr_prefix[t] : kv_indptr_prefix[t+1]]]
+//   kv        [kv_indices_extend[kv_indptr_extend[t] : kv_indptr_extend[t+1]]]
+// and nothing else, so any causality the caller wants is expressed by which
+// slots it puts in each row. `-1` entries are skipped when check_sentinel.
+//
+// The gfx942 counterpart of pa_sparse_prefill_opus, which is gfx950-only.
+// H must be a positive multiple of 16; D is fixed at 512.
+torch::Tensor mla_prefill_v4_bf16(torch::Tensor q,                  // [N, H, 512] bf16
+                                  torch::Tensor unified_kv,         // [total_pages, 512] bf16
+                                  torch::Tensor kv_indices_prefix,  // [nnz_p] int32
+                                  torch::Tensor kv_indptr_prefix,   // [N+1] int32
+                                  torch::Tensor kv,                 // [total_tokens, 512] bf16
+                                  torch::Tensor kv_indices_extend,  // [nnz_e] int32
+                                  torch::Tensor kv_indptr_extend,   // [N+1] int32
+                                  torch::Tensor attn_sink,          // [H] fp32
+                                  double softmax_scale,
+                                  bool check_sentinel);
+
 void mla_reduce_v1(const torch::Tensor& partial_output,
                    const torch::Tensor& partial_lse,
                    const torch::Tensor& reduce_indptr,

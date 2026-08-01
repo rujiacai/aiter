@@ -1375,6 +1375,43 @@ def mla_decode_v4_bf16_supported(
     )
 
 
+@compile_ops("module_mla_prefill_v4_bf16")
+def mla_prefill_v4_bf16(
+    q: torch.Tensor,
+    unified_kv: torch.Tensor,
+    kv_indices_prefix: torch.Tensor,
+    kv_indptr_prefix: torch.Tensor,
+    kv: torch.Tensor,
+    kv_indices_extend: torch.Tensor,
+    kv_indptr_extend: torch.Tensor,
+    attn_sink: torch.Tensor,
+    softmax_scale: float,
+    check_sentinel: bool = True,
+) -> torch.Tensor: ...
+
+
+def mla_prefill_v4_bf16_supported(
+    q_dtype: torch.dtype,
+    kv_dtype: torch.dtype,
+    num_heads: int,
+    head_dim: int,
+) -> bool:
+    """Whether `mla_prefill_v4_bf16` can serve this shape.
+
+    Same arch gate as the decode kernel, and for the same reasons: the MFMA form
+    and the 64 KiB LDS budget are both gfx942 shapes. This is the counterpart of
+    `pa_sparse_prefill_opus`, which covers gfx950, so the two do not overlap.
+    """
+    return (
+        get_gfx() == "gfx942"
+        and q_dtype == dtypes.bf16
+        and kv_dtype == dtypes.bf16
+        and head_dim == 512
+        and num_heads > 0
+        and num_heads % 16 == 0
+    )
+
+
 @triton.jit(do_not_specialize=["tile_reduce_cnt"])
 def decode_update_mla_metadata_v1_kernel(
     seqlens_qo_indptr,

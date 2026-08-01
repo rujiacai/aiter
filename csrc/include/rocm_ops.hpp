@@ -2126,6 +2126,21 @@ namespace py = pybind11;
           py::arg("softmax_scale"),                     \
           py::arg("kv_splits") = 0);
 
+#define MLA_PREFILL_V4_BF16_PYBIND                                \
+    m.def("mla_prefill_v4_bf16",                                  \
+          &mla_prefill_v4_bf16,                                   \
+          "bf16 MLA sparse paged prefill over unified_kv + kv (gfx942)", \
+          py::arg("q"),                                           \
+          py::arg("unified_kv"),                                  \
+          py::arg("kv_indices_prefix"),                           \
+          py::arg("kv_indptr_prefix"),                            \
+          py::arg("kv"),                                          \
+          py::arg("kv_indices_extend"),                           \
+          py::arg("kv_indptr_extend"),                            \
+          py::arg("attn_sink"),                                   \
+          py::arg("softmax_scale"),                               \
+          py::arg("check_sentinel") = true);
+
 #define MLA_REDUCE_PYBIND                \
     m.def("mla_reduce_v1",               \
           &mla_reduce_v1,                \
