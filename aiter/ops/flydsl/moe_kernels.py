@@ -159,6 +159,48 @@ def _prep_a8w4_scale_aligned(e8m0_scale, N, K):
     return s.view(-1).contiguous()
 
 
+A8W4_STAGE1_WAVES_PER_EU = 4
+"""Register cap for the a8w4 stage1 kernel.
+
+At the (32, 64, 128) tile it fits 102 VGPRs with no spilling, so asking for 4
+waves per SIMD costs nothing and measured 2-4% faster than the default 3 at
+every token count. Keep it in sync with the ``waves_per_eu`` entry in
+:func:`get_flydsl_stage1_kernels_mxfp4_fp8`.
+"""
+
+
+def a8w4_tiles(token: int, topk: int, experts: int, model_dim: int, inter_dim: int):
+    """Tile shape for the a8w4 Phase-1 (fp8 x 4-bit mxfp4) MoE kernels.
+
+    Returns ``(tile_m, stage1_tile_n, stage2_tile_n, tile_k)``. Shared by the
+    ``fused_moe`` dispatch and the standalone sweep so both measure the same
+    thing.
+
+    Measured on MI308X at model_dim=7168 / inter_dim=384 / E=384 / topk=6:
+
+    - ``tile_n``: the kernel is VALU-bound (the e2m1->fp8 unpack plus the
+      post-MFMA per-32 scale FMA are ~7.4 VALU per MFMA), so what matters is
+      staying off the register cliff. A narrower stage1 tile_n=64 gives one
+      N-accumulator per wave and fits in 102 VGPRs with no spilling (5 waves per
+      SIMD) where tile_n=128 needs 168 and spills. stage2 has no gate/up pair to
+      double the accumulators, so it prefers the wider tile_n=256, which halves
+      the workgroup count and the per-workgroup epilogue.
+    - ``tile_m``: 16 while an expert averages fewer than 16 tokens, where a
+      32-row tile is more than half padding, and 32 once the experts fill up,
+      where the extra rows amortize the weight traffic. tile_m=64 loses at
+      every token count: at
+      m_repeat=4 the accumulators no longer fit under the waves_per_eu=3 cap and
+      the kernel spills.
+    - ``tile_k``: 128. It divides every 128-aligned shape (256 would drop the K
+      tail on e.g. inter_dim=384) and measured slower where 256 is legal.
+    """
+    tokens_per_expert = (token * topk + experts - 1) // max(experts, 1)
+    tile_m = 16 if tokens_per_expert < 16 else 32
+    s1_tile_n = 64 if (inter_dim % 64) == 0 else 128
+    s2_tile_n = 256 if (model_dim % 256) == 0 else 128
+    return tile_m, s1_tile_n, s2_tile_n, 128
+
+
 _SUFFIX_RE = re.compile(
     r"(?:_kw(?P<kw>\d+))?(?P<fp4>_fp4)?(?P<fp8>_fp8)?(?:_sbm(?P<sbm>\d+))?$"
 )
@@ -631,6 +673,7 @@ def get_flydsl_stage1_kernels_mxfp4_fp8(out_dtype: str) -> Dict[str, Dict]:
                         "MPerBlock": tm,
                         "in_dtype": "mxfp4_fp8",
                         "k_batch": kb,
+                        "waves_per_eu": A8W4_STAGE1_WAVES_PER_EU,
                     }
     return kernels
 
