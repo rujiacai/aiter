@@ -201,6 +201,28 @@ def a8w4_tiles(token: int, topk: int, experts: int, model_dim: int, inter_dim: i
     return tile_m, s1_tile_n, s2_tile_n, 128
 
 
+def mxfp4_stage2_mode() -> str:
+    """Topk reduction strategy for the FlyDSL mxfp4 stage2 epilogue.
+
+    Shared by the ``fused_moe`` dispatch and the standalone sweep, for the same
+    reason ``a8w4_tiles`` is: the sweep is supposed to measure what production
+    runs, and it silently did not while this lived only in the dispatch.
+
+    "atomic" accumulates the topk partials straight into the bf16 output with
+    global atomics. The summation order is then whatever the hardware
+    schedules, so the bf16 rounding varies between otherwise identical calls,
+    and the read-modify-write traffic costs 18-20% of stage2 at large batch.
+    "reduce" writes the partials to a [tokens*topk, model_dim] scratch buffer
+    and sums them in fp32 in a second pass: bit-reproducible, half the stage2
+    error, 1.10-1.12x from token=16384 up, at the cost of that buffer.
+    """
+    return (
+        "atomic"
+        if os.environ.get("AITER_FLYDSL_STAGE2_ATOMIC", "0") == "1"
+        else "reduce"
+    )
+
+
 _SUFFIX_RE = re.compile(
     r"(?:_kw(?P<kw>\d+))?(?P<fp4>_fp4)?(?P<fp8>_fp8)?(?:_sbm(?P<sbm>\d+))?$"
 )
