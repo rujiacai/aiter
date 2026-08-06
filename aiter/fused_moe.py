@@ -1546,21 +1546,17 @@ def get_2stage_cfgs(
         # unpack e2m1->fp8 + in-kernel per-pair ratio-fold. 4-bit weight HBM (half
         # of Phase-0 mxfp8, = a16w4), native fp8 MFMA. AITER_FLYDSL_A8W4_W4=1.
         # Weights/scales prepared by moe_kernels.prep_a8w4_w4 (= a16w4 4-bit layout).
-        # tile_m=32 measured optimal at EVERY token from 1 to 32768 (MI308X,
-        # model_dim=7168/inter_dim=384). Do NOT reuse a16w4's tokens-per-expert
-        # adaptive tile_m here: a8w4 needs ~500 VGPRs at tile_m>=64, which drops
-        # occupancy to 1 wave/SIMD and leaves the SIMD idle 35-60% waiting on
-        # memory -- that costs far more than the unpack amortization it buys
-        # (tile_m=128 was 1.75x slower at 16k). tile_k stays 128: it divides every
-        # 128-aligned shape (tile_k=256 would drop the K tail on e.g. inter_dim=384)
-        # and measured 2.4x slower than 128 even where it is legal.
+        # Do NOT reuse a16w4's tokens-per-expert adaptive tile_m here; see
+        # moe_kernels.a8w4_tiles for the a8w4-specific shape and why.
         _out_str = "bf16"
-        _tile_m = 32
-        _tile_k = 128
-        from aiter.ops.flydsl.moe_kernels import flydsl_kernel_name
+        from aiter.ops.flydsl.moe_kernels import a8w4_tiles, flydsl_kernel_name
 
-        kn1 = flydsl_kernel_name(1, "fp8", "mxfp4", _out_str, _tile_m, 128, _tile_k)
-        _s2_tile_n = 128
+        _tile_m, _s1_tile_n, _s2_tile_n, _tile_k = a8w4_tiles(
+            token, topk, expert, model_dim, inter_dim
+        )
+        kn1 = flydsl_kernel_name(
+            1, "fp8", "mxfp4", _out_str, _tile_m, _s1_tile_n, _tile_k
+        )
         kn2 = flydsl_kernel_name(
             2, "fp8", "mxfp4", _out_str, _tile_m, _s2_tile_n, _tile_k, "atomic"
         )

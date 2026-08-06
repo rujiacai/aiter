@@ -126,6 +126,56 @@ def _mxfp4_fp8_fold_operands(r0, r1, sc, is_B, bitfold, permlut, arith, vector):
     return b0, b1, sc_out
 
 
+# a8w4 ALIGNED tuning knobs. Read once at import so they are plain Python
+# scalars by the time a kernel builder closes over them (FlyDSL folds closure
+# scalars into its disk cache key, so a flag flip can never serve a stale
+# binary).
+#
+# defer_unpack: carry the *packed* 4-bit B operands in the pipelined K-loop's
+#   iter_args and expand e2m1->fp8 inside compute_tile instead of at load time.
+#   The unpacked form is an i64 per K32 operand (2 VGPRs) vs 1 for the packed
+#   dword, and both the current and the prefetched tile are live at once, so
+#   this halves ~64 VGPRs of loop-carried B state -- enough to get the stage1
+#   kernel out of scratch spilling at tile_n=128.
+# fma_depth: how many MFMAs to keep in flight before applying a queued
+#   post-MFMA scale FMA. The a8w4 path runs every K32 MFMA into a zero
+#   accumulator and folds the per-32 E8M0 scale in with an f32 FMA; reading the
+#   MFMA result in the very next instruction stalls for the full MFMA latency
+#   (visible as a wall of s_nop in the ISA). 0 restores the old behavior.
+_A8W4_DEFER_UNPACK = os.environ.get("AITER_A8W4_DEFER_UNPACK", "1") == "1"
+_A8W4_FMA_DEPTH = int(os.environ.get("AITER_A8W4_FMA_DEPTH", "4"))
+
+
+def _make_scale_fma_pipe(apply_fn, depth: int):
+    """FIFO for deferred post-MFMA scale FMAs.
+
+    ``push(acc_list, idx, partial, scale)`` records one pending
+    ``acc_list[idx] = apply_fn(acc_list[idx], partial, scale)`` and retires the
+    oldest entry once more than ``depth`` are outstanding; ``drain()`` flushes
+    the rest. Retirement is FIFO, so per-accumulator ordering (and therefore
+    the f32 accumulation result) is bit-identical to applying each FMA inline.
+    """
+    queue = []
+
+    def _retire():
+        acc_list, idx, partial, scale = queue.pop(0)
+        acc_list[idx] = apply_fn(acc_list[idx], partial, scale)
+
+    def push(acc_list, idx, partial, scale):
+        if depth <= 0:
+            acc_list[idx] = apply_fn(acc_list[idx], partial, scale)
+            return
+        queue.append((acc_list, idx, partial, scale))
+        if len(queue) > depth:
+            _retire()
+
+    def drain():
+        while queue:
+            _retire()
+
+    return push, drain
+
+
 @contextmanager
 def _if_then(if_op):
     """Compat helper for SCF IfOp then-region across old/new Python APIs."""
@@ -432,6 +482,8 @@ def compile_moe_gemm1(
     # (_collect_closure_scalar_vals). Otherwise aligned/fold share a key and the
     # cache silently serves the wrong binary when both run for the same shape.
     _a8w4_aligned = is_mxfp4_fp8 and os.environ.get("AITER_A8W4_ALIGNED", "0") == "1"
+    _a8w4_defer_unpack = _a8w4_aligned and _A8W4_DEFER_UNPACK
+    _a8w4_fma_depth = _A8W4_FMA_DEPTH if (is_mxfp8 or is_mxfp4_fp8) else 0
 
     if True:
 
@@ -1023,8 +1075,15 @@ def compile_moe_gemm1(
                                         n_blk=blk_list[ni], n_intra=intra_list[ni],
                                         lane_div_16=lane_div_16, elem_type=w_elem,
                                     )
-                                    b0 = unpack_b_w4a16_mxfp4_to_fp8_permlut(r0, arith, vector)
-                                    b1 = unpack_b_w4a16_mxfp4_to_fp8_permlut(r1, arith, vector)
+                                    if const_expr(_a8w4_defer_unpack):
+                                        b0, b1 = r0, r1  # expanded in compute_tile
+                                    else:
+                                        b0 = unpack_b_w4a16_mxfp4_to_fp8_permlut(
+                                            r0, arith, vector
+                                        )
+                                        b1 = unpack_b_w4a16_mxfp4_to_fp8_permlut(
+                                            r1, arith, vector
+                                        )
                                     sc = _load_groupwise_scale(
                                         buffer_ops, arith, scale_rsrc=sw_rsrc,
                                         expert_offset=expert_off_idx,
@@ -1454,13 +1513,50 @@ def compile_moe_gemm1(
                                 up_list[p_idx], p_u, p_sc_u
                             )
                     elif const_expr(is_mxfp8_groupwise or is_mxfp4_fp8_groupwise):
-                        # a8w4 Phase0: per K32 -> fp8 MFMA into zero acc, then
-                        # multiply by the per-32 E8M0 scale (f32 FMA) and accumulate.
+                        # a8w4: per K32 -> fp8 MFMA into a zero acc, then multiply by
+                        # the per-32 E8M0 scale (f32 FMA) and accumulate. The scale FMA
+                        # is queued `_a8w4_fma_depth` MFMAs deep so the wave never reads
+                        # an MFMA result it just issued.
+                        push_fma, drain_fma = _make_scale_fma_pipe(
+                            _acc_scaled_f32, _a8w4_fma_depth
+                        )
                         for ku in range_constexpr(k_unroll):
                             b_gate_raw = b_gate_tile_in[ku]
                             b_up_raw = b_up_tile_in[ku]
                             ki64 = arith.index(ku * 64)
                             col_base = col_offset_base_bytes + ki64
+                            # Expand the packed 4-bit B operands once per (ku, ni), not
+                            # once per (ku, ni, mi): m_repeat MFMAs share one operand.
+                            b_ops = []
+                            for ni in range_constexpr(num_acc_n):
+                                bg0, bg1, scg = b_gate_raw[ni]
+                                bu0, bu1, scu = b_up_raw[ni]
+                                if const_expr(_a8w4_defer_unpack):
+                                    bg0 = unpack_b_w4a16_mxfp4_to_fp8_permlut(
+                                        bg0, arith, vector
+                                    )
+                                    bg1 = unpack_b_w4a16_mxfp4_to_fp8_permlut(
+                                        bg1, arith, vector
+                                    )
+                                    bu0 = unpack_b_w4a16_mxfp4_to_fp8_permlut(
+                                        bu0, arith, vector
+                                    )
+                                    bu1 = unpack_b_w4a16_mxfp4_to_fp8_permlut(
+                                        bu1, arith, vector
+                                    )
+                                # dword holds 2 group scales: low=first K32, high=second
+                                b_ops.append(
+                                    (
+                                        bg0,
+                                        bg1,
+                                        bu0,
+                                        bu1,
+                                        extract_bf16_scale(arith, scg, 0),
+                                        extract_bf16_scale(arith, scg, 1),
+                                        extract_bf16_scale(arith, scu, 0),
+                                        extract_bf16_scale(arith, scu, 1),
+                                    )
+                                )
                             for mi in range_constexpr(m_repeat):
                                 mi_val = arith.index(mi * 16)
                                 curr_row_a_lds = row_a_lds + mi_val
@@ -1479,37 +1575,34 @@ def compile_moe_gemm1(
                                     )
                                 for ni in range_constexpr(num_acc_n):
                                     acc_idx = mi * num_acc_n + ni
-                                    bg0, bg1, scg = b_gate_raw[ni]
-                                    bu0, bu1, scu = b_up_raw[ni]
-                                    # dword holds 2 group scales: low=first K32, high=second K32
-                                    scg0 = extract_bf16_scale(arith, scg, 0)
-                                    scg1 = extract_bf16_scale(arith, scg, 1)
-                                    scu0 = extract_bf16_scale(arith, scu, 0)
-                                    scu1 = extract_bf16_scale(arith, scu, 1)
-                                    pg0 = mfma_fn(
-                                        mfma_res_ty, [a0, bg0, zero_f32_acc, 0, 0, 0]
+                                    bg0, bg1, bu0, bu1, scg0, scg1, scu0, scu1 = b_ops[
+                                        ni
+                                    ]
+                                    push_fma(
+                                        gate_list, acc_idx,
+                                        mfma_fn(mfma_res_ty,
+                                                [a0, bg0, zero_f32_acc, 0, 0, 0]),
+                                        scg0,
                                     )
-                                    gate_list[acc_idx] = _acc_scaled_f32(
-                                        gate_list[acc_idx], pg0, scg0
+                                    push_fma(
+                                        gate_list, acc_idx,
+                                        mfma_fn(mfma_res_ty,
+                                                [a1, bg1, zero_f32_acc, 0, 0, 0]),
+                                        scg1,
                                     )
-                                    pg1 = mfma_fn(
-                                        mfma_res_ty, [a1, bg1, zero_f32_acc, 0, 0, 0]
+                                    push_fma(
+                                        up_list, acc_idx,
+                                        mfma_fn(mfma_res_ty,
+                                                [a0, bu0, zero_f32_acc, 0, 0, 0]),
+                                        scu0,
                                     )
-                                    gate_list[acc_idx] = _acc_scaled_f32(
-                                        gate_list[acc_idx], pg1, scg1
+                                    push_fma(
+                                        up_list, acc_idx,
+                                        mfma_fn(mfma_res_ty,
+                                                [a1, bu1, zero_f32_acc, 0, 0, 0]),
+                                        scu1,
                                     )
-                                    pu0 = mfma_fn(
-                                        mfma_res_ty, [a0, bu0, zero_f32_acc, 0, 0, 0]
-                                    )
-                                    up_list[acc_idx] = _acc_scaled_f32(
-                                        up_list[acc_idx], pu0, scu0
-                                    )
-                                    pu1 = mfma_fn(
-                                        mfma_res_ty, [a1, bu1, zero_f32_acc, 0, 0, 0]
-                                    )
-                                    up_list[acc_idx] = _acc_scaled_f32(
-                                        up_list[acc_idx], pu1, scu1
-                                    )
+                        drain_fma()
                     else:
                         for ku in range_constexpr(k_unroll):
                             b_gate_packs0, b_gate_packs1 = b_gate_tile_in[ku]
@@ -2681,6 +2774,8 @@ def compile_moe_gemm2(
     # a8w4 ALIGNED gate: outer-scope closure scalar so it is folded into FlyDSL's
     # disk cache key (see stage1 twin) -> aligned/fold never share a binary.
     _a8w4_aligned = is_mxfp4_fp8 and os.environ.get("AITER_A8W4_ALIGNED", "0") == "1"
+    _a8w4_defer_unpack = _a8w4_aligned and _A8W4_DEFER_UNPACK
+    _a8w4_fma_depth = _A8W4_FMA_DEPTH if (is_mxfp8 or is_mxfp4_fp8) else 0
 
     if True:
 
@@ -3171,8 +3266,15 @@ def compile_moe_gemm2(
                                         n_blk=n_blk_list[ni], n_intra=n_intra_list[ni],
                                         lane_div_16=lane_div_16, elem_type=w_elem,
                                     )
-                                    b0 = unpack_b_w4a16_mxfp4_to_fp8_permlut(r0, arith, vector)
-                                    b1 = unpack_b_w4a16_mxfp4_to_fp8_permlut(r1, arith, vector)
+                                    if const_expr(_a8w4_defer_unpack):
+                                        b0, b1 = r0, r1  # expanded in compute_tile
+                                    else:
+                                        b0 = unpack_b_w4a16_mxfp4_to_fp8_permlut(
+                                            r0, arith, vector
+                                        )
+                                        b1 = unpack_b_w4a16_mxfp4_to_fp8_permlut(
+                                            r1, arith, vector
+                                        )
                                     sc = _load_groupwise_scale(
                                         buffer_ops, arith, scale_rsrc=sw_rsrc,
                                         expert_offset=expert_off_idx,
@@ -3550,11 +3652,34 @@ def compile_moe_gemm2(
                             )
                     elif const_expr(is_mxfp8_groupwise or is_mxfp4_fp8_groupwise):
                         # a8w4 stage2: fp8 MFMA per K32 into zero acc, then per-32 E8M0
-                        # scale (per-pair-equal) post-multiply + accumulate (f32).
+                        # scale post-multiply + accumulate (f32). Mirrors stage1: B is
+                        # expanded once per (ku, ni) and the scale FMA is queued so no
+                        # MFMA result is read by the instruction that follows it.
+                        push_fma, drain_fma = _make_scale_fma_pipe(
+                            _acc_scaled_f32, _a8w4_fma_depth
+                        )
                         for ku in range_constexpr(k_unroll):
                             b_raw = b_tile_in[ku]
                             ki64 = arith.index(ku * 64)
                             col_base = col_offset_base_bytes + ki64
+                            b_ops = []
+                            for ni in range_constexpr(num_acc_n):
+                                b0, b1, sc = b_raw[ni]
+                                if const_expr(_a8w4_defer_unpack):
+                                    b0 = unpack_b_w4a16_mxfp4_to_fp8_permlut(
+                                        b0, arith, vector
+                                    )
+                                    b1 = unpack_b_w4a16_mxfp4_to_fp8_permlut(
+                                        b1, arith, vector
+                                    )
+                                b_ops.append(
+                                    (
+                                        b0,
+                                        b1,
+                                        extract_bf16_scale(arith, sc, 0),
+                                        extract_bf16_scale(arith, sc, 1),
+                                    )
+                                )
                             for mi in range_constexpr(m_repeat):
                                 mi_val = arith.index(mi * 16)
                                 curr_row_a_lds = row_a_lds + mi_val
@@ -3573,17 +3698,20 @@ def compile_moe_gemm2(
                                     )
                                 for ni in range_constexpr(num_acc_n):
                                     acc_idx = mi * num_acc_n + ni
-                                    b0, b1, sc = b_raw[ni]
-                                    sc0 = extract_bf16_scale(arith, sc, 0)
-                                    sc1 = extract_bf16_scale(arith, sc, 1)
-                                    p0 = mfma_fn(mfma_res_ty, [a0, b0, zero_f32_acc, 0, 0, 0])
-                                    acc_list[acc_idx] = _acc_scaled_f32(
-                                        acc_list[acc_idx], p0, sc0
+                                    b0, b1, sc0, sc1 = b_ops[ni]
+                                    push_fma(
+                                        acc_list, acc_idx,
+                                        mfma_fn(mfma_res_ty,
+                                                [a0, b0, zero_f32_acc, 0, 0, 0]),
+                                        sc0,
                                     )
-                                    p1 = mfma_fn(mfma_res_ty, [a1, b1, zero_f32_acc, 0, 0, 0])
-                                    acc_list[acc_idx] = _acc_scaled_f32(
-                                        acc_list[acc_idx], p1, sc1
+                                    push_fma(
+                                        acc_list, acc_idx,
+                                        mfma_fn(mfma_res_ty,
+                                                [a1, b1, zero_f32_acc, 0, 0, 0]),
+                                        sc1,
                                     )
+                        drain_fma()
                     else:
                         for ku in range_constexpr(k_unroll):
                             b_packs0, b_packs1 = b_tile_in[ku]
