@@ -26,6 +26,7 @@ from aiter.ops.flydsl.moe_kernels import (  # noqa: E402
     a8w4_tiles,
     flydsl_moe_stage1,
     flydsl_moe_stage2,
+    mxfp4_stage2_mode,
     prep_a8w4_w4,
     prep_a8w4_w4_aligned,
 )
@@ -296,6 +297,7 @@ def sweep(tokens, model_dim=4096, inter_dim=512, E=256, topk=6, iters=50,
             return flydsl_moe_stage2(a2_fp8, w2f8, s8_ids, s8_eid, s8_nvi, topk=topk,
                                      tile_m=tile_m_a8, tile_n=s2_tile_n_a8, tile_k=tile_k_a8,
                                      a_dtype="fp8", b_dtype="mxfp4", out_dtype="bf16",
+                                     mode=mxfp4_stage2_mode(),
                                      w2_scale=w2s8, a2_scale=a2_scale, sorted_weights=s8_w)
 
         # ---- a16w4 setup (bf16 activation, no quant) ----
