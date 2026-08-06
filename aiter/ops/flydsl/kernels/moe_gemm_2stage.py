@@ -2516,6 +2516,7 @@ def compile_moe_gemm2(
     use_cshuffle_epilog: bool | None = None,
     accumulate: bool = True,
     scale_is_bf16: bool = False,
+    waves_per_eu: int = 0,
 ):
     """Compile stage2 kernel (`moe_gemm2`) and return the compiled executable.
 
@@ -4343,7 +4344,7 @@ def compile_moe_gemm2(
         gx = n_in // fx.Index(tile_n)
         gy = size_expert_ids_in
 
-        moe_gemm2(
+        _k2 = moe_gemm2(
             arg_out,
             arg_x,
             arg_w,
@@ -4357,7 +4358,14 @@ def compile_moe_gemm2(
             i32_n_in,
             i32_k_in,
             i32_size_expert_ids_in,
-        ).launch(
+        )
+        if const_expr(waves_per_eu > 0):
+            for op in ctx.gpu_module_body.operations:
+                if hasattr(op, "attributes") and op.OPERATION_NAME == "gpu.func":
+                    op.attributes["rocdl.waves_per_eu"] = ir.IntegerAttr.get(
+                        T.i32, int(waves_per_eu)
+                    )
+        _k2.launch(
             grid=(gx, gy, 1),
             block=(256, 1, 1),
             stream=stream,

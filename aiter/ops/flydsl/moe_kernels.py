@@ -993,6 +993,7 @@ def compile_flydsl_moe_stage2(
             out_dtype=out_dtype,
             accumulate=accumulate,
             scale_is_bf16=True,
+            waves_per_eu=waves_per_eu or 0,
         )
     elif a_dtype == "bf16" and b_dtype == "mxfp4":
         # a16w4: bf16 activations, mxfp4 (e2m1) weights with E8M0 per-32 scale
@@ -1013,6 +1014,7 @@ def compile_flydsl_moe_stage2(
             out_dtype=out_dtype,
             accumulate=accumulate,
             scale_is_bf16=True,
+            waves_per_eu=waves_per_eu or 0,
         )
     elif a_dtype == "fp8" and b_dtype == "mxfp8":
         # a8w4 Phase0 (CDNA3): fp8 activation x mxfp8 weight (fp8 e4m3fnuz codebook
@@ -1034,6 +1036,7 @@ def compile_flydsl_moe_stage2(
             out_dtype=out_dtype,
             accumulate=accumulate,
             scale_is_bf16=True,
+            waves_per_eu=waves_per_eu or 0,
         )
     elif a_dtype == "fp8" and b_dtype == "mxfp4":
         # a8w4 Phase1 (CDNA3): fp8 activation x 4bit-stored mxfp4 weight; unpack
@@ -1055,6 +1058,7 @@ def compile_flydsl_moe_stage2(
             out_dtype=out_dtype,
             accumulate=accumulate,
             scale_is_bf16=True,
+            waves_per_eu=waves_per_eu or 0,
         )
     else:
         raise ValueError(
