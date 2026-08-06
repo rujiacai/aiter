@@ -2022,6 +2022,24 @@ def flydsl_moe_stage2(
     _use_fused_init = not _fused_init_disabled()
     _alloc_out = out is None
 
+    # FLYDSL_MOE_STAGE2_SCALAR_ASCALE makes the epilogue read the activation scale
+    # once instead of once per row, which is only equivalent when that scale really
+    # is per-tensor.  The kernel cannot tell: the host broadcasts a per-tensor scalar
+    # over tokens*topk, so both quant types reach it as the same [tokens*topk] f32
+    # buffer.  Under a per-token scale the knob does not fail, it just computes the
+    # wrong answer -- measured cos 0.9556 vs 0.999995, with no error and no NaN.
+    # Check here, where the un-broadcast scale is still visible, and fail loudly.
+    if os.environ.get("FLYDSL_MOE_STAGE2_SCALAR_ASCALE", "0") in (
+        "1", "true", "True", "YES", "yes"
+    ):
+        _n = 0 if a2_scale is None else a2_scale.numel()
+        if _n != 1:
+            raise ValueError(
+                "FLYDSL_MOE_STAGE2_SCALAR_ASCALE assumes a per-tensor activation "
+                f"scale, but a2_scale has {_n} elements. It would silently produce "
+                "wrong results (cos ~0.956); unset the knob for this quant type."
+            )
+
     if _use_fused_init:
         if _alloc_out:
             out = torch.empty(

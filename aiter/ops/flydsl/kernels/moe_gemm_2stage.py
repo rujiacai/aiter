@@ -2583,6 +2583,49 @@ def compile_moe_gemm2(
 
     _store_nt = 2 if not bool(accumulate) else 0
 
+    # Store the sorted-row partial through a per-block buffer descriptor instead of
+    # a raw 64-bit pointer.  The raw-pointer path exists because the partial buffer
+    # can exceed the 4 GiB a descriptor's 32-bit num_records can cover, but that only
+    # matters if a workgroup can address the whole buffer.  In the sorted-row layout
+    # it addresses exactly rows [bx_m, bx_m + tile_m), so a descriptor over that
+    # window is both legal at any token count and enough to keep every per-lane
+    # offset in 32 bits -- which is what removes the VGPR pair per in-flight store
+    # and the 64-bit address chain feeding it.
+    #
+    # Requires the sorted-row layout: the (token, topk, dim) layout puts a
+    # workgroup's rows all over the buffer, so no small window covers them.
+    _bufstore = (
+        os.environ.get("FLYDSL_MOE_STAGE2_BUFSTORE", "0")
+        in ("1", "true", "True", "YES", "yes")
+        and (not bool(accumulate))
+        and _SORTED_PARTIAL
+        and _use_cshuffle_epilog
+        and not out_is_f32
+    )
+
+    # Load the activation scale once instead of once per output row.
+    #
+    # The host broadcasts a per-tensor a2_scale over tokens*topk before the launch
+    # (moe_kernels._resolve_a_scale_for_fused_init), so every row reads the same
+    # number.  The per-row load costs a buffer_load plus the whole
+    # `ts2 = t*topk + s` address chain -- and that chain is the last consumer of
+    # the sorted id in the LDS-write half of the epilogue, so removing it also lets
+    # the sentinel read die.
+    #
+    # ONLY valid when the activation scale really is per-tensor; the kernel cannot
+    # tell, hence the opt-in.  Under a per-token scale this silently computes wrong
+    # results, so leave it off unless the caller guarantees QuantType.per_Tensor.
+    _scalar_ascale = os.environ.get(
+        "FLYDSL_MOE_STAGE2_SCALAR_ASCALE", "0"
+    ) in ("1", "true", "True", "YES", "yes")
+
+    # Vectorise the epilogue's scale multiply (see `_scaled_acc`).  Needs the scalar
+    # activation scale above, because the per-row variant folds a value that differs
+    # per row into the same product and so cannot be hoisted to the f32x4.
+    _vec_scale = _scalar_ascale and os.environ.get(
+        "FLYDSL_MOE_STAGE2_VEC_SCALE", "0"
+    ) in ("1", "true", "True", "YES", "yes")
+
     if True:
 
         @flyc.kernel(known_block_size=[total_threads, 1, 1])
@@ -2738,6 +2781,12 @@ def compile_moe_gemm2(
                 sx_nbytes_idx = (tokens_in * c_topk) * fx.Index(4)
                 sx_rsrc = buffer_ops.create_buffer_resource(
                     arg_scale_x, max_size=False, num_records_bytes=sx_nbytes_idx
+                )
+            # Per-tensor activation scale: one load for the whole workgroup.
+            sx_scalar = None
+            if _scalar_ascale and sx_rsrc is not None:
+                sx_scalar = buffer_ops.buffer_load(
+                    sx_rsrc, fx.Int32(0), vec_width=1, dtype=T.f32
                 )
             # scale_w: fp16/bf16 (non-int4) path ignores; int4_bf16 needs dequant scale.
             if not needs_scale_w:
@@ -3887,6 +3936,45 @@ def compile_moe_gemm2(
                         ptr_ty = ir.Type.parse(f"!llvm.ptr<{addr_space}>")
                         return llvm.inttoptr(ptr_ty, i64_raw)
 
+                    # Descriptor over this workgroup's slice of the sorted-row partial.
+                    # bx_m is workgroup-uniform, so the one 64-bit multiply-add lands in
+                    # SGPRs and everything downstream is a 32-bit lane offset.
+                    blk_out_rsrc = None
+                    if _bufstore:
+                        from flydsl._mlir.dialects import rocdl as _rocdl_dialect
+                        from flydsl.expr.buffer_ops import (
+                            _create_i16_constant as _mk_i16,
+                            _create_i32_constant as _mk_i32,
+                            _create_i64_constant as _mk_i64,
+                            _get_buffer_flags as _mk_buf_flags,
+                        )
+
+                        _blk_base_idx = out_base_idx + bx_m * fx.Index(
+                            model_dim * out_elem_bytes
+                        )
+                        _blk_idx_v = (
+                            _blk_base_idx._value
+                            if hasattr(_blk_base_idx, "_value")
+                            else _blk_base_idx
+                        )
+                        _blk_i64 = arith.index_cast(T.i64, _blk_idx_v)
+                        _blk_i64_raw = (
+                            _blk_i64._value if hasattr(_blk_i64, "_value") else _blk_i64
+                        )
+                        # Plain !llvm.ptr, matching BufferResourceDescriptor.from_memref.
+                        _blk_ptr = llvm.inttoptr(
+                            ir.Type.parse("!llvm.ptr"), _blk_i64_raw
+                        )
+                        blk_out_rsrc = _rocdl_dialect.MakeBufferRsrcOp(
+                            ir.Type.parse("!llvm.ptr<8>"),
+                            _blk_ptr,
+                            _mk_i16(0),
+                            _mk_i64(
+                                int(tile_m) * int(model_dim) * int(out_elem_bytes)
+                            ),
+                            _mk_i32(_mk_buf_flags()),
+                        ).result
+
                     # Emit-time mask state read by the epilogue callbacks. When the whole
                     # block is valid we re-emit the callbacks with masking disabled.
                     _epi = {"masked": True}
@@ -3905,6 +3993,61 @@ def compile_moe_gemm2(
                             return arith.bitcast(out_elem(), v_i16)
                         return arith.trunc_f(out_elem(), v)
 
+                    # Scale the whole f32x4 accumulator at once instead of once per
+                    # element.  `write_row_to_lds` is called with ii = 0..3 for a fixed
+                    # `mi`, and acc[mi*num_acc_n + ni] holds exactly those four rows, so
+                    # the multiply can be a vector op (2 v_pk_mul_f32 per f32x4) instead
+                    # of four scalar v_mul_f32.  The LDS writes stay per-row because the
+                    # four rows land in four different LDS rows -- this only vectorises
+                    # the arithmetic.
+                    #
+                    # Counted per N-tile at tile_m=64 / num_acc_n=2: the scalar form
+                    # issues 5 muls per (mi, ii) = 80; this form issues 2 (sx*sw) +
+                    # 16 (tw_vec*sw) + 16 (acc*scale) = 34.
+                    _vec_scale_cache = {}
+                    _sw_x = None
+                    if _vec_scale and sx_scalar is not None:
+                        # sx*sw folded once per N-tile, then splatted so the per-row
+                        # product below is a vector op rather than 4 scalar ones.
+                        _sw_x = [
+                            vector.from_elements(
+                                T.vec(4, T.f32), [sx_scalar * sw_vals[ni]] * 4
+                            )
+                            for ni in range(num_acc_n)
+                        ]
+
+                    def _scaled_acc(mi: int, ni: int, ii: int, row):
+                        """acc[mi,ni] * scale, as an f32x4 covering ii = 0..3."""
+                        key = (bool(_epi["masked"]), mi, ni)
+                        got = _vec_scale_cache.get(key)
+                        if got is None:
+                            if doweight_stage2:
+                                tws = []
+                                for jj in range_constexpr(4):
+                                    if tw_pf is not None:
+                                        tws.append(tw_pf[(mi * 4) + jj])
+                                    else:
+                                        # `row` is this call's row; the sibling rows of the
+                                        # same mi differ by (jj - ii).
+                                        tws.append(
+                                            buffer_ops.buffer_load(
+                                                sorted_w_rsrc,
+                                                row + fx.Index(jj - ii),
+                                                vec_width=1,
+                                                dtype=T.f32,
+                                            )
+                                        )
+                                tw_vec = vector.from_elements(T.vec(4, T.f32), tws)
+                                svec = tw_vec * _sw_x[ni]
+                            else:
+                                svec = _sw_x[ni]
+                            a = acc[mi * num_acc_n + ni]
+                            if is_int8:
+                                a = arith.sitofp(T.vec(4, T.f32), a)
+                            got = a * svec
+                            _vec_scale_cache[key] = got
+                        return got
+
                     def write_row_to_lds(
                         *,
                         mi: int,
@@ -3916,6 +4059,56 @@ def compile_moe_gemm2(
                         num_acc_n: int,
                         lds_out,
                     ):
+                        if sx_scalar is not None:
+                            # Per-tensor scale: no need to decode (t, s) at all here.
+                            # Padding rows get a non-zero scale, which is harmless --
+                            # the masked path still predicates their store away, and the
+                            # fast-valid path only runs on blocks that have no padding.
+                            if _vec_scale:
+                                for ni in range_constexpr(num_acc_n):
+                                    col_local = col_base_local + (ni * 16)
+                                    v = vector.extract(
+                                        _scaled_acc(mi, ni, ii, row),
+                                        static_position=[ii],
+                                        dynamic_position=[],
+                                    )
+                                    v_out = _cvt_out(v)
+                                    lds_idx = row_base_lds + col_local
+                                    v1 = vector.from_elements(
+                                        T.vec(1, out_elem()), [v_out]
+                                    )
+                                    vector.store(v1, lds_out, [lds_idx], alignment=2)
+                                return
+                            sx = sx_scalar
+                            if doweight_stage2:
+                                tw_idx0 = (mi * 4) + ii
+                                tw = (
+                                    tw_pf[tw_idx0]
+                                    if tw_pf is not None
+                                    else buffer_ops.buffer_load(
+                                        sorted_w_rsrc, row, vec_width=1, dtype=T.f32
+                                    )
+                                )
+                            sx_row0 = sx * tw if doweight_stage2 else sx
+                            for ni in range_constexpr(num_acc_n):
+                                col_local = col_base_local + (ni * 16)
+                                sw = sw_vals[ni]
+                                acc_idx = mi * num_acc_n + ni
+                                v = vector.extract(
+                                    acc[acc_idx],
+                                    static_position=[ii],
+                                    dynamic_position=[],
+                                )
+                                if is_int8:
+                                    v = arith.sitofp(T.f32, v)
+                                v = v * (sx_row0 * sw)
+                                v_out = _cvt_out(v)
+                                lds_idx = row_base_lds + col_local
+                                v1 = vector.from_elements(
+                                    T.vec(1, out_elem()), [v_out]
+                                )
+                                vector.store(v1, lds_out, [lds_idx], alignment=2)
+                            return
                         fused2 = memref.load(lds_tid, [row_in_tile])
                         t2 = fused2 & mask24_i32
                         s2 = fused2 >> 24
@@ -4002,6 +4195,15 @@ def compile_moe_gemm2(
                         else:
                             # fast-valid block: every row stores unconditionally.
                             row_valid = None
+                        if _bufstore:
+                            # Offset inside this block's descriptor window, in output
+                            # elements.  row_local is already the row within the tile,
+                            # so neither `t` nor `s` is needed here -- which is also what
+                            # lets the sentinel load die when the mask is off.
+                            return (
+                                (fused2, row_local * fx.Index(model_dim)),
+                                row_valid,
+                            )
                         if out_base_idx is not None:
                             t_idx = arith.index_cast(T.index, t)
                             s_idx = arith.index_cast(T.index, s)
@@ -4031,6 +4233,16 @@ def compile_moe_gemm2(
                         else:
                             fused = row_ctx
                             row_byte_base = None
+                        if _bufstore:
+                            # row_byte_base holds the row's *element* base in the window
+                            # (see precompute_row); buffer_store scales it to bytes.
+                            buffer_ops.buffer_store(
+                                frag,
+                                blk_out_rsrc,
+                                row_byte_base + col_g0,
+                                cache_modifier=_store_nt,
+                            )
+                            return
                         if _needs_global_atomic_bf16:
                             # gfx942: no buffer_atomic_pk_add_bf16, use global atomicrmw fadd
                             if bool(accumulate):

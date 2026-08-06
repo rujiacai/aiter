@@ -10,10 +10,15 @@ stage2 kernel name; see ``moe_kernels._parse_flydsl_kernel_name``.
 """
 
 import functools
+import os
 
 import torch
 
 _FP8 = (torch.float8_e4m3fnuz, torch.float8_e4m3fn)
+
+
+def _use_triton_reduce() -> bool:
+    return os.environ.get("AITER_PR1X4_TRITON_REDUCE", "0") in ("1", "true", "True", "yes", "YES")
 
 
 @functools.cache
@@ -120,5 +125,16 @@ def flydsl_moe_stage2_pr1x4(
     invert_sorted_ids(topk)(
         sorted_token_ids, loc_ids, num_valid_ids, sorted_token_ids.shape[0], B
     )
+    if _use_triton_reduce():
+        # Attribution probe: the reduce-mode stage2 already ships a Triton kernel
+        # for exactly this gather-and-sum over a sorted-row partial buffer, and it
+        # is measurably faster than sorted_sum on the same bytes.
+        from aiter.ops.flydsl._fused_post import fused_topk_sum_gather
+
+        fused_topk_sum_gather(
+            out, gemm2_out.view(-1), loc_ids,
+            token_num=B, topk=topk, model_dim=N2,
+        )
+        return out
     sorted_sum(topk, N2)(loc_ids, gemm2_out, out, B)
     return out
