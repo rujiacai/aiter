@@ -547,7 +547,7 @@ def get_flydsl_stage2_kernels_mxfp4_bf16(out_dtype: str) -> Dict[str, Dict]:
     tile_ks = [128, 256]
     tile_ms = [16, 32, 64, 128]
     tile_ns = [128, 256]
-    modes = ["atomic"]
+    modes = ["atomic", "reduce"]
 
     for tm in tile_ms:
         for tn in tile_ns:
@@ -686,7 +686,7 @@ def get_flydsl_stage2_kernels_mxfp4_fp8(out_dtype: str) -> Dict[str, Dict]:
     tile_ks = [128, 256]
     tile_ms = [16, 32, 64, 128]
     tile_ns = [128, 256]
-    modes = ["atomic"]
+    modes = ["atomic", "reduce"]
 
     for tm in tile_ms:
         for tn in tile_ns:
@@ -2088,8 +2088,8 @@ def flydsl_moe_stage2(
     model_dim = w2.shape[1]
     inter_dim = inter_states.shape[2]
 
-    # Debug: force stage2 to use the masked reduce epilogue instead of atomic
-    # accumulate. Enabled by default; set AITER_FLYDSL_FORCE_REDUCE=0 to opt out.
+    # Escape hatch that forces the reduce epilogue onto a kernel registered as
+    # "atomic"; otherwise the caller's ``mode`` decides.
     if os.environ.get("AITER_FLYDSL_FORCE_REDUCE", "0") == "1":
         mode = "reduce"
 

@@ -984,6 +984,25 @@ def _flydsl_stage1_wrapper(
     )
 
 
+def _flydsl_stage2_mode() -> str:
+    """Topk reduction strategy for the FlyDSL mxfp4 stage2 epilogue.
+
+    "atomic" accumulates the topk partials straight into the bf16 output with
+    global atomics. The summation order -- and with it the bf16 rounding --
+    then varies between otherwise identical calls, and the read-modify-write
+    traffic costs 18-20% of stage2 at large batch (MI308X, dsv4-pro TP8:
+    token=32768 spends 1732 of 8811 us there). "reduce" writes the partials to
+    a [tokens*topk, model_dim] scratch buffer and sums them in fp32 in a second
+    pass: bit-reproducible, half the stage2 error, and 1.09-1.12x faster from
+    token=16384 up. It costs one transient tokens*topk*model_dim buffer.
+    """
+    return (
+        "atomic"
+        if os.environ.get("AITER_FLYDSL_STAGE2_ATOMIC", "0") == "1"
+        else "reduce"
+    )
+
+
 def _flydsl_stage2_wrapper(
     inter_states,
     w1,
@@ -1558,7 +1577,14 @@ def get_2stage_cfgs(
             1, "fp8", "mxfp4", _out_str, _tile_m, _s1_tile_n, _tile_k
         )
         kn2 = flydsl_kernel_name(
-            2, "fp8", "mxfp4", _out_str, _tile_m, _s2_tile_n, _tile_k, "atomic"
+            2,
+            "fp8",
+            "mxfp4",
+            _out_str,
+            _tile_m,
+            _s2_tile_n,
+            _tile_k,
+            _flydsl_stage2_mode(),
         )
         return MOEMetadata(
             functools.partial(
@@ -1623,8 +1649,10 @@ def get_2stage_cfgs(
         # a16w4 stage2 (down-proj, N=model_dim is wide) prefers tile_n=256: halves the
         # N-tile count / workgroups. int4 keeps tile_n=128.
         _s2_tile_n = 256 if (_flydsl_a16w4 and model_dim % 256 == 0) else _tile_n
+        # int4 stage2 has no registered reduce variant, so it stays on atomics.
+        _s2_mode = _flydsl_stage2_mode() if _flydsl_a16w4 else "atomic"
         kn2 = flydsl_kernel_name(
-            2, "bf16", _w, _out_str, _tile_m, _s2_tile_n, _tile_k, "atomic"
+            2, "bf16", _w, _out_str, _tile_m, _s2_tile_n, _tile_k, _s2_mode
         )
         return MOEMetadata(
             functools.partial(
