@@ -2040,6 +2040,25 @@ def flydsl_moe_stage2(
                 "wrong results (cos ~0.956); unset the knob for this quant type."
             )
 
+    # FLYDSL_MOE_STAGE2_NO_MASK drops the masked epilogue instead of selecting it at
+    # runtime.  That is only sound on the sorted-row partial layout: there a padding
+    # row's store lands on a row of the padded buffer that the reduce never gathers, so
+    # writing it is harmless.  In the (token, topk, dim) layout the same store is
+    # addressed by the row's decoded (t, s) -- garbage for a padding row -- and would
+    # land on some real token's slot.  The kernel already refuses to apply the knob
+    # unless the layout matches, but silently doing nothing hides a misconfiguration,
+    # so say so here.
+    if os.environ.get("FLYDSL_MOE_STAGE2_NO_MASK", "0") in (
+        "1", "true", "True", "YES", "yes"
+    ):
+        if accumulate or not _stage2_sorted_partial():
+            raise ValueError(
+                "FLYDSL_MOE_STAGE2_NO_MASK requires the sorted-row partial layout "
+                "(stage2 mode=reduce plus AITER_FLYDSL_STAGE2_SORTED_PARTIAL=1); got "
+                f"accumulate={accumulate}, sorted_partial={_stage2_sorted_partial()}. "
+                "Without it the masked epilogue is load-bearing."
+            )
+
     if _use_fused_init:
         if _alloc_out:
             out = torch.empty(

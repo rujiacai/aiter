@@ -2626,6 +2626,59 @@ def compile_moe_gemm2(
         "FLYDSL_MOE_STAGE2_VEC_SCALE", "0"
     ) in ("1", "true", "True", "YES", "yes")
 
+    # Hoist the loop-invariant epilogue prefetches out of the persist N-loop.
+    #
+    # Two reads in the per-N-tile body depend only on `bx_m` and the lane, not on the
+    # N-tile: `tw_pf` (sorted_weights[bx_m + row_in_tile], 16 per tile) and the
+    # fast-valid guard (sorted_token_ids[bx_m + tile_m - 1], 1 per tile).  Persist
+    # unrolls that body once per N-tile, so at model_dim/tile_n = 32 tiles the same 17
+    # values are re-read 544 times per wave -- about 76% of all buffer_load_dword.
+    # The compiler cannot CSE them away: s_barrier and buffer_store sit in between and
+    # there is no alias info to prove the buffer is unchanged.
+    #
+    # Emitting them once and reusing the SSA values is legal because every N-tile body
+    # lands in the same MLIR block (`range_constexpr` unrolls in Python; it does not
+    # create scf regions), so the first definition dominates all later uses.
+    #
+    # Costs ~16 extra live VGPRs.  Default OFF until measured on more shapes.
+    # Same trick as `_hoist_pf`, applied to the X tile's LDS reads.  Under persist the
+    # X tile is written to LDS once (first N-tile) and then read back by every N-tile,
+    # but the read addresses (`row_a_lds`, `col_offset_base_bytes`, the k-tile's LDS
+    # base) carry no N-tile dependence -- so the 32 unrolled bodies re-issue the same
+    # ~12 ds_read_b128 over and over.  Caching the first N-tile's values reuses them,
+    # which costs ~64 live VGPRs (16 x 16 B per lane).  That is affordable here:
+    # occupancy is already VGPR-limited to 2 waves/SIMD at 169 VGPRs and stays there up
+    # to 256, and occupancy is not what bounds this kernel anyway (see the doc's 4.7).
+    # Drop the masked epilogue entirely instead of emitting both paths and branching.
+    # Only legal on the sorted-row partial layout, where a padding row's store goes to a
+    # row of the padded buffer that the reduce never gathers.  In the (token, topk, dim)
+    # layout a padding row's decoded (t, s) is garbage and would land on a real token's
+    # slot, so the mask is load-bearing there.
+    _no_mask = (
+        os.environ.get("FLYDSL_MOE_STAGE2_NO_MASK", "0")
+        in ("1", "true", "True", "YES", "yes")
+        and (not bool(accumulate))
+        and _SORTED_PARTIAL
+        and _use_cshuffle_epilog
+        and not out_is_f32
+    )
+
+    _hoist_x = os.environ.get("FLYDSL_MOE_STAGE2_HOIST_X", "0") in (
+        "1",
+        "true",
+        "True",
+        "YES",
+        "yes",
+    )
+
+    _hoist_pf = os.environ.get("FLYDSL_MOE_STAGE2_HOIST_PF", "0") in (
+        "1",
+        "true",
+        "True",
+        "YES",
+        "yes",
+    )
+
     if True:
 
         @flyc.kernel(known_block_size=[total_threads, 1, 1])
@@ -2825,6 +2878,10 @@ def compile_moe_gemm2(
             )
             bx_m_i32 = arith.index_cast(T.i32, bx_m)
             blk_valid = arith.cmpi(arith.CmpIPredicate.ult, bx_m_i32, num_valid_i32)
+
+            # Emit-time store for the N-tile-invariant prefetches (see `_hoist_pf`).
+            # Filled by the first N-tile body, reused by the rest.
+            _pf_hoist = {}
 
             def _moe_gemm2_then_body(
                 by, is_first_ntile=True, b_preloaded=None, next_by=None
@@ -3226,7 +3283,21 @@ def compile_moe_gemm2(
                     prefetch_epilogue: bool = False,
                     a0_prefetch=None,
                     a1_prefetch=None,
+                    lds_key=None,
                 ):
+                    # `lds_key` identifies the K-tile whose X data these reads target.
+                    # Set only on the persist path, where the reads are N-tile-invariant
+                    # and can therefore be cached across the 32 unrolled bodies.
+                    def _x_packs(row_lds, col_base, sub_key):
+                        if lds_key is None or not _hoist_x:
+                            return lds_load_packs_k64(row_lds, col_base, lds_base)
+                        k = ("x", lds_key) + sub_key
+                        got = _pf_hoist.get(k)
+                        if got is None:
+                            got = lds_load_packs_k64(row_lds, col_base, lds_base)
+                            _pf_hoist[k] = got
+                        return got
+
                     acc_list = list(acc_in)
                     mfma_res_ty = T.i32x4 if is_int8 else T.f32x4
                     mfma_fn = (
@@ -3258,8 +3329,11 @@ def compile_moe_gemm2(
                                 )
                             )
                         # Also prefetch per-row routed/topk weights (sorted_weights) when enabled.
-                        tw_pf = None
-                        if doweight_stage2:
+                        # The row index is bx_m + mi*16 + lane_div_16*4 + ii -- no N-tile
+                        # dependence -- so under `_hoist_pf` the first N-tile's loads are
+                        # reused by the rest instead of being re-issued 32 times.
+                        tw_pf = _pf_hoist.get("tw") if _hoist_pf else None
+                        if doweight_stage2 and tw_pf is None:
                             tw_pf = []
                             lane_div_16_mul4_pf = lane_div_16 * fx.Index(4)
                             ii_idx_list_pf = [fx.Index(ii) for ii in range(4)]
@@ -3279,6 +3353,8 @@ def compile_moe_gemm2(
                                             dtype=T.f32,
                                         )
                                     )
+                            if _hoist_pf:
+                                _pf_hoist["tw"] = tw_pf
                         epilogue_pf = (sw_pf, tw_pf)
 
                     def _i64_to_v4f16(x_i64):
@@ -3333,11 +3409,11 @@ def compile_moe_gemm2(
                                 if (a0_prefetch is not None) and (ku0 == 0) and (mi == 0):
                                     a0, a1 = a0_prefetch
                                 else:
-                                    a0, a1 = lds_load_packs_k64(curr_row_a_lds, col_base0, lds_base)
+                                    a0, a1 = _x_packs(curr_row_a_lds, col_base0, (ku0, mi))
                                 if (a1_prefetch is not None) and (ku1 == 1) and (mi == 0):
                                     a2, a3 = a1_prefetch
                                 else:
-                                    a2, a3 = lds_load_packs_k64(curr_row_a_lds, col_base1, lds_base)
+                                    a2, a3 = _x_packs(curr_row_a_lds, col_base1, (ku1, mi))
                                 a_128 = _pack_i64x4_to_i32x8(a0, a1, a2, a3)
 
                                 for ni in range_constexpr(num_acc_n):
@@ -3367,8 +3443,8 @@ def compile_moe_gemm2(
                                 elif (a1_prefetch is not None) and (ku == 1) and (mi == 0):
                                     a0, a1 = a1_prefetch
                                 else:
-                                    a0, a1 = lds_load_packs_k64(
-                                        curr_row_a_lds, col_base, lds_base
+                                    a0, a1 = _x_packs(
+                                        curr_row_a_lds, col_base, (ku, mi)
                                     )
 
                                 for ni in range_constexpr(num_acc_n):
@@ -3555,14 +3631,19 @@ def compile_moe_gemm2(
                         else:
                             _bt = load_b_tile(k_base_off + arith.index(_kk * tile_k))
                         _lbk = arith.index(_kk * _lds_tile_elems_py)
-                        _a0p = lds_load_packs_k64(
-                            row_a_lds, col_offset_base_bytes, _lbk
-                        )
-                        _a1p = (
-                            lds_load_packs_k64(row_a_lds, _a1_col_bytes2, _lbk)
-                            if k_unroll >= 2
-                            else None
-                        )
+                        # Same N-tile invariance as the reads inside compute_tile.
+                        _a0p = _pf_hoist.get(("xpf0", _kk)) if _hoist_x else None
+                        if _a0p is None:
+                            _a0p = lds_load_packs_k64(
+                                row_a_lds, col_offset_base_bytes, _lbk
+                            )
+                            if _hoist_x:
+                                _pf_hoist[("xpf0", _kk)] = _a0p
+                        _a1p = _pf_hoist.get(("xpf1", _kk)) if _hoist_x else None
+                        if _a1p is None and k_unroll >= 2:
+                            _a1p = lds_load_packs_k64(row_a_lds, _a1_col_bytes2, _lbk)
+                            if _hoist_x:
+                                _pf_hoist[("xpf1", _kk)] = _a1p
                         acc, _epi = compute_tile(
                             acc,
                             _bt,
@@ -3570,6 +3651,7 @@ def compile_moe_gemm2(
                             prefetch_epilogue=(_kk == _num_k_tiles_pro - 1),
                             a0_prefetch=_a0p,
                             a1_prefetch=_a1p,
+                            lds_key=_kk,
                         )
                         if _kk == _num_k_tiles_pro - 1:
                             epilogue_pf = _epi
@@ -4318,30 +4400,48 @@ def compile_moe_gemm2(
                             store_pair=store_pair,
                         )
 
-                    if _fast_valid_block:
+                    if _no_mask:
+                        # Sorted-row partial layout: a padding row's store lands at
+                        # `row * model_dim` inside the padded buffer, and the reduce
+                        # gathers through an inverted index built only from the valid
+                        # sorted ids -- so nothing ever reads those rows back and writing
+                        # them is harmless.  That makes the whole masked epilogue dead
+                        # code: emit only the unmasked one, which also drops the
+                        # `blk_all_valid` probe and the branch around it.
+                        _epi["masked"] = False
+                        _call_epilog()
+                    elif _fast_valid_block:
                         # blk_all_valid is uniform across the workgroup (depends only on
                         # bx_m). moe_sorting pads each expert to a tile_m multiple, so
                         # sentinel padding only ever occupies a block's tail rows. Hence
                         # if the block's LAST row is a real (token, slot) pair, every row
                         # in the block is real and we can run a masking-free epilogue.
-                        last_row_idx = bx_m + fx.Index(tile_m - 1)
-                        last_row_i32 = arith.index_cast(T.i32, last_row_idx)
-                        fused_last = buffer_ops.buffer_load(
-                            sorted_rsrc, last_row_idx, vec_width=1, dtype=T.i32
-                        )
-                        t_last = fused_last & mask24_i32
-                        s_last = fused_last >> 24
+                        # Depends only on bx_m, so under `_hoist_pf` it is computed by the
+                        # first N-tile and reused (see `_pf_hoist`).
                         blk_all_valid = (
-                            arith.cmpi(
-                                arith.CmpIPredicate.ult, last_row_i32, num_valid_i32
-                            )
-                            & arith.cmpi(
-                                arith.CmpIPredicate.ult, t_last, tokens_i32
-                            )
-                            & arith.cmpi(
-                                arith.CmpIPredicate.ult, s_last, topk_i32_v
-                            )
+                            _pf_hoist.get("blk_all_valid") if _hoist_pf else None
                         )
+                        if blk_all_valid is None:
+                            last_row_idx = bx_m + fx.Index(tile_m - 1)
+                            last_row_i32 = arith.index_cast(T.i32, last_row_idx)
+                            fused_last = buffer_ops.buffer_load(
+                                sorted_rsrc, last_row_idx, vec_width=1, dtype=T.i32
+                            )
+                            t_last = fused_last & mask24_i32
+                            s_last = fused_last >> 24
+                            blk_all_valid = (
+                                arith.cmpi(
+                                    arith.CmpIPredicate.ult, last_row_i32, num_valid_i32
+                                )
+                                & arith.cmpi(
+                                    arith.CmpIPredicate.ult, t_last, tokens_i32
+                                )
+                                & arith.cmpi(
+                                    arith.CmpIPredicate.ult, s_last, topk_i32_v
+                                )
+                            )
+                            if _hoist_pf:
+                                _pf_hoist["blk_all_valid"] = blk_all_valid
                         _if_fv = scf.IfOp(blk_all_valid, has_else=True)
                         with _if_then(_if_fv):
                             _epi["masked"] = False
