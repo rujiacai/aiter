@@ -20,7 +20,14 @@ set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(dirname "$HERE")"
 RESULTS="$HERE/results"
+# Which half of the node is ours moves around, so the static list is only a
+# reminder -- check_gpu_free() below is the guard that actually holds, since it
+# looks at live occupancy and so also catches a card that frees up or gets taken
+# after the list was last edited.  Note the `-` rather than `:-`: RESERVED_GPUS=
+# has to mean "nothing is reserved", which is what the message below tells you
+# to do, and `:-` would silently put the default back.
 GPU="${GPU:-4}"
+RESERVED_GPUS="${RESERVED_GPUS-0,1,2,3}"
 
 # ---------------------------------------------------------------------------
 # Stages.  Add a feature by appending a row: id|config|description|env...
@@ -41,6 +48,7 @@ STAGES=(
   "f3|old|循环不变量外提（路由权重 / guard / X 的 LDS 读不再逐 N-tile 重做）+ 输出宽度 e_vec=4|FLYDSL_MOE_STAGE2_HOIST_PF=1 FLYDSL_MOE_STAGE2_HOIST_X=1 FLYDSL_MOE_STAGE2_EVEC=4"
   "f4|old|删掉掩码 epilogue：sorted 行布局下 padding 行的写无害，整条掩码路径是死代码|FLYDSL_MOE_STAGE2_NO_MASK=1"
   "f5|old|CShuffle 两端一起加宽：B-first 让 Step1 写 b64 + nlane 随 e_vec 收窄让 Step2 存 dwordx4，配 LDSPAD=4 解 bank 冲突|FLYDSL_MOE_STAGE2_BFIRST=1 FLYDSL_MOE_STAGE2_NLANE_FIT=1 FLYDSL_MOE_STAGE2_EVEC=8 FLYDSL_MOE_STAGE2_LDSPAD=4"
+  "f6|old|去掉 B 下标拆分里的恒等取模：idx2crd 对非 2 幂的 experts*model_dim/16 会发 magic-number 取模，换成显式移位/掩码|FLYDSL_MOE_STAGE2_FASTIDX=1"
   "target|new|新内核 pr1x4 + Triton 归约（目标）|!AITER_PR1X4_TRITON_REDUCE=1"
 )
 
@@ -60,6 +68,7 @@ ALL_KNOBS=(
   FLYDSL_MOE_STAGE2_BFIRST
   FLYDSL_MOE_STAGE2_LDSPAD
   FLYDSL_MOE_STAGE2_NLANE_FIT
+  FLYDSL_MOE_STAGE2_FASTIDX
   AITER_PR1X4_TRITON_REDUCE
   AITER_LOG_MORE
 )
@@ -108,8 +117,10 @@ env_upto() {
 }
 
 usage() {
-  echo "usage: $0 [--repeats N] [--kernels] [--counters] [--no-ptl-check] [--list] [stage ...]"
+  echo "usage: $0 [--repeats N] [--kernels] [--counters]"
+  echo "          [--no-ptl-check] [--no-gpu-check] [--list] [stage ...]"
   echo "stages: $(stage_ids | tr '\n' ' ')"
+  echo "GPU=$GPU（保留卡 RESERVED_GPUS=$RESERVED_GPUS，另外会实测占用情况再决定）"
 }
 
 # PTL (Peak TOPS Limiter) is a machine-level setting that does not survive a
@@ -120,15 +131,25 @@ usage() {
 # Refuse to run rather than append a silently wrong ladder to the csv.
 check_ptl() {
   local bad
+  # Queried three times: a single read has been observed to come back false for
+  # every GPU right after a workload exits, while a direct query a second later
+  # said all eight were on.  Only a reading that repeats is believed.
   bad="$(python3 - <<'PY' 2>/dev/null
+import time
 try:
     from amdsmi import amdsmi_init, amdsmi_shut_down
     from amdsmi import amdsmi_get_processor_handles, amdsmi_get_gpu_ptl_state
     amdsmi_init()
-    off = [str(i) for i, h in enumerate(amdsmi_get_processor_handles())
-           if not amdsmi_get_gpu_ptl_state(h)]
+    hs = amdsmi_get_processor_handles()
+    off = None
+    for attempt in range(3):
+        cur = {i for i, h in enumerate(hs) if not amdsmi_get_gpu_ptl_state(h)}
+        off = cur if off is None else (off & cur)
+        if not off:
+            break
+        time.sleep(0.5)
     amdsmi_shut_down()
-    print(",".join(off))
+    print(",".join(str(i) for i in sorted(off)))
 except Exception:
     print("unknown")
 PY
@@ -146,10 +167,49 @@ PY
   esac
 }
 
+# Running on a card someone else is using both disturbs them and gives us
+# contaminated numbers, so refuse on both counts: reserved list, and live occupancy.
+check_gpu_free() {
+  case ",$RESERVED_GPUS," in
+    *",$GPU,"*)
+      echo "!! GPU $GPU 在保留列表里（RESERVED_GPUS=$RESERVED_GPUS），别人在用。" >&2
+      echo "   换一张：GPU=<n> $0 ...   或临时放开：RESERVED_GPUS= $0 ..." >&2
+      exit 4 ;;
+  esac
+  # An idle MI308X sits at ~284 MB VRAM and 0% gfx.  Anything clearly above that
+  # is someone else's job -- their work perturbs our timing and ours perturbs theirs.
+  local state
+  state="$(python3 - "$GPU" <<'PY' 2>/dev/null
+import sys
+try:
+    from amdsmi import (amdsmi_init, amdsmi_shut_down, amdsmi_get_processor_handles,
+                        amdsmi_get_gpu_activity, amdsmi_get_gpu_vram_usage)
+    amdsmi_init()
+    h = amdsmi_get_processor_handles()[int(sys.argv[1])]
+    gfx = amdsmi_get_gpu_activity(h).get("gfx_activity", 0)
+    used = amdsmi_get_gpu_vram_usage(h).get("vram_used", 0)
+    amdsmi_shut_down()
+    print(f"{gfx} {used}")
+except Exception:
+    print("unknown")
+PY
+)"
+  [ "$state" = unknown ] && { echo "!! 查不到 GPU $GPU 的占用状态，继续跑，但请自行确认" >&2; return 0; }
+  local gfx used
+  read -r gfx used <<< "$state"
+  if [ "${gfx:-0}" -gt 5 ] || [ "${used:-0}" -gt 2000 ]; then
+    echo "!! GPU $GPU 正被占用：gfx ${gfx}%，显存 ${used} MB（空闲基线约 284 MB）。" >&2
+    echo "   别人的负载会污染这批测量，我们的也会打扰他们。换一张空闲的卡。" >&2
+    echo "   确实要挤着跑，加 --no-gpu-check。" >&2
+    exit 4
+  fi
+}
+
 REPEATS=3
 WANT_KERNELS=0
 WANT_COUNTERS=0
 SKIP_PTL_CHECK=0
+SKIP_GPU_CHECK=0
 CHOSEN=()
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -157,6 +217,7 @@ while [ $# -gt 0 ]; do
     --kernels) WANT_KERNELS=1; shift ;;
     --counters) WANT_COUNTERS=1; shift ;;
     --no-ptl-check) SKIP_PTL_CHECK=1; shift ;;
+    --no-gpu-check) SKIP_GPU_CHECK=1; shift ;;
     --list)
       printf '%-8s %-6s %s\n' stage config description
       for s in "${STAGES[@]}"; do
@@ -175,6 +236,7 @@ for id in "${CHOSEN[@]}"; do
   stage_row "$id" >/dev/null || { echo "unknown stage '$id'" >&2; usage; exit 2; }
 done
 
+[ "$SKIP_GPU_CHECK" = 1 ] || check_gpu_free
 [ "$SKIP_PTL_CHECK" = 1 ] || check_ptl
 
 mkdir -p "$RESULTS"

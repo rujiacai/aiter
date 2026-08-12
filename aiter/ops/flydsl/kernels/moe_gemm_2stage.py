@@ -2571,6 +2571,15 @@ def compile_moe_gemm2(
                 f"total_threads={total_threads} / tile_m={tile_m}"
             )
 
+    # Drop the redundant modulo `idx2crd` emits for the B index split
+    # (see `_n_blk_intra`).
+    _fastidx = os.environ.get("FLYDSL_MOE_STAGE2_FASTIDX", "0") in (
+        "1",
+        "true",
+        "True",
+        "YES",
+        "yes",
+    )
     # Row padding for lds_out, in output elements.  Without it a row stride of
     # tile_n*2 = 256 B is an exact multiple of the 32x4 B bank array, so any access
     # pattern that walks *rows* at a fixed column lands every lane on the same
@@ -3107,6 +3116,24 @@ def compile_moe_gemm2(
                 # lane/16*4 (+0..3), but the B *operand* layout is unchanged, so
                 # col_g_list must stay as-is for n_blk/n_intra addressing.
                 col_g_bf_list = []
+
+                def _n_blk_intra(row):
+                    """Split `row` into (row / 16, row % 16) for the B layout.
+
+                    `idx2crd` lowers the leading coordinate to
+                    `(row / 16) % c_n0_static`.  c_n0_static is
+                    experts*model_dim/16, not a power of two, so that modulo
+                    becomes a magic-number sequence (mul_hi/shift/mul/sub, ~6
+                    VALU) instead of the single shift the division needs.  The
+                    modulo is a no-op: row is expert_off_idx + col_g, which is
+                    bounded by experts*model_dim, so the quotient never reaches
+                    c_n0_static -- the compiler just cannot see that bound.
+                    """
+                    if _fastidx:
+                        return row // fx.Index(16), row % fx.Index(16)
+                    coord = fx.idx2crd(row, layout_n_blk_intra)
+                    return fx.get(coord, 0), fx.get(coord, 1)
+
                 for ni in range_constexpr(num_acc_n):
                     offset = arith.index(ni * 16)
                     col_g = by_n + n_tile_base + offset + lane_mod_16
@@ -3116,10 +3143,9 @@ def compile_moe_gemm2(
                             by_n + n_tile_base + offset + lane_div_16 * fx.Index(4)
                         )
 
-                    row_w = expert_off_idx + col_g
-                    coord_w = fx.idx2crd(row_w, layout_n_blk_intra)
-                    n_blk_list.append(fx.get(coord_w, 0))
-                    n_intra_list.append(fx.get(coord_w, 1))
+                    n_blk, n_intra = _n_blk_intra(expert_off_idx + col_g)
+                    n_blk_list.append(n_blk)
+                    n_intra_list.append(n_intra)
 
                 # Compute (n_blk, n_intra) lists for an ARBITRARY N-tile index (used by
                 # the persist cross-N-tile W2 prefetch to load the next N-tile's B).
@@ -3129,9 +3155,9 @@ def compile_moe_gemm2(
                     _nil = []
                     for ni in range_constexpr(num_acc_n):
                         _cg = _byn + n_tile_base + arith.index(ni * 16) + lane_mod_16
-                        _cw = fx.idx2crd(expert_off_idx + _cg, layout_n_blk_intra)
-                        _nbl.append(fx.get(_cw, 0))
-                        _nil.append(fx.get(_cw, 1))
+                        _nb, _nin = _n_blk_intra(expert_off_idx + _cg)
+                        _nbl.append(_nb)
+                        _nil.append(_nin)
                     return _nbl, _nil
 
                 m_repeat = tile_m // 16
