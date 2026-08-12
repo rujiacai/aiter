@@ -2580,6 +2580,20 @@ def compile_moe_gemm2(
         "YES",
         "yes",
     )
+
+    # Treat the weight scale as constant over an expert's channels, which lets
+    # the whole epilogue scale collapse to one scalar per row (see `_sw_scalar`).
+    # Caller-checked, not kernel-checked: the host expands a per-tensor or
+    # per-expert scale into a full [experts*model_dim] buffer before we see it,
+    # so a genuinely per-channel scale is indistinguishable here and would be
+    # silently wrong -- flydsl_moe_stage2 asserts on the un-expanded tensor.
+    _wscalar = os.environ.get("FLYDSL_MOE_STAGE2_SCALAR_WSCALE", "0") in (
+        "1",
+        "true",
+        "True",
+        "YES",
+        "yes",
+    )
     # Row padding for lds_out, in output elements.  Without it a row stride of
     # tile_n*2 = 256 B is an exact multiple of the 32x4 B bank array, so any access
     # pattern that walks *rows* at a fixed column lands every lane on the same
@@ -2749,6 +2763,13 @@ def compile_moe_gemm2(
             "FLYDSL_MOE_STAGE2_BFIRST currently requires the CShuffle epilogue with "
             "FLYDSL_MOE_STAGE2_SCALAR_ASCALE=1 and FLYDSL_MOE_STAGE2_VEC_SCALE=1 "
             "(f16/bf16 output). Other epilogue variants still assume A-first."
+        )
+    if _wscalar and not (_bfirst and _vec_scale):
+        raise ValueError(
+            "FLYDSL_MOE_STAGE2_SCALAR_WSCALE currently requires "
+            "FLYDSL_MOE_STAGE2_BFIRST=1 and FLYDSL_MOE_STAGE2_VEC_SCALE=1: it "
+            "rewrites the B-first vector scale chain, the other epilogue "
+            "variants build their scale differently."
         )
 
     if True:
@@ -3415,7 +3436,10 @@ def compile_moe_gemm2(
                     if prefetch_epilogue:
                         expert_off_pf = expert_off_idx
                         sw_pf = []
-                        for ni in range_constexpr(num_acc_n):
+                        # Under `_wscalar` the scale does not vary with the
+                        # channel, so the epilogue loads it once itself and
+                        # these per-N-tile loads have nothing to prefetch.
+                        for ni in range_constexpr(0 if _wscalar else num_acc_n):
                             if _bfirst:
                                 # B-first: this lane owns 4 *consecutive* channels
                                 # per acc, so the weight scales are one 4-wide load
@@ -4047,7 +4071,7 @@ def compile_moe_gemm2(
                     sw_vals = sw_pf
                 else:
                     sw_vals = []
-                    for ni in range_constexpr(num_acc_n):
+                    for ni in range_constexpr(0 if _wscalar else num_acc_n):
                         if _bfirst:
                             # 4 consecutive channels per acc -> one 4-wide load.
                             row_w_idx = expert_off + col_g_bf_list[ni]
@@ -4246,9 +4270,37 @@ def compile_moe_gemm2(
                     # issues 5 muls per (mi, ii) = 80; this form issues 2 (sx*sw) +
                     # 16 (tw_vec*sw) + 16 (acc*scale) = 34.
                     _vec_scale_cache = {}
+                    _svec_cache = {}
+
+                    # Per-tensor / per-expert weight scale: every channel of this
+                    # expert holds the same number, so one scalar load replaces the
+                    # 4-wide per-N-tile loads, and sx*sw folds into a single scalar
+                    # for the whole kernel instead of a vector per N-tile.  What is
+                    # left per row is `sx*sw*tw`, still a scalar -- so the epilogue
+                    # goes from two vector multiplies per output (build the
+                    # per-(row, channel) scale, then apply it) down to one.
+                    # A workgroup keeps one expert for the whole persist N-loop and
+                    # both factors are per-tensor, so this is one load and one
+                    # multiply for the entire kernel rather than per N-tile.
+                    _sx_sw = _pf_hoist.get("sx_sw") if (_wscalar and _hoist_pf) else None
+                    if _wscalar and _sx_sw is None:
+                        _sw_scalar = (
+                            fx.Float32(1.0)
+                            if not needs_scale_w
+                            else buffer_ops.buffer_load(
+                                sw_rsrc, expert_off, vec_width=1, dtype=T.f32
+                            )
+                        )
+                        _sx_sw = (
+                            sx_scalar * _sw_scalar
+                            if sx_scalar is not None
+                            else _sw_scalar
+                        )
+                        if _hoist_pf:
+                            _pf_hoist["sx_sw"] = _sx_sw
 
                     _sw_x = None
-                    if _vec_scale and sx_scalar is not None:
+                    if _vec_scale and sx_scalar is not None and not _wscalar:
                         # sx*sw folded once per N-tile, then splatted so the per-row
                         # product below is a vector op rather than 4 scalar ones.
                         # Under B-first sw_vals[ni] is already a 4-channel vector,
@@ -4277,6 +4329,34 @@ def compile_moe_gemm2(
                         key = (bool(_epi["masked"]), mi, ni)
                         got = _vec_scale_cache.get(key)
                         if got is None:
+                            if _wscalar:
+                                # Scale is one scalar per row; ni does not enter it.
+                                skey = (bool(_epi["masked"]), mi)
+                                svec = _svec_cache.get(skey)
+                                if svec is None:
+                                    s = _sx_sw
+                                    if doweight_stage2:
+                                        tw = (
+                                            tw_pf[mi]
+                                            if tw_pf is not None
+                                            else buffer_ops.buffer_load(
+                                                sorted_w_rsrc,
+                                                row,
+                                                vec_width=1,
+                                                dtype=T.f32,
+                                            )
+                                        )
+                                        s = s * tw
+                                    svec = vector.from_elements(
+                                        T.vec(4, T.f32), [s] * 4
+                                    )
+                                    _svec_cache[skey] = svec
+                                a = acc[mi * num_acc_n + ni]
+                                if is_int8:
+                                    a = arith.sitofp(T.vec(4, T.f32), a)
+                                got = a * svec
+                                _vec_scale_cache[key] = got
+                                return got
                             if doweight_stage2:
                                 if _bfirst:
                                     tw = (

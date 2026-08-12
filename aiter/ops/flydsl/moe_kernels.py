@@ -2040,6 +2040,26 @@ def flydsl_moe_stage2(
                 "wrong results (cos ~0.956); unset the knob for this quant type."
             )
 
+    # FLYDSL_MOE_STAGE2_SCALAR_WSCALE is the same bargain for the weight scale: it
+    # holds only while that scale is constant across an expert's channels, i.e.
+    # per-tensor (numel 1) or per-expert (numel E).  `_expand_per_tensor_scale`
+    # below materialises either of those into a full [E*model_dim] buffer, so by
+    # the time the kernel sees it a genuinely per-channel scale looks identical
+    # and the knob would quietly scale every channel by whichever value happens
+    # to sit at the expert's first column.  Check while the compact tensor is
+    # still around.
+    if os.environ.get("FLYDSL_MOE_STAGE2_SCALAR_WSCALE", "0") in (
+        "1", "true", "True", "YES", "yes"
+    ):
+        _n = 0 if w2_scale is None else w2_scale.numel()
+        if _n not in (1, E):
+            raise ValueError(
+                "FLYDSL_MOE_STAGE2_SCALAR_WSCALE assumes a per-tensor or "
+                f"per-expert weight scale, but w2_scale has {_n} elements "
+                f"(experts={E}, model_dim={model_dim}). On a per-channel scale it "
+                "would silently produce wrong results; unset the knob."
+            )
+
     # FLYDSL_MOE_STAGE2_NO_MASK drops the masked epilogue instead of selecting it at
     # runtime.  That is only sound on the sorted-row partial layout: there a padding
     # row's store lands on a row of the padded buffer that the reduce never gathers, so

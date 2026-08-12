@@ -49,6 +49,7 @@ STAGES=(
   "f4|old|删掉掩码 epilogue：sorted 行布局下 padding 行的写无害，整条掩码路径是死代码|FLYDSL_MOE_STAGE2_NO_MASK=1"
   "f5|old|CShuffle 两端一起加宽：B-first 让 Step1 写 b64 + nlane 随 e_vec 收窄让 Step2 存 dwordx4，配 LDSPAD=4 解 bank 冲突|FLYDSL_MOE_STAGE2_BFIRST=1 FLYDSL_MOE_STAGE2_NLANE_FIT=1 FLYDSL_MOE_STAGE2_EVEC=8 FLYDSL_MOE_STAGE2_LDSPAD=4"
   "f6|old|去掉 B 下标拆分里的恒等取模：idx2crd 对非 2 幂的 experts*model_dim/16 会发 magic-number 取模，换成显式移位/掩码|FLYDSL_MOE_STAGE2_FASTIDX=1"
+  "f7|old|per-tensor 权重 scale 塌缩成标量：整条 scale 链降成每行一个标量，epilogue 每个输出从两次向量乘变一次|FLYDSL_MOE_STAGE2_SCALAR_WSCALE=1"
   "target|new|新内核 pr1x4 + Triton 归约（目标）|!AITER_PR1X4_TRITON_REDUCE=1"
 )
 
@@ -69,6 +70,7 @@ ALL_KNOBS=(
   FLYDSL_MOE_STAGE2_LDSPAD
   FLYDSL_MOE_STAGE2_NLANE_FIT
   FLYDSL_MOE_STAGE2_FASTIDX
+  FLYDSL_MOE_STAGE2_SCALAR_WSCALE
   AITER_PR1X4_TRITON_REDUCE
   AITER_LOG_MORE
 )
