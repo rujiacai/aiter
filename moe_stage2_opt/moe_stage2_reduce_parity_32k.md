@@ -9,9 +9,10 @@
 本文是一份**进行中的优化记录**，不是一次性的对比报告。结构是：
 
 - 第一章说明测试怎么做、起点和目标各是多少；
-- 之后**每章一个 feature**（二~五），记录它做了什么、值多少、为什么；
+- 之后**每章一个 feature**（二~五 = f1~f4，八 = f5），记录它做了什么、值多少、为什么；
 - 第六章是汇总表，e2e 和逐算子两个口径，每加一个 feature 一行；
-- 第七章是 trace 分析：四个 feature 之后，离 target 还剩什么；
+- 第七章是 trace 分析：f4 之后离 target 还剩什么——**它直接产出了第八章的 f5**，
+  所以那一章的几处判断被后面的实测修正了，正文都标了出来；
 - 最后一章是怎么复现。
 
 目标是在**旧内核**上一个 feature 一个 feature 地加，直到追平新内核。
@@ -115,7 +116,7 @@ stage2 GEMM 一个就占了一半，所以优化都围绕它。
 旧 epilogue 里，每个输出行要先从 LDS 取回 `moe_sorting` 打包的 sorted id，
 再从里面解出 token 号 `t` 和 topk 槽号 `s`：
 
-```4179:4182:aiter/ops/flydsl/kernels/moe_gemm_2stage.py
+```4513:4516:aiter/ops/flydsl/kernels/moe_gemm_2stage.py
                     def precompute_row(*, row_local, row):
                         fused2 = memref.load(lds_tid, [row_local])
                         t = fused2 & mask24_i32
@@ -127,7 +128,7 @@ stage2 GEMM 一个就占了一半，所以优化都围绕它。
 **消费者一：算存储地址。** partial 缓冲的布局是 `(token, topk, model_dim)`，
 所以行号必须是 `t*topk + s`：
 
-```4223:4226:aiter/ops/flydsl/kernels/moe_gemm_2stage.py
+```4557:4560:aiter/ops/flydsl/kernels/moe_gemm_2stage.py
                             else:
                                 row_byte_base = out_base_idx + ts_idx * fx.Index(
                                     model_dim * out_elem_bytes
@@ -137,7 +138,7 @@ stage2 GEMM 一个就占了一半，所以优化都围绕它。
 **消费者二：算存储谓词。** `moe_sorting` 把每个专家补齐到 `block_m` 的倍数，
 补出来的行填的是哨兵值，写出去会污染真实数据，所以每行要查三个条件：
 
-```4183:4197:aiter/ops/flydsl/kernels/moe_gemm_2stage.py
+```4517:4528:aiter/ops/flydsl/kernels/moe_gemm_2stage.py
                         if _epi["masked"]:
                             row_i32 = arith.index_cast(T.i32, row)
                             row_valid0 = arith.cmpi(
@@ -169,7 +170,7 @@ FLYDSL_MOE_STAGE2_FASTVALID=1           # 砍掉消费者二
 partial 缓冲改成**一行一个 sorted slot**，行号直接就是 sorted 行号 `row`，
 而 `row = bx_m + row_in_tile` 纯粹来自 block/线程下标，**不需要读 LDS**：
 
-```4215:4222:aiter/ops/flydsl/kernels/moe_gemm_2stage.py
+```4549:4556:aiter/ops/flydsl/kernels/moe_gemm_2stage.py
                             elif _SORTED_PARTIAL:
                                 # Partial rows keep sorted order, so a workgroup's stores
                                 # cover one contiguous row range instead of scattering over
@@ -183,7 +184,7 @@ partial 缓冲改成**一行一个 sorted slot**，行号直接就是 sorted 行
 host 侧要跟着换三样东西。缓冲按 sorted 行数（含 padding）而不是 `token*topk` 开，
 并额外建一张反查表：
 
-```2123:2140:aiter/ops/flydsl/moe_kernels.py
+```2142:2159:aiter/ops/flydsl/moe_kernels.py
     if not accumulate:
         if _stage2_sorted_partial():
             # Sorted-row layout: one partial row per sorted (token, slot) slot,
@@ -206,7 +207,7 @@ host 侧要跟着换三样东西。缓冲按 sorted 行数（含 padding）而�
 
 归约也跟着从"每 token 的 9 行连续相加"换成"按反查表 gather 再相加"：
 
-```2220:2232:aiter/ops/flydsl/moe_kernels.py
+```2239:2251:aiter/ops/flydsl/moe_kernels.py
         if _sorted_partial_loc is not None:
             # Sorted-row partials are not contiguous per token; gather through the
             # inverted index instead of the plain topk-slab sum.
@@ -230,7 +231,7 @@ host 侧要跟着换三样东西。缓冲按 sorted 行数（含 padding）而�
 padding 行写进 partial 缓冲是**无害的**——归约按反查表取，根本不会碰到那些行。
 所以掩码可以整个去掉：
 
-```4195:4197:aiter/ops/flydsl/kernels/moe_gemm_2stage.py
+```4529:4531:aiter/ops/flydsl/kernels/moe_gemm_2stage.py
                         else:
                             # fast-valid block: every row stores unconditionally.
                             row_valid = None
@@ -238,8 +239,8 @@ padding 行写进 partial 缓冲是**无害的**——归约按反查表取，�
 
 这不是精度换性能。编译期把两条 epilogue 都编进去，运行时选一条：
 
-```4321:4354:aiter/ops/flydsl/kernels/moe_gemm_2stage.py
-                    if _fast_valid_block:
+```4668:4674:aiter/ops/flydsl/kernels/moe_gemm_2stage.py
+                    elif _fast_valid_block:
                         # blk_all_valid is uniform across the workgroup (depends only on
                         # bx_m). moe_sorting pads each expert to a tile_m multiple, so
                         # sentinel padding only ever occupies a block's tail rows. Hence
@@ -592,7 +593,7 @@ v_mul_f32_e32 v47, v22, v47   ; acc * scale   (ni=1)
 
 per-tensor 时那个数组里每个元素都一样，读一次就够：
 
-```2785:2790:aiter/ops/flydsl/kernels/moe_gemm_2stage.py
+```2912:2917:aiter/ops/flydsl/kernels/moe_gemm_2stage.py
             # Per-tensor activation scale: one load for the whole workgroup.
             sx_scalar = None
             if _scalar_ascale and sx_rsrc is not None:
@@ -783,7 +784,7 @@ X 那一项尤其反直觉：persist 的设计初衷就是"X 装进 LDS 一次�
 一次（`is_first_ntile`），但**读回**每个 N-tile 都重做，而三个地址参数
 `row_a_lds` / `col_offset_base_bytes` / k-tile 的 LDS 基址全都不含 N-tile 分量：
 
-```3589:3597:aiter/ops/flydsl/kernels/moe_gemm_2stage.py
+```3764:3772:aiter/ops/flydsl/kernels/moe_gemm_2stage.py
                         _lbk = arith.index(_kk * _lds_tile_elems_py)
                         _a0p = lds_load_packs_k64(
                             row_a_lds, col_offset_base_bytes, _lbk
@@ -1087,86 +1088,90 @@ if os.environ.get("FLYDSL_MOE_STAGE2_NO_MASK", "0") in (...):
 
 ### 6.1 e2e 阶梯
 
-3 次取中位，全距 <0.3%，全部 `pass=True` / `cos=0.999995`。
-**六档同一 session**（`20260807-093220`，GPU 4，PTL 开——PTL 是什么、为什么必须确认，见 1.2）。
+5 次取中位，全距 <0.3%，全部 `pass=True` / `cos=0.999995`。
+**七档同一 session**（`20260811-171959`，**GPU 0**，PTL 开——PTL 是什么、为什么必须确认，见 1.2）。
 
 | stage | e2e (us) | 本 feature | 累计 | 已补上差距 | 说明 |
 |---|---|---|---|---|---|
-| `base` | **7818.3** | — | — | 0% | 旧内核 reduce，未改动 |
-| `f1` | **7032.6** | −785.7 | −785.7 | **48.3%** | sorted-row 输出路径 |
-| `f2` | **6802.9** | −229.7 | −1015.4 | **62.4%** | 拆掉 epilogue 的逐行标量链 |
-| `f3` | **6493.7** | −309.3 | −1324.6 | **81.4%** | 循环不变量外提 + 输出宽度 |
-| `f4` | **6457.1** | −36.6 | −1361.3 | **83.7%** | 删掉掩码 epilogue |
+| `base` | **7796.0** | — | — | 0% | 旧内核 reduce，未改动 |
+| `f1` | **6970.9** | −825.2 | −825.2 | **51.1%** | sorted-row 输出路径 |
+| `f2` | **6733.9** | −237.0 | −1062.1 | **65.7%** | 拆掉 epilogue 的逐行标量链 |
+| `f3` | **6426.8** | −307.1 | −1369.2 | **84.7%** | 循环不变量外提 + 输出宽度 |
+| `f4` | **6372.0** | −54.8 | −1424.1 | **88.1%** | 删掉掩码 epilogue |
+| `f5` | **6281.2** | −90.8 | −1514.8 | **93.7%** | CShuffle 两端一起加宽（第八章） |
 | *(下一个 feature)* | | | | | |
-| `target` | **6192.0** | — | −1626.3 | 100% | 新内核 pr1x4 + Triton 归约 |
+| `target` | **6179.9** | — | −1616.1 | 100% | 新内核 pr1x4 + Triton 归约 |
 
-**当前离目标还差 265.1 us（1.043×）。**
+**当前离目标还差 101.3 us（1.016×）。**
+
+> 从 GPU 4 换到 GPU 0 是因为 4~7 被别人占用了。绝对值因此和早先几个 session 有 1~2% 的
+> 卡间差异（见 7.1），比例不受影响。`run.sh` 现在会自己拦保留卡和被占用的卡。
 
 > **f3 和 f4 的收益不能相加，阶梯必须按这个顺序读。** 两者次可加（交互 +71.4，见 5.4）：
 > 换成先做 f4 的话，f4 是 −122.6 而 f3 只剩 −97.7。表里的数都是"在前一档之上"。
 
 按每 wave 指令数（这才是和时间同向的量，但只对**执行到的**指令成立，见 5.3）：
 
-| | base | f2 | f3 | f4 | target | 剩余缺口 |
-|---|---|---|---|---|---|---|
-| VALU | 12,867 | 6,731 | 5,534 | **4,749** | 3,886 | 863 |
-| LDS | 2,011 | 1,645 | 1,190 | **1,150** | 391 | **759** |
-| SALU | 2,123 | 703 | 588 | **228** | 136 | 92 |
-| VMEM 读 | 1,297 | 828 | 312 | **311** | 198 | 113 |
-| VMEM 写 | 492 | 492 | 246 | **251** | 125 | 126 |
-| MFMA | 1,504 | 1,504 | 1,504 | 1,504 | 1,504 | 0 |
-| **合计** | **20,293** | **11,902** | **9,374** | **8,193** | **6,240** | **1,953** |
+| | base | f2 | f3 | f4 | **f5** | target | f5 剩余缺口 |
+|---|---|---|---|---|---|---|---|
+| VALU | 12,867 | 6,731 | 5,534 | 4,749 | **5,461** | 3,886 | **1,575** |
+| LDS | 2,011 | 1,645 | 1,190 | 1,150 | **274** | 391 | **−117** |
+| SALU | 2,123 | 703 | 588 | 228 | **241** | 136 | 105 |
+| VMEM 读 | 1,297 | 828 | 312 | 311 | **299** | 198 | 101 |
+| VMEM 写 | 492 | 492 | 246 | 251 | **125** | 125 | **0** |
+| MFMA | 1,504 | 1,504 | 1,504 | 1,504 | 1,504 | 1,504 | 0 |
+| **合计** | **20,293** | **11,902** | **9,374** | **8,193** | **7,904** | **6,240** | **1,664** |
 
-剩下的 1,953 条里，**LDS 的 759 基本就是那 1024 条 `ds_write_b16`**（7.5 的累加器朝向），
-VALU 的 863 里也有约一半是配套的逐元素打包——这两项同一个根因，就是第七章的候选 C。
+f4 那一列的两个大缺口（LDS 759、VALU 863）**f5 全动了**，但方向相反：
+
+- **LDS 1,150 → 274，已经低于 target 的 391**（−117）
+- **VMEM 写 251 → 125，与 target 精确相等**
+- **VALU 4,749 → 5,461，反而涨了 712**
+
+净指令 −289，时间 −119 us（GEMM 口径）。代价是**剩余缺口的构成彻底变了**：
+1,664 条里 VALU 独占 **1,575（95%）**，其余四项加起来只剩 89 条。
+访存和 LDS 这两条线已经走到头，第八章解释了 VALU 为什么涨、以及它是不是还能降。
 
 ### 6.2 逐算子阶梯
 
 `AITER_LOG_MORE=1` 的 `device_time_avg`，us/次，与 6.1 同一 session。`-` 表示该 stage 不跑这个 kernel。
 
-| kernel | base | f1 | f2 | f3 | f4 | target |
-|---|---|---|---|---|---|---|
-| `moe_gemm2_0`（旧 stage2 GEMM） | **3794.2** | **2838.3** | **2571.3** | **2229.1** | **2161.0** | — |
-| `moe_2stage_down_prefill_1x4_0`（新 stage2 GEMM） | — | — | — | — | — | **1761.2** |
-| `ck::kernel_moe_gemm`（stage1） | 2420.8 | 2498.4 | 2521.3 | 2550.3 | 2559.6 | 2653.1 |
-| `_topk_sum_kernel`（归约，slab 布局） | 730.4 | — | — | — | — | — |
-| `_topk_sum_gather_kernel`（归约，sorted 布局） | — | 769.7 | 770.0 | 770.5 | 771.7 | 816.8 |
-| `_invert_sorted_ids_kernel` / `invert_sorted_ids_kernel_0` | — | 9.9 | 9.9 | 9.9 | 9.9 | 10.2 |
-| `_quant_from_per_tensor_amax_kernel` | 462.7 | 471.1 | 473.4 | 476.6 | 477.2 | 486.1 |
-| `at::native::vectorized_elementwise_kernel`（各变体合计） | 154.6 | 146.5 | 147.8 | 148.2 | 171.0 | 165.2 |
-| `aiter::scaled_quant_kernel` | 117.9 | 118.9 | 119.8 | 119.6 | 119.9 | 120.9 |
-| `aiter::data_to_scale_kernel` | 91.8 | 92.3 | 91.8 | 92.5 | 92.5 | 92.1 |
-| `_per_tensor_amax_kernel` | 52.9 | 54.1 | 54.6 | 54.8 | 55.0 | 55.9 |
-| `scatter_kernel_0` | 33.4 | 35.0 | 35.8 | 36.3 | 36.5 | 38.0 |
-| `count_kernel_0` | 17.2 | 17.7 | 17.8 | 18.0 | 18.1 | 18.6 |
-| `_fused_init_kernel` | 5.8 | 5.9 | 5.8 | 5.9 | 5.9 | — |
-| `aiter::initializeScale` | 4.9 | 5.1 | 5.0 | 5.1 | 5.3 | 5.3 |
-| `cumsum_kernel_0` | 4.6 | 4.7 | 4.8 | 4.9 | 4.9 | 5.0 |
-| **合计** | **7891.2** | **7067.6** | **6829.1** | **6521.7** | **6488.5** | **6228.4** |
+| kernel | base | f1 | f2 | f3 | f4 | **f5** | target |
+|---|---|---|---|---|---|---|---|
+| `moe_gemm2_0`（旧 stage2 GEMM） | **3784.0** | **2808.8** | **2551.6** | **2206.0** | **2140.8** | **2021.7** | — |
+| `moe_2stage_down_prefill_1x4_0`（新 stage2 GEMM） | — | — | — | — | — | — | **1753.7** |
+| `ck::kernel_moe_gemm`（stage1） | 2418.5 | 2486.4 | 2509.7 | 2534.0 | 2540.5 | 2564.9 | 2630.3 |
+| `_topk_sum_kernel`（归约，slab 布局） | 723.5 | — | — | — | — | — | — |
+| `_topk_sum_gather_kernel`（归约，sorted 布局） | — | 744.4 | 745.1 | 746.0 | 746.4 | 747.3 | 793.0 |
+| `_invert_sorted_ids_kernel` / `invert_sorted_ids_kernel_0` | — | 9.8 | 9.8 | 9.8 | 9.9 | 10.0 | 10.2 |
+| `_quant_from_per_tensor_amax_kernel` | 462.2 | 467.4 | 471.0 | 473.1 | 474.6 | 476.3 | 482.6 |
+| 其余小算子合计 | 482.8 | 501.6 | 503.0 | 494.0 | 505.3 | 484.6 | 501.6 |
+| **合计** | **7871.0** | **7018.4** | **6790.2** | **6462.9** | **6417.5** | **6304.8** | **6171.4** |
 
-只看 stage2 GEMM 这一行：**3794.2 → 2838.3 → 2571.3 → 2229.1 → 2161.0 → 1761.2**，
-即 f1 **−955.9**、f2 **−267.0**、f3 **−342.2**、f4 **−68.1**，**剩余 399.8 us（1.227×）**。
+只看 stage2 GEMM 这一行：**3784.0 → 2808.8 → 2551.6 → 2206.0 → 2140.8 → 2021.7 → 1753.7**，
+即 f1 **−975.2**、f2 **−257.2**、f3 **−345.6**、f4 **−65.2**、f5 **−119.1**，
+**剩余 268.0 us（1.153×）**。
 
-注意这个口径下的剩余差距（399.8 us）比 e2e 口径（265.1 us）**大**，因为 stage1
-在 target 那一档反而更慢，e2e 上把 GEMM 的真实差距抵掉了一部分。
+注意这个口径下的剩余差距（268.0 us）比 e2e 口径（101.3 us）**大得多**，因为 target 那一档的
+stage1 慢 65 us、归约慢 46 us，e2e 上把 GEMM 的真实差距抵掉了一大半。**归因看这张表。**
 
 ### 6.3 三条需要留意的读数
 
-**stage1 在五档下是 2425.1 / 2506.2 / 2534.0 / 2547.9 / 2666.1**——同一个 CK kernel、同一组
-参数、同一 session，却单调递增了 9.9%。`target` 那一档多分配了 2.34 GB 的 padded 中间缓冲，
-怀疑是 HBM 页面放置的副作用。这意味着 e2e 层面有约 241 us **不能算到 stage2 头上**；
-做 feature 归因时以 6.2 的 stage2 GEMM 那一行为准，e2e 只作为总账。
+**stage1 在七档下是 2418.5 / 2486.4 / 2509.7 / 2534.0 / 2540.5 / 2564.9 / 2630.3**——
+同一个 CK kernel、同一组参数、同一 session，却单调递增了 8.8%。`target` 那一档多分配了
+2.34 GB 的 padded 中间缓冲，怀疑是 HBM 页面放置的副作用。这意味着 e2e 层面有约 212 us
+**不能算到 stage2 头上**；做 feature 归因时以 6.2 的 stage2 GEMM 那一行为准，e2e 只作为总账。
 
-f2 和 f3 都是现成的例子：e2e 分别降 239.7 / 214.2，stage2 GEMM 实降 261.5 / 246.6。
-差额里一半是 stage1 的漂移（+27.8 / +13.9），其余是七八个小算子每个涨零点几 us 累出来的。
-**单看 e2e 会把每个 feature 低估约一成。**
+**f5 是最极端的例子**：e2e 只降 90.8，stage2 GEMM 实降 119.1，差了 28.3。而在总账上，
+f5 到 target 的 e2e 差距只剩 101.3，GEMM 差距却有 268.0——**e2e 把差距少算了 62%**。
+只看 e2e 会以为快追平了，实际 GEMM 本体还有 1.153×。
 
-**归约在 sorted 布局下比 slab 布局贵 64 us**（729.9 → 783.9 + 9.9）。这是 Feature 1 的固有代价，
-已经算进那 −957.4 里了。新内核付的是同一笔（817.3 + 10.6）。
+**归约在 sorted 布局下比 slab 布局贵 30.7 us**（723.5 → 744.4 + 9.8）。这是 Feature 1 的固有
+代价，已经算进那 −975.2 里了。新内核付的是同一笔，而且更贵（793.0 + 10.2 = 803.2）。
 
-**逐算子合计比 e2e 高 7~62 us**（五档都是）。这不是矛盾：逐算子那一遍开着 `AITER_LOG_MORE`，
-ROCTracer 的开销把每个 kernel 都抬高了约 0.5%（见 1.2）。所以**绝对值看 6.1，构成看 6.2**，
-两张表之间不要做减法。
+**逐算子合计和 e2e 差 −8 ~ +75 us**。这不是矛盾：逐算子那一遍开着 `AITER_LOG_MORE`，
+ROCTracer 的开销把每个 kernel 都抬高约 0.5%，而 e2e 那一遍是干净的（见 1.2）。
+所以**绝对值看 6.1，构成看 6.2**，两张表之间不要做减法。
 
 ---
 
@@ -1285,10 +1290,18 @@ opcode 直方图把问题摊得很平：
 
 - **VMEM 写 126**：f3 的 `EVEC=4` 已经把宽度从 4 B 提到 8 B（`buffer_store_dwordx2`），
   再往上要 `e_vec=8`，而那需要 `tile_n=256`——实测慢 302.7 us，见 4.4 里那条证伪记录。
+
+  > **这一条被 f5 推翻了。** `e_vec=8` 不是非要 `tile_n=256` 不可——约束是
+  > `tile_n % (cshuffle_nlane × e_vec) == 0`，把**写死的 `cshuffle_nlane` 从 32 降到 16**
+  > 同样能满足，而且不用动 tile。当时只想到了抬 `tile_n` 这一条路。详见 8.2。
 - **VMEM 读 113**：f3 的外提之后只剩真正每 N-tile 都不同的量（`sw_pf` 的逐列权重 scale）。
 - **SALU 92**：f4 删掉掩码路径后从 588 掉到 228，剩下的是地址基址和循环控制。
 
 ### 7.6 候选：只剩一条，而且它就是架构分界线
+
+> **本节的判断被 f5 部分推翻了**：候选 C 做出来了（第八章），LDS 缺口不但补上还反超 target；
+> 但"改动量大"是对的，而且它单独做**基本打平**，必须配合另一个当时没看见的旋钮
+> （`cshuffle_nlane`）才有收益。原文保留如下。
 
 | 候选 | 能省的指令（每 wave） | 改动量 | 状态 |
 |---|---|---|---|
@@ -1360,6 +1373,8 @@ LDS 从 28928 降到 20736、理论允许从 8 涨到 12 waves，**实测 occupa
 
 ### 7.8 一个需要正视的判断
 
+> **这一节写于 f4 之后，f5 已经把它的核心判断推翻了一半。** 保留原文，修正见第八章末尾。
+
 四个 feature 拿到了 **1,626 us 里的 1,361 us（83.7%）**，stage2 GEMM 上是
 3794.2 → 2161.0（**1.76×**）。剩下的 **399.8 us（GEMM 口径）全部压在一个根因上**：
 累加器朝向决定了 epilogue 只能一次写 2 个字节，而它同时拖着 LDS 和 VALU 两项缺口。
@@ -1372,9 +1387,515 @@ C1 那条"只转置 LDS 布局"是唯一还没试过的局部手段，值得做�
 sorted-row 输出布局、per-tensor scale 提到入口、缩放按 f32x4 向量化、per-block 描述符、
 循环不变量的 emit 时缓存、以及"布局一变，整条掩码路径就成了死代码"这个观察。
 
-## 八、怎么跑
+---
 
-### 8.1 驱动脚本
+## 八、Feature 5：CShuffle 两端一起加宽
+
+**e2e −90.8 us（累计补上总差距的 93.7%）；stage2 GEMM −119.1 us**
+
+```bash
+FLYDSL_MOE_STAGE2_BFIRST=1       # Step 1：累加器改 B-first，一个 lane 拿 4 个连续通道
+FLYDSL_MOE_STAGE2_NLANE_FIT=1    # Step 2：cshuffle_nlane 随 e_vec 收窄
+FLYDSL_MOE_STAGE2_EVEC=8         #         于是 e_vec 能上到 8，存储变 dwordx4
+FLYDSL_MOE_STAGE2_LDSPAD=4       # 解 B-first 引入的 LDS bank 冲突，必须配
+```
+
+**四个 knob 缺一不可**，而且前两个单独做都接近 0——析因见 8.4。
+
+### 8.1 Step 1：B-first（7.4 的候选 C）
+
+7.4 已经把根因讲清楚了：旧内核激活当 A、权重当 B，累加器是 `(token, channel)`，一个 lane 的
+4 个累加值沿 **token** 排列，落到 LDS 是 4 个不同的行，只能一次写 2 个字节。
+
+翻转成 B-first（权重当 A、激活当 B）之后，一个 lane 的 4 个值是 **4 个连续通道**，
+在 `[行][列]` 的 LDS 里天然连续，一条 `ds_write2_b64` 写完：
+
+```
+ds_write_b16_d16_hi   1024  →  0
+ds_write2_b64            0  →  128
+```
+
+**但它引入了一个新的 bank 冲突。** B-first 下相邻 lane 写的是 16 个**不同的行**，
+而行跨步 `tile_n = 128` bf16 = 256 B = 64 个 bank ≡ 0 (mod 32)——**16 个 lane 全撞同一组 bank**。
+不加 padding 时这一项就让 e2e **倒亏 977 us**，比 B-first 省下的多得多。
+
+`LDSPAD=4` 把行跨步改成 264 B，`264/4 = 66 ≡ 2 (mod 32)`，相邻行错开 2 个 bank，
+16 行正好铺满 32 个——冲突归零。实测 `LDSBankConflict` 从 f4 的 12.73% 降到 **6.87%**
+（target 是 27.84%）。
+
+pad 的值不能乱选，**只有 4 是对的**：
+
+| `LDSPAD` | e2e（叠在 C0 之上） |
+|---|---|
+| 0 | 6362.5 |
+| **4** | **6311.4** |
+| 8 | 6382.8 |
+
+### 8.2 Step 2：`cshuffle_nlane` 是个从没被传过的形参
+
+7.5 说"`e_vec=8` 需要 `tile_n=256`，实测慢 302.7 us"——**这句话是错的**，当时只想到了一条路。
+
+真正的约束在 `mfma_epilogues.py`：
+
+```140:143:aiter/ops/flydsl/kernels/mfma_epilogues.py
+    if (int(tile_n) % (int(cshuffle_nlane) * int(e_vec))) != 0:
+        raise ValueError(
+            f"tile_n must be divisible by (CShuffleNLane*EVec) = {cshuffle_nlane*e_vec}, got tile_n={tile_n}"
+        )
+```
+
+Step 2 一轮覆盖 `cshuffle_mlane 行 × (cshuffle_nlane × e_vec) 列`，要求列跨度整除 `tile_n`。
+`nlane=32、e_vec=8` 时列跨度是 256，比 `tile_n=128` 还宽，放不进去——**但这 2048 个元素
+换个形状就行**：
+
+| `nlane` | `mlane = 256/nlane` | 一轮形状 | 塞得进 64×128 吗 |
+|---|---|---|---|
+| 32 | 8 | 8 × **256** | 否 |
+| **16** | **16** | **16 × 128** | **是** ✓ |
+
+而 `_cshuffle_nlane` 在旧内核里是个**写死的字面量**，`c_shuffle_epilog` 那边它其实是**带默认值
+的形参，从来没被传过**：
+
+```95:95:aiter/ops/flydsl/kernels/mfma_epilogues.py
+    cshuffle_nlane: int = 32,
+```
+
+改成随 `e_vec` 收窄（这个写法直接抄自 `mixed_moe_gemm_2stage.py:1888`，那边早就这么做了）：
+
+```python
+if os.environ.get("FLYDSL_MOE_STAGE2_NLANE_FIT", "0") in (...):
+    _cshuffle_nlane = min(32, int(tile_n) // _e_vec)
+```
+
+再把它真正传给 epilogue，`e_vec=8` 就通了，存储从 `buffer_store_dwordx2` 变
+`buffer_store_dwordx4`：
+
+```
+buffer_store_dwordx2   256  →  0
+buffer_store_dwordx4     0  →  128
+```
+
+### 8.3 实现：翻转朝向只有一行，连锁的是它下游的六处
+
+早先评估 C2 时估的是"要重写两个操作数加载器、X 的 LDS 布局、累加器下标语义……等于重写"。
+**这个判断错了**，而且错在一个可以事先想清楚的地方。
+
+#### (a) 核心：交换 MFMA 的两个源操作数就够了
+
+```3574:3589:aiter/ops/flydsl/kernels/moe_gemm_2stage.py
+                                    if _bfirst:
+                                        acc_list[acc_idx] = mfma_k64(
+                                            acc_list[acc_idx],
+                                            b_packs0[ni],
+                                            b_packs1[ni],
+                                            a0,
+                                            a1,
+                                        )
+                                    else:
+                                        acc_list[acc_idx] = mfma_k64(
+                                            acc_list[acc_idx],
+                                            a0,
+                                            a1,
+                                            b_packs0[ni],
+                                            b_packs1[ni],
+                                        )
+```
+
+**为什么加载器不用动**：MFMA 的两个源操作数**每 lane 的布局是完全相同的**——
+`lane%16` 选 16 维那一侧、`lane/16` 选 K 切片。所以把 W 喂给 src0、X 喂给 src1，
+得到的就是转置过的 16×16 结果，**两个 fragment 的加载代码一个字都不用改**。
+
+这是 A×B 和 Bᵀ×Aᵀ = (A×B)ᵀ 在 MFMA 这个对称布局下的直接体现。早先的评估把
+"操作数换位置"和"操作数换布局"混为一谈了。
+
+同理 `mfma_scale_f32_16x16x128_f8f6f4` 那条路径也只是换个位置：
+
+```3538:3542:aiter/ops/flydsl/kernels/moe_gemm_2stage.py
+                                    # B-first transposes the result; both scale
+                                    # operands are identical so they need no swap.
+                                    src0, src1 = (
+                                        (b_128, a_128) if _bfirst else (a_128, b_128)
+                                    )
+```
+
+#### (b) 下游要跟着改的六处
+
+累加器转置之后，**凡是"这个 lane 的第几个值对应谁"的地方都要重算**：
+
+| # | 位置 | A-first | B-first |
+|---|---|---|---|
+| 1 | epilogue 的列坐标 | `lane%16 + ni*16` | `lane/16*4 + ni*16` |
+| 2 | epilogue 的行坐标 | `mi*16 + lane/16*4 + ii` | `mi*16 + lane%16` |
+| 3 | 权重量化 scale `sw` | 每 `ni` 一个标量 | 每 `ni` 一个 **4 宽向量**（4 个连续通道） |
+| 4 | 路由权重 `tw` | 每 `mi` 取 4 个（4 个 token） | 每 `mi` 取 **1 个**（一个 token，广播） |
+| 5 | LDS 写 | 4 条 `ds_write_b16` | 1 条 `ds_write_b64` |
+| 6 | Step 1 的遍历 | `mi × ii` 两层 | 只剩 `mi` 一层 |
+
+第 1 处在 `col_g_bf_list` 里单独算一份——注意 **B 操作数本身的寻址不能跟着变**：
+
+```3117:3120:aiter/ops/flydsl/kernels/moe_gemm_2stage.py
+                # Under B-first the epilogue's channel mapping moves from lane%16 to
+                # lane/16*4 (+0..3), but the B *operand* layout is unchanged, so
+                # col_g_list must stay as-is for n_blk/n_intra addressing.
+                col_g_bf_list = []
+```
+
+第 3、4 处是**一对反向的变化**，也是 f5 的 VALU 涨跌互见的原因：
+
+```python
+# sw：A-first 是标量、B-first 变 4 宽向量（4 个连续通道各有各的 scale）
+if _bfirst:
+    row_w_idx = expert_off + col_g_bf_list[ni]
+    sw_vals.append(buffer_ops.buffer_load(sw_rsrc, row_w_idx, vec_width=4, dtype=T.f32))
+```
+
+```python
+# tw：A-first 要 gather 4 个 token 的权重、B-first 只需 1 个标量广播
+if _bfirst:
+    tw = tw_pf[mi]
+    tw_vec = vector.from_elements(T.vec(4, T.f32), [tw] * 4)
+else:
+    tws = [tw_pf[(mi * 4) + jj] for jj in range_constexpr(4)]   # 4 次
+    tw_vec = vector.from_elements(T.vec(4, T.f32), tws)
+```
+
+`tw_pf` 的预取量因此从 `m_repeat × 4` 降到 `m_repeat`（16 → 4 条 load）。
+
+第 5、6 处合在一起就是收益的来源——整个 f32x4 一次落进 LDS：
+
+```4371:4395:aiter/ops/flydsl/kernels/moe_gemm_2stage.py
+                        if _bfirst:
+                            # The f32x4 holds 4 consecutive channels of one token, so
+                            # the whole accumulator lands in 4 adjacent lds_out slots:
+                            # one ds_write_b64 replaces four ds_write_b16.
+                            for ni in range_constexpr(num_acc_n):
+                                col_local = col_base_local + (ni * 16)
+                                sv = _scaled_acc(mi, ni, 0, row)
+                                outs = [
+                                    _cvt_out(
+                                        vector.extract(
+                                            sv,
+                                            static_position=[jj],
+                                            dynamic_position=[],
+                                        )
+                                    )
+                                    for jj in range_constexpr(4)
+                                ]
+                                v4 = vector.from_elements(T.vec(4, out_elem()), outs)
+                                vector.store(
+                                    v4,
+                                    lds_out,
+                                    [row_base_lds + col_local],
+                                    alignment=8,
+                                )
+                            return
+```
+
+那 4 次 `vector.extract` + `_cvt_out` + `from_elements` 就是 8.5 里 `v_perm_b32` 那 512 条的
+来源——**A-first 下这一步是靠 `ds_write_b16_d16_hi` 白拿的**。
+
+第 6 处在共享的 `mfma_epilogues.py` 里，因为 `ii` 那一层没有了：
+
+```172:179:aiter/ops/flydsl/kernels/mfma_epilogues.py
+    if bfirst:
+        # One call per `mi`: the callback emits all 4 channels as a single store,
+        # so there is no `ii` axis to iterate here.
+        for mi in range_constexpr(m_repeat):
+            row_in_tile = arith.constant(mi * 16, index=True) + lane_mod_16
+            _write_row(mi, 0, row_in_tile, bx_m + row_in_tile)
+    else:
+        default_epilog(...)
+```
+
+#### (c) Step 2 完全不用动
+
+**这是 B-first 改动量能控制住的另一半原因。** CShuffle 的 Step 2 用的是它自己的映射
+（`m_lane = tx / nlane`、`n_lane = tx % nlane`），和 MFMA 的 lane 布局本来就无关——
+它只认"`lds_out` 里 `[行][列]` 摆着一个 `tile_m × tile_n` 的 tile"。朝向翻转只改了
+**谁把值写进哪个格子**，格子本身没动，所以读回和存储那一侧一行都不用改。
+
+`bfirst` 因此只作用于 Step 1：
+
+```99:103:aiter/ops/flydsl/kernels/mfma_epilogues.py
+    # B-first accumulator orientation: only Step 1's thread->element mapping
+    # changes; Step 2 reads lds_out through its own mapping and is unaffected.
+    bfirst: bool = False,
+    # Row stride of lds_out in elements; defaults to tile_n (unpadded).
+    lds_out_stride: int | None = None,
+```
+
+#### (d) `LDSPAD` 与 `NLANE_FIT`：各三行
+
+padding 只是把 `lds_out` 的行跨步和分配大小换个数：
+
+```python
+_lds_out_stride = int(tile_n) + _lds_pad
+lds_out_bytes = 2 * int(tile_m) * _lds_out_stride
+```
+
+`c_shuffle_epilog` 那边把写死的 `tile_n` 换成传进来的跨步（列仍在 `[0, tile_n)` 内）：
+
+```145:148:aiter/ops/flydsl/kernels/mfma_epilogues.py
+    # ---------------- Step 1: write C tile to LDS (row-major, fp16) ----------------
+    # Row stride may exceed tile_n when lds_out is padded to break bank aliasing;
+    # columns still live in [0, tile_n).
+    tile_n_idx = arith.constant(int(lds_out_stride or tile_n), index=True)
+```
+
+`NLANE_FIT` 见 8.2，加上把 `cshuffle_nlane` 真正传给 epilogue，一共三行。
+
+#### (e) 适用范围
+
+B-first 目前**只接了 per-tensor 激活 scale + 向量化缩放这一条路**，其它 epilogue 变体
+（原子累加、f32 输出、split-K）仍是 A-first，入口处直接拒绝：
+
+```2749:2754:aiter/ops/flydsl/kernels/moe_gemm_2stage.py
+    if _bfirst and not (_use_cshuffle_epilog and _vec_scale and not out_is_f32):
+        raise ValueError(
+            "FLYDSL_MOE_STAGE2_BFIRST currently requires the CShuffle epilogue with "
+            "FLYDSL_MOE_STAGE2_SCALAR_ASCALE=1 and FLYDSL_MOE_STAGE2_VEC_SCALE=1 "
+            "(f16/bf16 output). Other epilogue variants still assume A-first."
+        )
+```
+
+**改动量实测：内核 +264 行、共享 epilogue +38 行**，其中一半是 `if _bfirst: ... else: ...`
+的两条并存路径。早先估的"等于重写"高估了一个数量级——根源是误以为操作数换位要跟着换布局。
+
+### 8.4 析因：两半都得做，缺一个就接近 0
+
+GPU 0，各 3 次取中位，全部叠在 f4 之上：
+
+| 配置 | 中位 e2e | vs f4 |
+|---|---|---|
+| f4（`e_vec=4`, `nlane=32`） | 6385.0 | — |
+| 只做 Step 2（C0：`e_vec=8` + `nlane=16`） | 6362.5 | −22.5 |
+| 只做 Step 2 + pad4 | 6311.4 | −73.6 |
+| **两半都做（f5）** | **6275.4** | **−109.6** |
+| 参考：只做 Step 1（B-first + pad4，早先单测） | — | **−13.7** |
+
+**Step 1 单独 −13.7、Step 2 单独 −73.6，加起来 −87.3；实际联合 −109.6，协同 −22.3。**
+
+原因很直接：**Step 1 管写、Step 2 管读和存，两端都变宽才吃得满**。只加宽写，读回还是窄的，
+数据卡在 LDS 出不去；只加宽读存，写进去的还是 1024 条窄写。
+
+这和 f1（`SORTED_PARTIAL` + `FASTVALID`）、f2（三个 knob）是同一种形态——
+**都是一条链上的多个消费者，留任何一个，另外几个的收益就还埋着。**
+
+### 8.5 ISA 与计数器
+
+opcode（旧内核全展开、新内核是循环体，绝对数不可直接比，看的是形态）：
+
+| opcode | f4 | **f5** | target |
+|---|---|---|---|
+| `ds_write_b16_d16_hi` | **1024** | **0** | 0 |
+| `ds_write2_b64` | 0 | **128** | 0 |
+| `ds_write_b64` | 0 | 0 | 16 |
+| `ds_read2st64_b64` | 128 | 0 | 0 |
+| `ds_read_b128` | 12 | 12 | 20 |
+| `buffer_store_dwordx2` | **256** | **0** | 0 |
+| `buffer_store_dwordx4` | 0 | **128** | 8 |
+| `v_perm_b32`（bf16 打包） | 0 | **512** | 32 |
+
+每 MFMA 归一的动态计数器：
+
+| | f4 | **f5** | target |
+|---|---|---|---|
+| VALU | 3.158 | **3.632** | 2.584 |
+| **LDS** | 0.765 | **0.182** | 0.260 |
+| **VMEM 写** | 0.167 | **0.083** | **0.083** |
+| VMEM 读 | 0.207 | 0.199 | 0.132 |
+| SALU | 0.152 | 0.160 | 0.090 |
+| `LDSBankConflict` | 12.73% | **6.87%** | 27.84% |
+| `MeanOccupancyPerCU` | 7.76 | 7.75 | 15.35 |
+
+**LDS 从 0.765 打到 0.182，已经低于 target 的 0.260；VMEM 写和 target 精确相等。**
+
+代价是 **VALU 从 3.158 涨到 3.632**，每 wave +712 条。大头是 `v_perm_b32` 那 512 条：
+A-first 用 `ds_write_b16_d16_hi` 直接写 VGPR 的**高 16 位**，bf16 的截断被折进 store、
+**一条指令都不花**；B-first 要宽写就必须先把 2 个 bf16 打包成 dword，这笔就得实打实地付。
+
+**这不是 f5 实现得差——按 MFMA 归一，f5 和 target 的打包成本精确相等，都是 0.333 条
+`v_perm_b32` 每条 MFMA。** 打包是宽写的固有成本，target 一分不少地也在付。
+
+VGPR 196 → 198，LDS 28928 → 29440 B。
+
+### 8.6 附带发现：后端漏掉三分之一的打包机会（已放弃，代码已删）
+
+> **结论先行**：这一节记录的 `FLYDSL_MOE_STAGE2_PK2` 实验最终被否掉，代码已从
+> `moe_gemm_2stage.py` 删除。它在 f5 上确实有 −13.7~−23.8 us，但叠到 f6
+> （`FLYDSL_MOE_STAGE2_FASTIDX`，见 `run.sh` 的 f6 阶梯行；本文尚未成章）
+> 之后翻转成 **+46.0 us 的净拖累**——f6 已经把打包率提上去了，
+> PK2 再插一手反而干扰后端。8.6.4 记录了这个反转，8.6.3 记录了当时那个
+> splat 猜测是怎么被证伪的。保留全文是因为**过程结论比结果有用**：它划清了
+> 「哪些东西从 MLIR 这一侧够得着、哪些够不着」的边界。
+
+#### 8.6.1 现象
+
+查 f5 剩余 VALU 时发现的，独立于上面四个 knob，曾用 `FLYDSL_MOE_STAGE2_PK2` 门控。
+
+**IR 层是干净的**：f5 的 LLVM IR 里有 **576 条 `<4 x float>` fmul，一条标量都没有**。
+但落到 ISA：
+
+```
+750 条 v_pk_mul_f32 + 804 条 v_mul_f32（标量）
+750 × 2 + 804 = 2304 = 576 × 4     ← 精确对账
+```
+
+**576 条向量乘里有 201 条（35%）被后端整条拆成了标量。** 同一段代码里两种结果并存：
+
+```asm
+v_pk_mul_f32 v[182:183], v[4:5], v[174:175]     ← 打包了
+v_mul_f32_e64 v186, v4, v180                    ┐ 操作数形状完全一样
+v_mul_f32_e64 v187, v5, v181                    ┘ 却没打包
+```
+
+**先排除了寄存器压力**——打包率和 VGPR 不相关，f4 的 VGPR 更高反而打包得最好：
+
+| 配置 | VGPR | vec4 fmul | pk_mul | 标量 mul | 打包率 |
+|---|---|---|---|---|---|
+| f2 | 169 | 1024 | 1065 | 494 | 52.0% |
+| f3 | 172 | 1024 | 1053 | 518 | 51.4% |
+| f4 | 196 | 512 | 714 | 684 | **69.7%** |
+| f5 | 198 | 576 | 750 | 804 | 65.1% |
+
+#### 8.6.2 试过的办法：源码直接发 2 宽
+
+`v_pk_mul_f32` 天然是 2 宽的，喂它 4 宽的 `arith.mulf` 等于让后端自己拆再配对。
+`_vmul4` 改成发两条 `vector<2xf32>`，1:1 映射：
+
+```python
+def _vmul4(a, b):
+    if not _pk2:
+        return a * b
+    halves = []
+    for h in range_constexpr(2):
+        av = vector.from_elements(T.vec(2, T.f32), [...])   # a 的第 h 个半区
+        bv = vector.from_elements(T.vec(2, T.f32), [...])
+        halves.append(av * bv)
+    return vector.from_elements(T.vec(4, T.f32), [...])     # 重新拼回
+```
+
+**结果：有效，但只解决了一部分。**
+
+| | f5 | f5 + PK2 |
+|---|---|---|
+| IR | 576 × vec4 | 1152 × vec2 |
+| `v_pk_mul_f32` | 750 | **814** |
+| 标量 `v_mul_f32` | 804 | **676** |
+| `v_mov_b32` | 197 | **37** |
+| 总指令 | 7407 | **7255**（−152） |
+| VGPR | 198 | **194** |
+
+e2e（四次交错测量，控制机器漂移）：
+
+| 轮次 | f5 | f5 + PK2 | 差 |
+|---|---|---|---|
+| 第一轮 | 6321.3 | 6307.6 | **−13.7** |
+| 第二轮 | 6346.8 | 6323.0 | **−23.8** |
+
+两轮区间都不重叠，**−15~24 us 是真的**。但预期是 −50~70，差距来自：
+**换成原生 2 宽之后后端仍然拆掉 29%**（1152 → 814 打包 + 338 拆散），
+只省了 152 条而不是 402 条。
+
+**所以"宽度不匹配"只是部分原因，还有别的东西在阻止打包。**
+
+`v_mov_b32` 从 197 掉到 37 是个附带好处：那些 mov 原本是为拆散的标量乘凑寄存器用的。
+
+#### 8.6.3 追下去：两个假设都被证伪，够不着
+
+**假设一：splat 操作数**。`_sw_x` 和 `svec` 那两处都有一个操作数是标量广播，
+猜测 LLVM 因为"知道它是 uniform"而倾向标量化；target 走的是
+`v_pk_mul_f32 ... op_sel_hi:[0,1]`，用硬件广播位而不是真的 splat 成向量。
+
+**证伪**：若成立，被拆散的条数应等于某个乘法点的整数倍。实测 338 条，对不上任何一个：
+
+| 假设来源 | 预期 vec2 条数 | 实测 338 |
+|---|---|---|
+| 只有 `_sw_x`（splat×向量） | 128 | 不符 |
+| 只有 `svec`（splat×向量） | 512 | 不符 |
+| 只有 `got`（向量×向量） | 512 | 不符 |
+| 两个 splat 点合计 | 640 | 不符 |
+
+而且 flydsl 没有 `rocdl.pk_mul_f32`（只有 cvt 类 pk 转换），就算成立也发不出带
+`op_sel_hi` 的指令。更要命的是把残留的标量两两配对检查后发现——**20/20 采样组的
+三个操作数全部偶对齐且连续，本来就完全满足 `v_pk_mul_f32` 的硬性要求**。同一段
+ISA 里形状完全一样的两条，一条打包了一条没有：
+
+```asm
+v_mul_f32_e64 v172, v6, v164                    ┐ 没打包
+v_mul_f32_e64 v173, v7, v165                    ┘
+v_pk_mul_f32  v[176:177], v[6:7], v[170:171]      ← 形状一样，打包了
+```
+
+所以不是"做不到"，是后端"没做"。
+
+**假设二：逐元素 extract 触发中端标量化**。`_cvt_out` 是标量的，每个 vec 结果都得
+先 `vector.extract` 拆开才能喂进去；猜测 InstCombine 看到"vec2 fmul 的全部使用者
+都是逐元素 extract"就把它改写成两条标量 fmul，而 `v_pk_mul_f32` 只在 ISel 阶段
+从 vec2 fmul 生成，一旦提前拆掉就再也回不来。
+
+**证伪**：照这个思路把 `_cvt_out` 改成向量原生（`vector<4xf32>` → bitcast → 移位 →
+trunci → bitcast 到 `vector<4xbf16>`）。IR 层面完全按预期生效（标量 `arith.bitcast`
+2048→0，标量 `arith.trunci` 1024→256 条向量形式），而且一路活到最终 LLVM IR。
+但**最终 ISA 逐字节相同**。原因是前提就不成立：查交给后端的 LLVM IR，
+**两个版本都是 576 条 `fmul <4 x float>`，一条标量 fmul 都没有**——中端从没标量化过，
+根本没有需要保护的对象。
+
+**结论**：拆散完全发生在 AMDGPU 后端 ISel 内部（576 条 vec4 → 750 打包 + 804 标量，
+750×2+804 = 2304 ✓），从 MLIR 这一侧改任何 IR 形状都够不着。这条线到此为止。
+
+#### 8.6.4 反转：f6 之后 PK2 变成负收益，代码已删
+
+f6（`FLYDSL_MOE_STAGE2_FASTIDX`，去掉 B 下标拆分里的恒等取模）落地后，
+打包率**自己**从 65.1% 涨到 73.4%
+（`v_mul_f32` 804→612，`v_pk_mul_f32` 750→846）——挪走无关的除法减轻了寄存器压力，
+后端自己就多打包了。这反过来印证了 8.6.3：打包决策受寄存器压力和调度影响，
+只是从 IR 形状那一侧推不动。
+
+于是重测 PK2 是否还有价值（PTL 已确认开启，GPU 空闲，四轮交错）：
+
+| 轮次 | f6 | f6 + PK2 | 差 |
+|---|---|---|---|
+| rep0 | 6293.4 | 6341.8 | +48.4 |
+| rep1 | 6315.1 | 6351.4 | +36.3 |
+| rep2 | 6294.1 | 6333.7 | +39.6 |
+| rep3 | 6291.1 | 6337.7 | +46.6 |
+| **中位数** | **6293.8** | **6339.8** | **+46.0** |
+
+四轮全部同向，两组区间完全不重叠（f6 最慢 6315.1 < f6+PK2 最快 6333.7）。
+PK2 从 −13.7~−23.8 us 翻转成 **+46.0 us**，`_vmul4` 与 `FLYDSL_MOE_STAGE2_PK2`
+已从 `moe_gemm_2stage.py` 删除（删除后 ISA 与开关关闭时逐条相同，确认是死代码）。
+
+**教训**：一个针对后端启发式的 codegen 提示，其收益取决于当时的寄存器压力和调度
+状态，不是代码的固有属性。上游改动动了这些状态之后必须重测，不能默认它还成立。
+
+### 8.7 效果与修正后的判断
+
+| | f4 | f5 | 差 |
+|---|---|---|---|
+| `moe_gemm2_0` | 2140.8 | **2021.7** | **−119.1** |
+| e2e | 6372.0 | **6281.2** | −90.8 |
+
+stage2 GEMM 到 target 的剩余差距从 387.1 收到 **268.0 us（1.153×）**。
+
+**7.8 那个判断要改。** 它说"剩下的 399.8 us 全部压在累加器朝向这一个根因上"，
+并暗示只有重写才能拿到。实际是：
+
+1. **朝向确实是根因，但只解朝向不够**——B-first 单独只值 −13.7 us，
+   因为 Step 2 那一半还卡着，而那一半根本不需要动朝向，只是一个从没被传过的形参。
+2. **改动量也没那么大**：`NLANE_FIT` 是三行，`LDSPAD` 是给 `lds_out` 加个行 padding。
+   真正大的只有 B-first 本身。
+3. **收益的构成完全变了**：剩余 1,664 条指令缺口里 VALU 独占 1,575（95%），
+   LDS 已经反超 target、VMEM 写已经打平。**访存和 LDS 这两条线到此为止。**
+
+下一步只能从 VALU 下手，而 VALU 的大头是 occupancy 之外的东西——旧内核 VGPR 198 / LDS 29440
+对 target 的 118 / 16384，occupancy 仍是 7.75 对 15.35 的 2 倍差距（候选 D：X 进寄存器）。
+7.7(1)(2) 证伪 occupancy 那两个实验是在 f1 时代做的，**epilogue 已经榨干、结构差异占比大了
+很多，值得重新验一次**再决定。
+
+## 九、怎么跑
+
+### 9.1 驱动脚本
 
 ```bash
 cd /data/aiter/moe_stage2_opt
@@ -1398,7 +1919,7 @@ GPU=3 ./run.sh                   # 换卡
 2. 核对实际派发的 `kernelName2` 与配置是否一致，名字写错时 fused_moe 会静默回落；
 3. e2e 和 `AITER_LOG_MORE` 分两遍跑，tracer 的开销不会污染 headline 数字。
 
-### 8.2 加一个 feature
+### 9.2 加一个 feature
 
 在 `run.sh` 的 `STAGES` 数组里追加一行，格式 `id|config|说明|env`：
 
@@ -1419,7 +1940,7 @@ env 是**累积**的：`f3` 会带着 `f1`、`f2` 的 knob 一起跑，所以每
 `AITER_*` 变量把它门控住**——否则代码一落地，`base` 就不再是 base 了，整条阶梯失去意义。
 `moe_stage2_pr1x4.py` 里的 `AITER_PR1X4_TRITON_REDUCE` 就是这个模式。
 
-### 8.3 手工跑单条
+### 9.3 手工跑单条
 
 ```bash
 cd /data/aiter
@@ -1520,6 +2041,13 @@ _e_vec = 8 if int(tile_n) % (_cshuffle_nlane * 8) == 0 else 2
 真正的约束是下一行的 `tile_n % (32 * e_vec) == 0`，`tile_n=128` 下 **e_vec=4 合法**，
 但这个三元表达式只在 8 和 2 之间二选一，直接掉到 2。实测改成 4 值 −34.5 us（5.3）。
 应该改成取满足约束的最大值，`FLYDSL_MOE_STAGE2_EVEC` 退化成 kill-switch。
+
+> **f5 之后这一条要往前再推一步。** 约束里的 `32` 本身就是可调的（`cshuffle_nlane`），
+> 把它随 `e_vec` 收窄之后 `e_vec=8` 也合法（8.2）。所以正确的默认值不是"满足
+> `tile_n % (32*e_vec)==0` 的最大 e_vec"，而是**在 `(nlane, e_vec)` 这个二维空间里取
+> `e_vec` 最大的可行解**：`e_vec = min(8, tile_n*32//total_threads ...)` 之类，
+> 再反解 `nlane = min(32, tile_n // e_vec)`。`NLANE_FIT` / `LDSPAD` / `BFIRST`
+> 目前都还是 opt-in。
 
 `FLYDSL_MOE_STAGE2_HOIST_PF` 同理。它是纯粹的循环不变量外提，**没有正确性前提、
 没有寄存器代价**（实测 VGPR 169 → 169），也不依赖任何其他 knob——留成 opt-in 只是为了

@@ -96,6 +96,11 @@ def c_shuffle_epilog(
     block_size: int = 256,
     m_repeat: int,
     num_acc_n: int,
+    # B-first accumulator orientation: only Step 1's thread->element mapping
+    # changes; Step 2 reads lds_out through its own mapping and is unaffected.
+    bfirst: bool = False,
+    # Row stride of lds_out in elements; defaults to tile_n (unpadded).
+    lds_out_stride: int | None = None,
     # Thread mapping inputs
     tx,
     lane_div_16,
@@ -138,9 +143,15 @@ def c_shuffle_epilog(
         )
 
     # ---------------- Step 1: write C tile to LDS (row-major, fp16) ----------------
-    tile_n_idx = arith.constant(int(tile_n), index=True)
+    # Row stride may exceed tile_n when lds_out is padded to break bank aliasing;
+    # columns still live in [0, tile_n).
+    tile_n_idx = arith.constant(int(lds_out_stride or tile_n), index=True)
     n_tile_base_v = n_tile_base
-    col_base_local = n_tile_base_v + lane_mod_16  # index within [0,tile_n)
+    # A-first: a lane owns one channel (lane%16) across 4 rows (lane/16*4 + ii).
+    # B-first: it owns one row (lane%16) across 4 channels (lane/16*4 + 0..3).
+    col_base_local = n_tile_base_v + (
+        lane_div_16 * 4 if bfirst else lane_mod_16
+    )  # index within [0,tile_n)
 
     def _write_row(mi: int, ii: int, row_in_tile, row):
         # row_base_lds = row_in_tile * tile_n
@@ -158,14 +169,21 @@ def c_shuffle_epilog(
 
     # Ensure all LDS reads finished before the lds write.
     gpu.barrier()
-    default_epilog(
-        arith=arith,
-        range_constexpr=range_constexpr,
-        m_repeat=m_repeat,
-        lane_div_16=lane_div_16,
-        bx_m=bx_m,
-        body_row=_write_row,
-    )
+    if bfirst:
+        # One call per `mi`: the callback emits all 4 channels as a single store,
+        # so there is no `ii` axis to iterate here.
+        for mi in range_constexpr(m_repeat):
+            row_in_tile = arith.constant(mi * 16, index=True) + lane_mod_16
+            _write_row(mi, 0, row_in_tile, bx_m + row_in_tile)
+    else:
+        default_epilog(
+            arith=arith,
+            range_constexpr=range_constexpr,
+            m_repeat=m_repeat,
+            lane_div_16=lane_div_16,
+            bx_m=bx_m,
+            body_row=_write_row,
+        )
 
     # Ensure all LDS writes are visible before the shuffle-read.
     gpu.barrier()

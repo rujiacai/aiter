@@ -40,6 +40,7 @@ STAGES=(
   "f2|old|拆掉 epilogue 的逐行标量链：per-tensor scale 提到入口 + 向量化缩放 + per-block buffer 存储|FLYDSL_MOE_STAGE2_SCALAR_ASCALE=1 FLYDSL_MOE_STAGE2_VEC_SCALE=1 FLYDSL_MOE_STAGE2_BUFSTORE=1"
   "f3|old|循环不变量外提（路由权重 / guard / X 的 LDS 读不再逐 N-tile 重做）+ 输出宽度 e_vec=4|FLYDSL_MOE_STAGE2_HOIST_PF=1 FLYDSL_MOE_STAGE2_HOIST_X=1 FLYDSL_MOE_STAGE2_EVEC=4"
   "f4|old|删掉掩码 epilogue：sorted 行布局下 padding 行的写无害，整条掩码路径是死代码|FLYDSL_MOE_STAGE2_NO_MASK=1"
+  "f5|old|CShuffle 两端一起加宽：B-first 让 Step1 写 b64 + nlane 随 e_vec 收窄让 Step2 存 dwordx4，配 LDSPAD=4 解 bank 冲突|FLYDSL_MOE_STAGE2_BFIRST=1 FLYDSL_MOE_STAGE2_NLANE_FIT=1 FLYDSL_MOE_STAGE2_EVEC=8 FLYDSL_MOE_STAGE2_LDSPAD=4"
   "target|new|新内核 pr1x4 + Triton 归约（目标）|!AITER_PR1X4_TRITON_REDUCE=1"
 )
 
@@ -56,6 +57,9 @@ ALL_KNOBS=(
   FLYDSL_MOE_STAGE2_HOIST_X
   FLYDSL_MOE_STAGE2_NO_MASK
   FLYDSL_MOE_STAGE2_EVEC
+  FLYDSL_MOE_STAGE2_BFIRST
+  FLYDSL_MOE_STAGE2_LDSPAD
+  FLYDSL_MOE_STAGE2_NLANE_FIT
   AITER_PR1X4_TRITON_REDUCE
   AITER_LOG_MORE
 )

@@ -2541,15 +2541,54 @@ def compile_moe_gemm2(
         _e_vec_env = int(os.environ.get("FLYDSL_MOE_STAGE2_EVEC", "0") or "0")
         if _e_vec_env > 0:
             _e_vec = _e_vec_env
+        # Step 2 tiles the (tile_m, tile_n) rectangle as
+        # cshuffle_mlane rows x (cshuffle_nlane * e_vec) columns per round, so the
+        # column span must divide tile_n.  Pinning nlane at 32 caps e_vec at
+        # tile_n/32 (= 4 here) even though the thread budget allows 8: the same 2048
+        # elements per round just have to be laid out 16x128 instead of 8x256.
+        # Deriving nlane from e_vec unlocks buffer_store_dwordx4, which is what the
+        # new kernel uses.  mixed_moe_gemm_2stage.py already does exactly this.
+        # Off by default: it changes the row stride seen by Step 2 and therefore the
+        # LDS bank pattern, so it wants FLYDSL_MOE_STAGE2_LDSPAD alongside.
+        if os.environ.get("FLYDSL_MOE_STAGE2_NLANE_FIT", "0") in (
+            "1",
+            "true",
+            "True",
+            "YES",
+            "yes",
+        ):
+            _cshuffle_nlane = min(32, int(tile_n) // _e_vec)
         _cshuffle_stride = _cshuffle_nlane * _e_vec
         if int(tile_n) % _cshuffle_stride != 0:
             raise ValueError(
                 f"tile_n={tile_n} must be divisible by {_cshuffle_stride} when accumulate=False"
             )
+        if int(total_threads) % _cshuffle_nlane != 0 or (
+            int(tile_m) % (int(total_threads) // _cshuffle_nlane)
+        ) != 0:
+            raise ValueError(
+                f"cshuffle_nlane={_cshuffle_nlane} incompatible with "
+                f"total_threads={total_threads} / tile_m={tile_m}"
+            )
+
+    # Row padding for lds_out, in output elements.  Without it a row stride of
+    # tile_n*2 = 256 B is an exact multiple of the 32x4 B bank array, so any access
+    # pattern that walks *rows* at a fixed column lands every lane on the same
+    # banks.  That is exactly what B-first's Step-1 write does (16 lanes -> 16 rows,
+    # one column), which is why it needs padding while A-first does not.
+    # pad=4 elements -> stride 264 B; 264/4 = 66 = 2 (mod 32), so consecutive rows
+    # step 2 banks and 16 rows cover all 32 banks exactly once.
+    _lds_pad = int(os.environ.get("FLYDSL_MOE_STAGE2_LDSPAD", "0") or "0")
+    if _lds_pad % 4 != 0:
+        # Keep the 8 B alignment that the B-first ds_write_b64 needs.
+        raise ValueError(
+            f"FLYDSL_MOE_STAGE2_LDSPAD must be a multiple of 4 elements, got {_lds_pad}"
+        )
+    _lds_out_stride = int(tile_n) + _lds_pad
 
     # ── LDS sizing (pure Python; no MLIR Context needed) ─────────────────────
     lds_out_bytes = (
-        2 * int(tile_m) * int(tile_n) if _use_cshuffle_epilog else 0
+        2 * int(tile_m) * _lds_out_stride if _use_cshuffle_epilog else 0
     )  # f16 bytes
     lds_tid_bytes = int(tile_m) * 4
     if _persist:
@@ -2679,6 +2718,30 @@ def compile_moe_gemm2(
         "yes",
     )
 
+    # B-first accumulator orientation.  MFMA's two source operands have identical
+    # per-lane layouts (lane%16 picks the 16-dim, lane/16 picks the K slice), so
+    # feeding W as src0 and X as src1 transposes the 16x16 result without touching
+    # either loader: a lane then holds 4 consecutive *channels* of one token
+    # instead of 4 consecutive tokens of one channel.  Step 1 of the CShuffle
+    # epilogue can therefore write 4 elements at once (ds_write_b64) instead of
+    # four ds_write_b16, and the per-token scalar work drops 4x.
+    #
+    # Only the per-tensor-activation-scale + vector-scale path is ported; the
+    # other epilogue variants keep the A-first mapping and are rejected below.
+    _bfirst = os.environ.get("FLYDSL_MOE_STAGE2_BFIRST", "0") in (
+        "1",
+        "true",
+        "True",
+        "YES",
+        "yes",
+    )
+    if _bfirst and not (_use_cshuffle_epilog and _vec_scale and not out_is_f32):
+        raise ValueError(
+            "FLYDSL_MOE_STAGE2_BFIRST currently requires the CShuffle epilogue with "
+            "FLYDSL_MOE_STAGE2_SCALAR_ASCALE=1 and FLYDSL_MOE_STAGE2_VEC_SCALE=1 "
+            "(f16/bf16 output). Other epilogue variants still assume A-first."
+        )
+
     if True:
 
         @flyc.kernel(known_block_size=[total_threads, 1, 1])
@@ -2792,7 +2855,7 @@ def compile_moe_gemm2(
                     base_ptr,
                     lds_x_ptr.byte_offset + _lds_out_byte_off,
                     (T.bf16 if out_is_bf16 else T.f16),
-                    shape=(tile_m * tile_n,),
+                    shape=(tile_m * _lds_out_stride,),
                 ).get()
                 if _use_cshuffle_epilog
                 else None
@@ -3040,10 +3103,18 @@ def compile_moe_gemm2(
                 col_g_list = []
                 c_n0_static = experts * model_dim // 16
                 layout_n_blk_intra = fx.make_layout((c_n0_static, 16), stride=(16, 1))
+                # Under B-first the epilogue's channel mapping moves from lane%16 to
+                # lane/16*4 (+0..3), but the B *operand* layout is unchanged, so
+                # col_g_list must stay as-is for n_blk/n_intra addressing.
+                col_g_bf_list = []
                 for ni in range_constexpr(num_acc_n):
                     offset = arith.index(ni * 16)
                     col_g = by_n + n_tile_base + offset + lane_mod_16
                     col_g_list.append(col_g)
+                    if _bfirst:
+                        col_g_bf_list.append(
+                            by_n + n_tile_base + offset + lane_div_16 * fx.Index(4)
+                        )
 
                     row_w = expert_off_idx + col_g
                     coord_w = fx.idx2crd(row_w, layout_n_blk_intra)
@@ -3319,6 +3390,21 @@ def compile_moe_gemm2(
                         expert_off_pf = expert_off_idx
                         sw_pf = []
                         for ni in range_constexpr(num_acc_n):
+                            if _bfirst:
+                                # B-first: this lane owns 4 *consecutive* channels
+                                # per acc, so the weight scales are one 4-wide load
+                                # instead of a single scalar.
+                                row_w_idx = expert_off_pf + col_g_bf_list[ni]
+                                sw_pf.append(
+                                    vector.from_elements(
+                                        T.vec(4, T.f32), [fx.Float32(1.0)] * 4
+                                    )
+                                    if not needs_scale_w
+                                    else buffer_ops.buffer_load(
+                                        sw_rsrc, row_w_idx, vec_width=4, dtype=T.f32
+                                    )
+                                )
+                                continue
                             col_g = col_g_list[ni]
                             row_w_idx = expert_off_pf + col_g
                             sw_pf.append(
@@ -3335,16 +3421,14 @@ def compile_moe_gemm2(
                         tw_pf = _pf_hoist.get("tw") if _hoist_pf else None
                         if doweight_stage2 and tw_pf is None:
                             tw_pf = []
-                            lane_div_16_mul4_pf = lane_div_16 * fx.Index(4)
-                            ii_idx_list_pf = [fx.Index(ii) for ii in range(4)]
-                            for mi in range_constexpr(m_repeat):
-                                mi_base_pf = arith.index(mi * 16)
-                                for ii in range_constexpr(4):
-                                    row_off_pf = (
-                                        lane_div_16_mul4_pf + ii_idx_list_pf[ii]
+                            if _bfirst:
+                                # B-first: a lane covers one token per `mi`
+                                # (row = mi*16 + lane%16), so this is m_repeat
+                                # loads instead of m_repeat*4.
+                                for mi in range_constexpr(m_repeat):
+                                    sorted_row_pf = (
+                                        bx_m + arith.index(mi * 16) + lane_mod_16
                                     )
-                                    row_in_tile_pf = mi_base_pf + row_off_pf
-                                    sorted_row_pf = bx_m + row_in_tile_pf
                                     tw_pf.append(
                                         buffer_ops.buffer_load(
                                             sorted_w_rsrc,
@@ -3353,6 +3437,25 @@ def compile_moe_gemm2(
                                             dtype=T.f32,
                                         )
                                     )
+                            else:
+                                lane_div_16_mul4_pf = lane_div_16 * fx.Index(4)
+                                ii_idx_list_pf = [fx.Index(ii) for ii in range(4)]
+                                for mi in range_constexpr(m_repeat):
+                                    mi_base_pf = arith.index(mi * 16)
+                                    for ii in range_constexpr(4):
+                                        row_off_pf = (
+                                            lane_div_16_mul4_pf + ii_idx_list_pf[ii]
+                                        )
+                                        row_in_tile_pf = mi_base_pf + row_off_pf
+                                        sorted_row_pf = bx_m + row_in_tile_pf
+                                        tw_pf.append(
+                                            buffer_ops.buffer_load(
+                                                sorted_w_rsrc,
+                                                sorted_row_pf,
+                                                vec_width=1,
+                                                dtype=T.f32,
+                                            )
+                                        )
                             if _hoist_pf:
                                 _pf_hoist["tw"] = tw_pf
                         epilogue_pf = (sw_pf, tw_pf)
@@ -3421,9 +3524,14 @@ def compile_moe_gemm2(
                                     b_128 = _pack_i64x4_to_i32x8(
                                         b0_p0[ni], b0_p1[ni], b1_p0[ni], b1_p1[ni],
                                     )
+                                    # B-first transposes the result; both scale
+                                    # operands are identical so they need no swap.
+                                    src0, src1 = (
+                                        (b_128, a_128) if _bfirst else (a_128, b_128)
+                                    )
                                     acc_list[acc_idx] = rocdl.mfma_scale_f32_16x16x128_f8f6f4(
                                         T.f32x4,
-                                        [a_128, b_128, acc_list[acc_idx],
+                                        [src0, src1, acc_list[acc_idx],
                                          0, 0, 0, 0x7F7F7F7F, 0, 0x7F7F7F7F],
                                     )
                             _s_setprio(0)
@@ -3449,13 +3557,25 @@ def compile_moe_gemm2(
 
                                 for ni in range_constexpr(num_acc_n):
                                     acc_idx = mi * num_acc_n + ni
-                                    acc_list[acc_idx] = mfma_k64(
-                                        acc_list[acc_idx],
-                                        a0,
-                                        a1,
-                                        b_packs0[ni],
-                                        b_packs1[ni],
-                                    )
+                                    # B-first: swapping src0/src1 transposes the
+                                    # 16x16 result. The (k-half 0, k-half 1)
+                                    # pairing is preserved.
+                                    if _bfirst:
+                                        acc_list[acc_idx] = mfma_k64(
+                                            acc_list[acc_idx],
+                                            b_packs0[ni],
+                                            b_packs1[ni],
+                                            a0,
+                                            a1,
+                                        )
+                                    else:
+                                        acc_list[acc_idx] = mfma_k64(
+                                            acc_list[acc_idx],
+                                            a0,
+                                            a1,
+                                            b_packs0[ni],
+                                            b_packs1[ni],
+                                        )
                             _s_setprio(0)
                     return acc_list, epilogue_pf
 
@@ -3902,6 +4022,19 @@ def compile_moe_gemm2(
                 else:
                     sw_vals = []
                     for ni in range_constexpr(num_acc_n):
+                        if _bfirst:
+                            # 4 consecutive channels per acc -> one 4-wide load.
+                            row_w_idx = expert_off + col_g_bf_list[ni]
+                            sw_vals.append(
+                                vector.from_elements(
+                                    T.vec(4, T.f32), [fx.Float32(1.0)] * 4
+                                )
+                                if not needs_scale_w
+                                else buffer_ops.buffer_load(
+                                    sw_rsrc, row_w_idx, vec_width=4, dtype=T.f32
+                                )
+                            )
+                            continue
                         col_g = col_g_list[ni]
                         row_w_idx = expert_off + col_g
                         sw_vals.append(
@@ -4087,39 +4220,69 @@ def compile_moe_gemm2(
                     # issues 5 muls per (mi, ii) = 80; this form issues 2 (sx*sw) +
                     # 16 (tw_vec*sw) + 16 (acc*scale) = 34.
                     _vec_scale_cache = {}
+
                     _sw_x = None
                     if _vec_scale and sx_scalar is not None:
                         # sx*sw folded once per N-tile, then splatted so the per-row
                         # product below is a vector op rather than 4 scalar ones.
+                        # Under B-first sw_vals[ni] is already a 4-channel vector,
+                        # so the splat collapses to a scalar-times-vector multiply.
                         _sw_x = [
-                            vector.from_elements(
-                                T.vec(4, T.f32), [sx_scalar * sw_vals[ni]] * 4
+                            (
+                                sw_vals[ni]
+                                * vector.from_elements(
+                                    T.vec(4, T.f32), [sx_scalar] * 4
+                                )
+                                if _bfirst
+                                else vector.from_elements(
+                                    T.vec(4, T.f32), [sx_scalar * sw_vals[ni]] * 4
+                                )
                             )
                             for ni in range(num_acc_n)
                         ]
 
                     def _scaled_acc(mi: int, ni: int, ii: int, row):
-                        """acc[mi,ni] * scale, as an f32x4 covering ii = 0..3."""
+                        """acc[mi,ni] * scale, as an f32x4.
+
+                        A-first: the four lanes-of-the-vector are four tokens (ii).
+                        B-first: they are four channels of a single token, so the
+                        routed weight is one scalar broadcast instead of a gather.
+                        """
                         key = (bool(_epi["masked"]), mi, ni)
                         got = _vec_scale_cache.get(key)
                         if got is None:
                             if doweight_stage2:
-                                tws = []
-                                for jj in range_constexpr(4):
-                                    if tw_pf is not None:
-                                        tws.append(tw_pf[(mi * 4) + jj])
-                                    else:
-                                        # `row` is this call's row; the sibling rows of the
-                                        # same mi differ by (jj - ii).
-                                        tws.append(
-                                            buffer_ops.buffer_load(
-                                                sorted_w_rsrc,
-                                                row + fx.Index(jj - ii),
-                                                vec_width=1,
-                                                dtype=T.f32,
-                                            )
+                                if _bfirst:
+                                    tw = (
+                                        tw_pf[mi]
+                                        if tw_pf is not None
+                                        else buffer_ops.buffer_load(
+                                            sorted_w_rsrc,
+                                            row,
+                                            vec_width=1,
+                                            dtype=T.f32,
                                         )
-                                tw_vec = vector.from_elements(T.vec(4, T.f32), tws)
+                                    )
+                                    tw_vec = vector.from_elements(
+                                        T.vec(4, T.f32), [tw] * 4
+                                    )
+                                else:
+                                    tws = []
+                                    for jj in range_constexpr(4):
+                                        if tw_pf is not None:
+                                            tws.append(tw_pf[(mi * 4) + jj])
+                                        else:
+                                            # `row` is this call's row; the sibling rows of the
+                                            # same mi differ by (jj - ii).
+                                            tws.append(
+                                                buffer_ops.buffer_load(
+                                                    sorted_w_rsrc,
+                                                    row + fx.Index(jj - ii),
+                                                    vec_width=1,
+                                                    dtype=T.f32,
+                                                )
+                                            )
+                                    tw_vec = vector.from_elements(T.vec(4, T.f32), tws)
                                 svec = tw_vec * _sw_x[ni]
                             else:
                                 svec = _sw_x[ni]
@@ -4141,6 +4304,31 @@ def compile_moe_gemm2(
                         num_acc_n: int,
                         lds_out,
                     ):
+                        if _bfirst:
+                            # The f32x4 holds 4 consecutive channels of one token, so
+                            # the whole accumulator lands in 4 adjacent lds_out slots:
+                            # one ds_write_b64 replaces four ds_write_b16.
+                            for ni in range_constexpr(num_acc_n):
+                                col_local = col_base_local + (ni * 16)
+                                sv = _scaled_acc(mi, ni, 0, row)
+                                outs = [
+                                    _cvt_out(
+                                        vector.extract(
+                                            sv,
+                                            static_position=[jj],
+                                            dynamic_position=[],
+                                        )
+                                    )
+                                    for jj in range_constexpr(4)
+                                ]
+                                v4 = vector.from_elements(T.vec(4, out_elem()), outs)
+                                vector.store(
+                                    v4,
+                                    lds_out,
+                                    [row_base_lds + col_local],
+                                    alignment=8,
+                                )
+                            return
                         if sx_scalar is not None:
                             # Per-tensor scale: no need to decode (t, s) at all here.
                             # Padding rows get a non-zero scale, which is harmless --
@@ -4385,8 +4573,11 @@ def compile_moe_gemm2(
                             tile_n=tile_n,
                             block_size=total_threads,
                             e_vec=e_vec,
+                            cshuffle_nlane=_cshuffle_nlane,
                             m_repeat=m_repeat,
                             num_acc_n=num_acc_n,
+                            bfirst=_bfirst,
+                            lds_out_stride=_lds_out_stride,
                             tx=tx,
                             lane_div_16=lane_div_16,
                             lane_mod_16=lane_mod_16,
