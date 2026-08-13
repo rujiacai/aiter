@@ -101,6 +101,13 @@ def c_shuffle_epilog(
     bfirst: bool = False,
     # Row stride of lds_out in elements; defaults to tile_n (unpadded).
     lds_out_stride: int | None = None,
+    # Interleave Step 1 and Step 2 in chunks of `chunk_m` rows instead of staging
+    # the whole tile.  Step 1's `mi` writes rows [mi*16, mi*16+16) and Step 2's
+    # `mr` reads rows [mr*CShuffleMLane, +CShuffleMLane), so when those two spans
+    # coincide each chunk can be written and read back before the next one starts
+    # and lds_out only ever holds one chunk.  Costs one extra barrier pair per
+    # chunk; buys back the LDS that caps occupancy.  B-first only.
+    chunk_m: int | None = None,
     # Thread mapping inputs
     tx,
     lane_div_16,
@@ -153,9 +160,10 @@ def c_shuffle_epilog(
         lane_div_16 * 4 if bfirst else lane_mod_16
     )  # index within [0,tile_n)
 
-    def _write_row(mi: int, ii: int, row_in_tile, row):
-        # row_base_lds = row_in_tile * tile_n
-        row_base_lds = row_in_tile * tile_n_idx
+    def _write_row(mi: int, ii: int, row_in_tile, row, lds_row=None):
+        # row_base_lds = row_in_tile * tile_n; chunked keeps only one chunk of
+        # rows resident, so the row index is taken modulo the chunk.
+        row_base_lds = (row_in_tile if lds_row is None else lds_row) * tile_n_idx
         write_row_to_lds(
             mi=mi,
             ii=ii,
@@ -167,26 +175,17 @@ def c_shuffle_epilog(
             lds_out=lds_out,
         )
 
-    # Ensure all LDS reads finished before the lds write.
-    gpu.barrier()
-    if bfirst:
+    def _step1(mi: int):
         # One call per `mi`: the callback emits all 4 channels as a single store,
         # so there is no `ii` axis to iterate here.
-        for mi in range_constexpr(m_repeat):
-            row_in_tile = arith.constant(mi * 16, index=True) + lane_mod_16
-            _write_row(mi, 0, row_in_tile, bx_m + row_in_tile)
-    else:
-        default_epilog(
-            arith=arith,
-            range_constexpr=range_constexpr,
-            m_repeat=m_repeat,
-            lane_div_16=lane_div_16,
-            bx_m=bx_m,
-            body_row=_write_row,
+        row_in_tile = arith.constant(mi * 16, index=True) + lane_mod_16
+        _write_row(
+            mi,
+            0,
+            row_in_tile,
+            bx_m + row_in_tile,
+            lds_row=lane_mod_16 if chunk_m is not None else None,
         )
-
-    # Ensure all LDS writes are visible before the shuffle-read.
-    gpu.barrier()
 
     # ---------------- Step 2: shuffle mapping + half2 store/atomic ----------------
     CShuffleNLane = int(cshuffle_nlane)
@@ -207,10 +206,11 @@ def c_shuffle_epilog(
     bx_m_v = bx_m
     by_n_v = by_n
 
-    for mr in range_constexpr(m_reps_shuffle):
+    def _step2(mr: int):
         row_base_m = arith.constant(mr * CShuffleMLane, index=True)
         row_local = row_base_m + m_lane
         row = bx_m_v + row_local
+        lds_row = m_lane if chunk_m is not None else row_local
 
         row_ctx_raw = (
             precompute_row(row_local=row_local, row=row)
@@ -231,7 +231,7 @@ def c_shuffle_epilog(
             row_ctx, row_pred = row_ctx_raw
 
         def _do_store_row():
-            row_base_lds = row_local * tile_n_idx
+            row_base_lds = lds_row * tile_n_idx
             # Hoist *all* LDS (CShuffle) reads for this row ahead of the stores so
             # the backend can batch them under a single lgkmcnt wait and issue the
             # subsequent atomics back-to-back, instead of the serial
@@ -262,6 +262,39 @@ def c_shuffle_epilog(
                 _do_store_row()
         else:
             _do_store_row()
+
+    if chunk_m is None:
+        # Ensure all LDS reads finished before the lds write.
+        gpu.barrier()
+        if bfirst:
+            for mi in range_constexpr(m_repeat):
+                _step1(mi)
+        else:
+            default_epilog(
+                arith=arith,
+                range_constexpr=range_constexpr,
+                m_repeat=m_repeat,
+                lane_div_16=lane_div_16,
+                bx_m=bx_m,
+                body_row=_write_row,
+            )
+        # Ensure all LDS writes are visible before the shuffle-read.
+        gpu.barrier()
+        for mr in range_constexpr(m_reps_shuffle):
+            _step2(mr)
+    else:
+        if not bfirst:
+            raise ValueError("chunk_m requires the B-first Step-1 mapping")
+        if m_repeat != m_reps_shuffle:
+            raise ValueError(
+                f"chunk_m needs Step 1 and Step 2 to walk the same row spans, but "
+                f"m_repeat={m_repeat} and m_reps_shuffle={m_reps_shuffle}"
+            )
+        for c in range_constexpr(m_repeat):
+            gpu.barrier()
+            _step1(c)
+            gpu.barrier()
+            _step2(c)
 
 
 def mfma_epilog(

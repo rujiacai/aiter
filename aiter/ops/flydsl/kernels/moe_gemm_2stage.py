@@ -2594,6 +2594,18 @@ def compile_moe_gemm2(
         "YES",
         "yes",
     )
+
+    # Stage the CShuffle tile one chunk of rows at a time instead of whole.
+    # Under persist, lds_out cannot alias the X staging (X stays live across the
+    # N-loop while the epilogue runs per N-tile), so the two add up and LDS --
+    # not VGPRs -- is what caps occupancy.  See `chunk_m` in c_shuffle_epilog.
+    _ldschunk = os.environ.get("FLYDSL_MOE_STAGE2_LDSCHUNK", "0") in (
+        "1",
+        "true",
+        "True",
+        "YES",
+        "yes",
+    )
     # Row padding for lds_out, in output elements.  Without it a row stride of
     # tile_n*2 = 256 B is an exact multiple of the 32x4 B bank array, so any access
     # pattern that walks *rows* at a fixed column lands every lane on the same
@@ -2610,8 +2622,18 @@ def compile_moe_gemm2(
     _lds_out_stride = int(tile_n) + _lds_pad
 
     # ── LDS sizing (pure Python; no MLIR Context needed) ─────────────────────
+    # Chunked staging keeps only one Step-2 round of rows resident.
+    _cshuffle_mlane = int(total_threads) // int(_cshuffle_nlane)
+    _lds_out_rows = _cshuffle_mlane if _ldschunk else int(tile_m)
+    if _ldschunk and (int(tile_m) // 16) != (int(tile_m) // _cshuffle_mlane):
+        raise ValueError(
+            "FLYDSL_MOE_STAGE2_LDSCHUNK needs Step 1 and Step 2 to walk the same "
+            f"row spans, i.e. cshuffle_mlane == 16, got {_cshuffle_mlane} "
+            f"(cshuffle_nlane={_cshuffle_nlane}, total_threads={total_threads}). "
+            "FLYDSL_MOE_STAGE2_NLANE_FIT=1 gives that at tile_n=128/e_vec=8."
+        )
     lds_out_bytes = (
-        2 * int(tile_m) * _lds_out_stride if _use_cshuffle_epilog else 0
+        2 * _lds_out_rows * _lds_out_stride if _use_cshuffle_epilog else 0
     )  # f16 bytes
     lds_tid_bytes = int(tile_m) * 4
     if _persist:
@@ -4684,6 +4706,7 @@ def compile_moe_gemm2(
                             num_acc_n=num_acc_n,
                             bfirst=_bfirst,
                             lds_out_stride=_lds_out_stride,
+                            chunk_m=_cshuffle_mlane if _ldschunk else None,
                             tx=tx,
                             lane_div_16=lane_div_16,
                             lane_mod_16=lane_mod_16,
