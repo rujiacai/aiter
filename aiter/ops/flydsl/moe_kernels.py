@@ -456,6 +456,29 @@ def _lds_within_limit(
     return lds_total_bytes <= lds_limit_bytes
 
 
+def _stage1_cshuffle_default(tile_n: int) -> Optional[bool]:
+    """Let `compile_moe_gemm1` choose its epilogue, unless tile_n rules it out.
+
+    The CShuffle Step 2 rectangle is ``cshuffle_nlane * e_vec`` columns wide and
+    that has to divide tile_n; with nlane pinned at 32 and e_vec at 4 the only
+    legal tiles are multiples of 128, so anything narrower has to fall back to
+    the scalar-store epilogue.  ``FLYDSL_MOE_STAGE1_NLANE_FIT`` derives nlane
+    from e_vec instead, which makes the narrow tiles legal, so with it set the
+    choice goes back to the kernel (``None``).
+    """
+    if int(tile_n) % 128 == 0:
+        return None
+    if os.environ.get("FLYDSL_MOE_STAGE1_NLANE_FIT", "0") in (
+        "1",
+        "true",
+        "True",
+        "YES",
+        "yes",
+    ):
+        return None
+    return False
+
+
 def stage1_kb_candidates_for_m(M: int) -> list[int]:
     """Recommended split-K (`k_batch`) candidates for stage1 at a given M.
 
@@ -1041,6 +1064,7 @@ def compile_flydsl_moe_stage1(
     gate_only: bool = False,
     n_per_wave: int = 32,
     splitk_mode: str = "atomic",
+    scalar_a_scale: bool = False,
 ):
     """Compile stage1 kernel (cached via underlying lru_cache).
 
@@ -1115,6 +1139,7 @@ def compile_flydsl_moe_stage1(
             n_per_wave=n_per_wave,
             k_batch=k_batch,
             splitk_mode=splitk_mode,
+            scalar_a_scale=scalar_a_scale,
         )
 
 
@@ -1650,6 +1675,26 @@ def flydsl_moe_stage1(
 
     _use_fused_init = _is_splitk_std and not _fused_init_disabled()
 
+    # FLYDSL_MOE_STAGE1_SCALAR_ASCALE makes the epilogue read the activation scale
+    # once instead of once per output row, which is only equivalent when that scale
+    # really is per-tensor.  The kernel cannot tell on its own: the host broadcasts
+    # a per-tensor scalar over tokens, so both quant types reach it as the same
+    # [tokens] f32 buffer.  Under a per-token scale the knob would not fail, it
+    # would quietly apply token 0's scale to every row.  Check here, where the
+    # un-broadcast scale is still visible, and fail loudly.  (Same bargain as
+    # FLYDSL_MOE_STAGE2_SCALAR_ASCALE.)
+    _scalar_a_scale = os.environ.get("FLYDSL_MOE_STAGE1_SCALAR_ASCALE", "0") in (
+        "1", "true", "True", "YES", "yes"
+    )
+    if _scalar_a_scale:
+        _n = 0 if a1_scale is None else a1_scale.numel()
+        if _n != 1:
+            raise ValueError(
+                "FLYDSL_MOE_STAGE1_SCALAR_ASCALE assumes a per-tensor activation "
+                f"scale, but a1_scale has {_n} elements. It would silently produce "
+                "wrong results; unset the knob for this quant type."
+            )
+
     if _is_splitk_std:
         # f32 partials.  Atomic mode: single (M*topk, 2*inter_dim) buffer that
         # every WG atomic-fadd's into.  Reduce mode: (k_batch, M*topk, 2*inter)
@@ -1698,7 +1743,11 @@ def flydsl_moe_stage1(
             w_cols=w1.shape[1] if _need_w else 1,
         )
     else:
-        flat_a_scale = _expand_per_tensor_scale(a1_scale, token_num, 1)
+        if _scalar_a_scale:
+            # Hand the kernel the one value instead of token_num copies of it.
+            flat_a_scale = a1_scale.view(-1)
+        else:
+            flat_a_scale = _expand_per_tensor_scale(a1_scale, token_num, 1)
         if flat_a_scale is None:
             flat_a_scale = torch.empty(0, device=dev)
         flat_w_scale = _expand_per_tensor_scale(
@@ -1819,9 +1868,10 @@ def flydsl_moe_stage1(
         fuse_fp4_quant=_gemm_fq,
         fuse_sort_scale=_gemm_fss,
         use_async_copy=use_async_copy,
-        use_cshuffle_epilog=False
-        if use_cshuffle_epilog is None and tile_n % 128 != 0
+        use_cshuffle_epilog=_stage1_cshuffle_default(tile_n)
+        if use_cshuffle_epilog is None
         else use_cshuffle_epilog,
+        scalar_a_scale=_scalar_a_scale,
         k_batch=k_batch,
         waves_per_eu=waves_per_eu,
         b_nt=b_nt,

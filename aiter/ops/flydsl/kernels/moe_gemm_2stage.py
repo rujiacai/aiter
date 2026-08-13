@@ -181,8 +181,15 @@ def compile_moe_gemm1(
     n_per_wave: int = 32,
     k_batch: int = 1,
     splitk_mode: str = "atomic",
+    scalar_a_scale: bool = False,
 ):
     """Compile stage1 kernel (`moe_gemm1`) and return the compiled executable.
+
+    scalar_a_scale:
+      The activation scale tensor holds a single value for the whole tensor
+      (per-tensor quant), so the epilogue reads it once at entry instead of
+      once per output row.  The caller must then pass a 1-element `scale_x`
+      rather than the token-length broadcast of it.
 
     n_per_wave:
       Number of N-columns each wave covers. Default 32 reproduces the legacy
@@ -450,6 +457,98 @@ def compile_moe_gemm1(
     #        "stage1 cshuffle epilog currently supports only f16 output (out_dtype='f16')"
     #    )
 
+    # ── CShuffle epilogue geometry (pure Python; has to be settled before
+    # @flyc.kernel, because the AST rewriter turns an `if` inside a kernel body
+    # into a closure dispatch and variable reassignment stops working) ───────
+    # Step 2 tiles the (tile_m, tile_n) rectangle into cshuffle_mlane rows x
+    # (cshuffle_nlane * e_vec) columns per round, so that column span must
+    # divide tile_n.  Pinning nlane at 32 therefore caps e_vec at tile_n/32,
+    # and at the inter_dim=192 shapes (tile_n in {32, 64}) that is below the
+    # e_vec=4 this epilogue emits -- the geometry is simply illegal, which is
+    # why moe_kernels.py disables CShuffle under tile_n=128 and leaves a scalar
+    # 16-bit store per output element.  Deriving nlane from e_vec keeps the
+    # same elements per round in a taller, narrower rectangle: legal at
+    # tile_n=64, and wide enough to store dwordx4.  Off by default because it
+    # changes the LDS bank pattern Step 2 sees.  Stage2 has the same knob.
+    _e_vec = 4
+    _cshuffle_nlane = 32
+    if use_cshuffle_epilog:
+        _e_vec_env = int(os.environ.get("FLYDSL_MOE_STAGE1_EVEC", "0") or "0")
+        if _e_vec_env > 0:
+            _e_vec = _e_vec_env
+        if os.environ.get("FLYDSL_MOE_STAGE1_NLANE_FIT", "0") in (
+            "1",
+            "true",
+            "True",
+            "YES",
+            "yes",
+        ):
+            # Largest legal nlane: Step 2 walks a (total_threads//nlane) x
+            # (nlane*e_vec) rectangle, so the width has to divide tile_n and the
+            # height has to divide tile_m.  `tile_n // e_vec` satisfies both at
+            # tile_n=64 but not in general (at 192 it gives 24, which divides
+            # neither), so search down instead of assuming.
+            for _cand in range(min(32, int(tile_n) // _e_vec), 0, -1):
+                if int(tile_n) % (_cand * _e_vec):
+                    continue
+                if int(total_threads) % _cand:
+                    continue
+                if int(tile_m) % (int(total_threads) // _cand):
+                    continue
+                _cshuffle_nlane = _cand
+                break
+        _cshuffle_stride = _cshuffle_nlane * _e_vec
+        if int(tile_n) % _cshuffle_stride != 0:
+            raise ValueError(
+                f"tile_n={tile_n} must be divisible by cshuffle_nlane*e_vec="
+                f"{_cshuffle_stride}; FLYDSL_MOE_STAGE1_NLANE_FIT=1 derives "
+                f"cshuffle_nlane from e_vec and makes tile_n={tile_n} legal"
+            )
+        if int(total_threads) % _cshuffle_nlane != 0 or (
+            int(tile_m) % (int(total_threads) // _cshuffle_nlane)
+        ) != 0:
+            raise ValueError(
+                f"cshuffle_nlane={_cshuffle_nlane} incompatible with "
+                f"total_threads={total_threads} / tile_m={tile_m}"
+            )
+
+    # B-first accumulator orientation.  Swapping the two MFMA source operands
+    # transposes the 16x16 result, so a lane ends up owning 4 *consecutive*
+    # channels of one row instead of one channel spread over 4 rows.  That makes
+    # the CShuffle Step 1 store contiguous -- one ds_write_b64 replaces four
+    # ds_write_b16 -- and halves the LDS bank conflicts that the strided form
+    # causes.  It is also what PR3987's gateup kernel does.  Step 2 is
+    # unaffected: it reads lds_out back through its own mapping.
+    _bfirst = os.environ.get("FLYDSL_MOE_STAGE1_BFIRST", "0") in (
+        "1",
+        "true",
+        "True",
+        "YES",
+        "yes",
+    )
+    if _bfirst and not use_cshuffle_epilog:
+        raise ValueError(
+            "FLYDSL_MOE_STAGE1_BFIRST needs the CShuffle epilogue; the direct "
+            "and split-K stores still assume the A-first accumulator layout. "
+            "At tile_n < 128 that means FLYDSL_MOE_STAGE1_NLANE_FIT=1 too."
+        )
+
+    # Pad the lds_out row so consecutive rows do not land on the same LDS bank.
+    # B-first makes Step 1 store 4 contiguous channels of *one* row per lane, so
+    # neighbouring lanes write neighbouring rows -- a stride of exactly
+    # tile_n*2 = 128 B is the full 32-bank width, i.e. every lane hits the same
+    # bank and the store serialises 16 ways.  Padding the row breaks that
+    # alignment.  Only useful with B-first; A-first's Step 1 walks along a row
+    # and is already spread.
+    _lds_pad = int(os.environ.get("FLYDSL_MOE_STAGE1_LDSPAD", "0") or "0")
+    if _lds_pad and (_lds_pad % 4) != 0:
+        # The B-first store is 4 elements wide, so the row start has to stay
+        # 8-byte aligned.
+        raise ValueError(
+            f"FLYDSL_MOE_STAGE1_LDSPAD must be a multiple of 4 elements, got {_lds_pad}"
+        )
+    _lds_out_stride = int(tile_n) + _lds_pad
+
     epilog_tag = "cshuffle" if use_cshuffle_epilog else "direct"
     # IMPORTANT: module name participates in FlyDSL's compile cache key.
     # Keep an explicit ABI tag so signature changes can't accidentally reuse an old binary.
@@ -461,11 +560,13 @@ def compile_moe_gemm1(
     _kb_tag = f"_kb{int(k_batch)}" if _is_splitk else ""
     # Distinguish atomic vs reduce split-K binaries in FlyDSL's compile cache.
     _skmode_tag = "_red" if _splitk_reduce else ""
-    module_name = (
-        f"mfma_moe1_{g1u_tag}_{in_dtype}_{out_dtype}_{epilog_tag}"
-        f"_t{tile_m}x{tile_n}x{tile_k}{_async_tag}{_wpe_tag}{_bnt_tag}{_npw_tag}{_kb_tag}{_skmode_tag}"
-        f"_abi5_csh16"  # keep MFMA16 CShuffle isolated from MFMA32 epilogue scheduling
-    ).replace("-", "_")
+    # The CShuffle geometry comes from env, so it has to reach the cache key or
+    # a rerun with a different e_vec silently reuses the previous binary.
+    _csh_tag = (
+        f"_e{_e_vec}n{_cshuffle_nlane}"
+        if use_cshuffle_epilog and (_e_vec, _cshuffle_nlane) != (4, 32)
+        else ""
+    )
 
     # ── LDS sizing (pure Python; no MLIR Context needed) ─────────────────────
     # Reuse the same LDS bytes for both:
@@ -475,16 +576,47 @@ def compile_moe_gemm1(
     # concurrently with the epilogue cshuffle region.
     _use_cshuffle_epilog = bool(use_cshuffle_epilog)
     lds_x_bytes = 2 * int(tile_m) * int(lds_stride) * int(elem_bytes)
-    lds_out_bytes = 2 * int(tile_m) * int(tile_n) if _use_cshuffle_epilog else 0
+    lds_out_bytes = (
+        2 * int(tile_m) * int(_lds_out_stride) if _use_cshuffle_epilog else 0
+    )
     lds_tid_bytes = int(tile_m) * 4
-    lds_total_bytes = max(lds_x_bytes, lds_out_bytes) + lds_tid_bytes
+    # lds_tid normally sits above both the X ping-pong and the CShuffle tile,
+    # so it costs LDS that neither of them is using.  The CShuffle tile is half
+    # the size of the X region here, so those bytes are free during the epilogue
+    # -- and the difference matters out of all proportion to its size: 16640 vs
+    # 16384 bytes is 3 vs 4 workgroups per CU (65536/16640 = 3.94), and at 106
+    # VGPRs the register file would allow 4.  Tucking lds_tid into the tail of
+    # the X region reclaims it; the cost is that lds_tid can only be filled
+    # *after* the main loop, because until then the X ping-pong owns those bytes.
+    _ldstight = (
+        _use_cshuffle_epilog
+        and os.environ.get("FLYDSL_MOE_STAGE1_LDSTIGHT", "0")
+        in ("1", "true", "True", "YES", "yes")
+        and (lds_out_bytes + lds_tid_bytes) <= lds_x_bytes
+    )
+    if _ldstight:
+        _lds_tid_byte_off = lds_out_bytes
+        lds_total_bytes = max(lds_x_bytes, lds_out_bytes + lds_tid_bytes)
+    else:
+        _lds_tid_byte_off = max(lds_x_bytes, lds_out_bytes)
+        lds_total_bytes = _lds_tid_byte_off + lds_tid_bytes
     lds_total_elems = lds_total_bytes if elem_bytes == 1 else (lds_total_bytes // 2)
 
     lds_alloc_bytes = int(lds_total_elems) * int(elem_bytes)
     lds_alloc_offset = allocator._align(allocator.ptr, 16)
     allocator.ptr = lds_alloc_offset + lds_alloc_bytes
 
-    _lds_tid_byte_off = max(lds_x_bytes, lds_out_bytes)
+    _ldst_tag = "_ldst" if _ldstight else ""
+    # scalar_a_scale changes the expected length of scale_x, so a binary built
+    # one way must never be reused for the other.
+    _sas_tag = "_sas" if scalar_a_scale else ""
+    _bf_tag = "_bf" if _bfirst else ""
+    _pad_tag = f"_pad{_lds_pad}" if _lds_pad else ""
+    module_name = (
+        f"mfma_moe1_{g1u_tag}_{in_dtype}_{out_dtype}_{epilog_tag}"
+        f"_t{tile_m}x{tile_n}x{tile_k}{_async_tag}{_wpe_tag}{_bnt_tag}{_npw_tag}{_kb_tag}{_skmode_tag}{_csh_tag}{_ldst_tag}{_sas_tag}{_bf_tag}{_pad_tag}"
+        f"_abi5_csh16"  # keep MFMA16 CShuffle isolated from MFMA32 epilogue scheduling
+    ).replace("-", "_")
 
     if waves_per_eu >= 1:
         _total_cu_lds = per_cu_lds_bytes()
@@ -684,7 +816,7 @@ def compile_moe_gemm1(
                 # Alias LDS bytes as fp16 for optional CShuffle epilogue.
                 lds_out = (
                     SmemPtr(
-                        base_ptr, lds_x_ptr.byte_offset, _out_elem_type(), shape=(tile_m * tile_n,)
+                        base_ptr, lds_x_ptr.byte_offset, _out_elem_type(), shape=(tile_m * _lds_out_stride,)
                     ).get()
                     if _use_cshuffle_epilog
                     else None
@@ -743,7 +875,13 @@ def compile_moe_gemm1(
                 if is_f16_or_bf16:
                     sx_rsrc = None
                 else:
-                    sx_rows = tokens_in * (c_topk if x_is_token_slot else fx.Index(1))
+                    # scalar_a_scale: the caller passes the single per-tensor
+                    # value rather than a token-length broadcast of it.
+                    sx_rows = (
+                        fx.Index(1)
+                        if scalar_a_scale
+                        else tokens_in * (c_topk if x_is_token_slot else fx.Index(1))
+                    )
                     sx_nbytes_idx = sx_rows * fx.Index(4)
                     sx_rsrc = buffer_ops.create_buffer_resource(
                         arg_scale_x, max_size=False, num_records_bytes=sx_nbytes_idx
@@ -935,6 +1073,11 @@ def compile_moe_gemm1(
                 n_intra_up = []
                 n_blk_up = []
                 col_g_list = []
+                # B-first moves the epilogue's channel mapping from lane%16 to
+                # lane/16*4 (+0..3), but the B *operand* layout is unchanged, so
+                # col_g_list has to stay as-is for the n_blk/n_intra addressing;
+                # only the weight-scale and output-column math uses this one.
+                col_g_bf_list = []
                 inter_idx = arith.index(inter_dim)
                 c_n0_static = experts * _w_rows_per_expert // 16
                 layout_n_blk_intra = fx.make_layout((c_n0_static, 16), stride=(16, 1))
@@ -944,6 +1087,10 @@ def compile_moe_gemm1(
                     col_g = col_g + offset
                     col_g = col_g + lane_mod_16
                     col_g_list.append(col_g)
+                    if _bfirst:
+                        col_g_bf_list.append(
+                            by_n + n_tile_base + offset + lane_div_16 * fx.Index(4)
+                        )
 
                     row_gate = expert_off_idx + col_g
 
@@ -1206,22 +1353,33 @@ def compile_moe_gemm1(
                         sw_gate_pf = []
                         sw_up_pf = []
                         for ni in range_constexpr(num_acc_n):
-                            col_g = col_g_list[ni]
+                            # B-first: this lane owns 4 *consecutive* channels per
+                            # acc, so the weight scales are one 4-wide load rather
+                            # than a scalar broadcast over the acc.
+                            _vw = 4 if _bfirst else 1
+                            _ones = (
+                                vector.from_elements(
+                                    T.vec(4, T.f32), [fx.Float32(1.0)] * 4
+                                )
+                                if _bfirst
+                                else fx.Float32(1.0)
+                            )
+                            col_g = col_g_bf_list[ni] if _bfirst else col_g_list[ni]
                             row_gate_idx = expert_off_pf + col_g
                             sw_gate_pf.append(
-                                fx.Float32(1.0)
+                                _ones
                                 if not needs_scale_w
                                 else buffer_ops.buffer_load(
-                                    sw_rsrc, row_gate_idx, vec_width=1, dtype=T.f32
+                                    sw_rsrc, row_gate_idx, vec_width=_vw, dtype=T.f32
                                 )
                             )
                             if use_g1u1:
                                 row_up_idx = row_gate_idx + inter_idx
                                 sw_up_pf.append(
-                                    fx.Float32(1.0)
+                                    _ones
                                     if not needs_scale_w
                                     else buffer_ops.buffer_load(
-                                        sw_rsrc, row_up_idx, vec_width=1, dtype=T.f32
+                                        sw_rsrc, row_up_idx, vec_width=_vw, dtype=T.f32
                                     )
                                 )
                         epilogue_pf = (sw_gate_pf, sw_up_pf)
@@ -1330,6 +1488,27 @@ def compile_moe_gemm1(
 
                                 for ni in range_constexpr(num_acc_n):
                                     acc_idx = mi * num_acc_n + ni
+                                    # B-first: swapping src0/src1 transposes the
+                                    # 16x16 result, so the acc's value dim runs
+                                    # along channel instead of row. The
+                                    # (k-half 0, k-half 1) pairing is preserved.
+                                    if _bfirst:
+                                        gate_list[acc_idx] = mfma_k64(
+                                            gate_list[acc_idx],
+                                            b_gate_packs0[ni],
+                                            b_gate_packs1[ni],
+                                            a0,
+                                            a1,
+                                        )
+                                        if use_g1u1:
+                                            up_list[acc_idx] = mfma_k64(
+                                                up_list[acc_idx],
+                                                b_up_packs0[ni],
+                                                b_up_packs1[ni],
+                                                a0,
+                                                a1,
+                                            )
+                                        continue
                                     gate_list[acc_idx] = mfma_k64(
                                         gate_list[acc_idx],
                                         a0,
@@ -1420,17 +1599,27 @@ def compile_moe_gemm1(
 
                     rocdl.sched_barrier(0)
 
-                # Preload sorted_token_ids into lds_tid for epilogue
-                _c_tile_m_idx = arith.constant(tile_m, index=True)
-                _tid_in_range = arith.cmpi(arith.CmpIPredicate.ult, tx, _c_tile_m_idx)
-                _if_tid = scf.IfOp(_tid_in_range)
-                with _if_then(_if_tid):
-                    _tid_row = bx_m + tx
-                    _tid_val = buffer_ops.buffer_load(
-                        sorted_rsrc, _tid_row, vec_width=1, dtype=T.i32
+                # Fill lds_tid with this tile's sorted_token_ids for the epilogue.
+                def _fill_lds_tid():
+                    _c_tile_m_idx = arith.constant(tile_m, index=True)
+                    _tid_in_range = arith.cmpi(
+                        arith.CmpIPredicate.ult, tx, _c_tile_m_idx
                     )
-                    _tid_vec1 = vector.from_elements(T.vec(1, T.i32), [_tid_val])
-                    vector.store(_tid_vec1, lds_tid, [tx])
+                    _if_tid = scf.IfOp(_tid_in_range)
+                    with _if_then(_if_tid):
+                        _tid_row = bx_m + tx
+                        _tid_val = buffer_ops.buffer_load(
+                            sorted_rsrc, _tid_row, vec_width=1, dtype=T.i32
+                        )
+                        _tid_vec1 = vector.from_elements(T.vec(1, T.i32), [_tid_val])
+                        vector.store(_tid_vec1, lds_tid, [tx])
+
+                # Normally this happens here, before the X ping-pong starts, so
+                # the load overlaps the whole main loop.  Under _ldstight lds_tid
+                # is aliased into the X region, so it has to wait until the loop
+                # is done with those bytes -- see the call after the last tile.
+                if not _ldstight:
+                    _fill_lds_tid()
 
                 # Prologue: prefetch tile0, store to LDS(cur), sync.
                 # Split-K: k_base_off = bz * (model_dim/k_batch); without
@@ -1634,6 +1823,15 @@ def compile_moe_gemm1(
                     a1_prefetch=a1_prefetch_ping,
                 )
 
+                if _ldstight:
+                    # lds_tid aliases bytes the X ping-pong just finished
+                    # reading, so wait for every wave to be out of them before
+                    # writing.  Visibility of the write is covered by the
+                    # barrier c_shuffle_epilog emits before its Step 1, which is
+                    # the first thing that reads lds_tid back.
+                    gpu.barrier()
+                    _fill_lds_tid()
+
                 # Store epilogue to out[t, slot, inter]
                 expert_off = expert_off_idx
                 tokens_i32_v = tokens_i32
@@ -1641,28 +1839,48 @@ def compile_moe_gemm1(
                 inter_i32_v = fx.Int32(inter_dim)
                 mask24_i32 = fx.Int32(0xFFFFFF)
 
+                # Per-tensor activation scale is one uniform value, so read it
+                # once here rather than once per output row -- the per-row form
+                # is 16 buffer_loads per wave of the same float.
+                sx_scalar = (
+                    buffer_ops.buffer_load(
+                        sx_rsrc, fx.Int32(0), vec_width=1, dtype=T.f32
+                    )
+                    if (scalar_a_scale and not is_f16_or_bf16)
+                    else fx.Float32(1.0)
+                )
+
                 if epilogue_pf is not None:
                     sw_gate_vals, sw_up_vals = epilogue_pf
                 else:
                     sw_gate_vals = []
                     sw_up_vals = []
                     for ni in range_constexpr(num_acc_n):
-                        col_g = col_g_list[ni]
+                        # B-first: 4 consecutive channels per acc -> one 4-wide load.
+                        _vw = 4 if _bfirst else 1
+                        _ones = (
+                            vector.from_elements(
+                                T.vec(4, T.f32), [fx.Float32(1.0)] * 4
+                            )
+                            if _bfirst
+                            else fx.Float32(1.0)
+                        )
+                        col_g = col_g_bf_list[ni] if _bfirst else col_g_list[ni]
                         row_gate_idx = expert_off + col_g
                         row_up_idx = row_gate_idx + inter_idx
                         sw_gate_vals.append(
-                            fx.Float32(1.0)
+                            _ones
                             if not needs_scale_w
                             else buffer_ops.buffer_load(
-                                sw_rsrc, row_gate_idx, vec_width=1, dtype=T.f32
+                                sw_rsrc, row_gate_idx, vec_width=_vw, dtype=T.f32
                             )
                         )
                         if use_g1u1:
                             sw_up_vals.append(
-                                fx.Float32(1.0)
+                                _ones
                                 if not needs_scale_w
                                 else buffer_ops.buffer_load(
-                                    sw_rsrc, row_up_idx, vec_width=1, dtype=T.f32
+                                    sw_rsrc, row_up_idx, vec_width=_vw, dtype=T.f32
                                 )
                             )
                         else:
@@ -1675,7 +1893,6 @@ def compile_moe_gemm1(
 
                 inter_i32_local = inter_i32_v
 
-                # Uses EVec=4 (buffer store "x4" of fp16 elements).
                 use_cshuffle_epilog_flag = _use_cshuffle_epilog
 
                 if use_cshuffle_epilog_flag:
@@ -1701,7 +1918,10 @@ def compile_moe_gemm1(
                         # aiter moe_sorting uses sentinel token_id == tokens for padding.
                         # Do NOT rely on buffer OOB semantics for scale loads; explicitly mask.
                         t_valid = arith.cmpi(arith.CmpIPredicate.ult, t2, tokens_i32_v)
-                        if x_is_token_slot:
+                        if scalar_a_scale:
+                            # One value for the whole tensor: read once at entry.
+                            sx = sx_scalar
+                        elif x_is_token_slot:
                             # slot-major: slot*tokens + token
                             ts2 = s2 * tokens_i32_v + t2
                             sx = (
@@ -1734,6 +1954,75 @@ def compile_moe_gemm1(
                                 sorted_w_rsrc, row, vec_width=1, dtype=T.f32
                             )
 
+                        def _activate(vg, vu):
+                            if use_g1u1:
+                                if act == "gelu":
+                                    y = gelu(vg) * vu
+                                else:
+                                    y = silu(vg) * vu
+                            else:
+                                y = gelu(vg) if act == "gelu" else silu(vg)
+                            if doweight_stage1:
+                                y = y * tw
+                            return arith.trunc_f(_out_elem_type(), y)
+
+                        if _bfirst:
+                            # The f32x4 holds 4 consecutive channels of one row,
+                            # so the whole accumulator lands in 4 adjacent
+                            # lds_out slots: one wide store replaces four
+                            # 16-bit ones.  `ii` is always 0 here -- under
+                            # B-first c_shuffle_epilog calls this once per `mi`.
+                            for ni in range_constexpr(num_acc_n):
+                                col_local = col_base_local + (ni * 16)
+                                acc_idx = mi * num_acc_n + ni
+                                outs = []
+                                for _v in range_constexpr(4):
+                                    vg = vector.extract(
+                                        acc_gate[acc_idx],
+                                        static_position=[_v],
+                                        dynamic_position=[],
+                                    )
+                                    vu = (
+                                        vector.extract(
+                                            acc_up[acc_idx],
+                                            static_position=[_v],
+                                            dynamic_position=[],
+                                        )
+                                        if use_g1u1
+                                        else None
+                                    )
+                                    if is_int8:
+                                        vg = arith.sitofp(T.f32, vg)
+                                        vu = (
+                                            arith.sitofp(T.f32, vu)
+                                            if use_g1u1
+                                            else None
+                                        )
+                                    swg = vector.extract(
+                                        sw_gate_vals[ni],
+                                        static_position=[_v],
+                                        dynamic_position=[],
+                                    )
+                                    vg = vg * sx * swg
+                                    if use_g1u1:
+                                        swu = vector.extract(
+                                            sw_up_vals[ni],
+                                            static_position=[_v],
+                                            dynamic_position=[],
+                                        )
+                                        vu = vu * sx * swu
+                                    outs.append(_activate(vg, vu))
+                                v4 = vector.from_elements(
+                                    T.vec(4, _out_elem_type()), outs
+                                )
+                                vector.store(
+                                    v4,
+                                    lds_out,
+                                    [row_base_lds + col_local],
+                                    alignment=8,
+                                )
+                            return
+
                         for ni in range_constexpr(num_acc_n):
                             col_local = col_base_local + (ni * 16)
                             sw_gate = sw_gate_vals[ni]
@@ -1756,24 +2045,7 @@ def compile_moe_gemm1(
                                 vu = arith.sitofp(T.f32, vu) if use_g1u1 else None
                             vg = vg * sx * sw_gate
                             vu = (vu * sx * sw_up) if use_g1u1 else None
-
-                            if use_g1u1:
-                                if act == "silu":
-                                    y = silu(vg) * vu
-                                elif act == "gelu":
-                                    y = gelu(vg) * vu
-                                else:
-                                    y = silu(vg) * vu
-                            else:
-                                if act == "silu":
-                                    y = silu(vg)
-                                elif act == "gelu":
-                                    y = gelu(vg)
-                                else:
-                                    y = silu(vg)
-                            if doweight_stage1:
-                                y = y * tw
-                            y16 = arith.trunc_f(_out_elem_type(), y)
+                            y16 = _activate(vg, vu)
 
                             lds_idx = row_base_lds + col_local
                             v1 = vector.from_elements(_out_vec_type(), [y16])
@@ -1794,7 +2066,6 @@ def compile_moe_gemm1(
                             idx0 = row_ctx
                             col_i32 = arith.index_cast(T.i32, col_g0)
                             idx_out = idx0 + col_i32
-                            # Vectorized fp16 store (EVec=4).
                             buffer_ops.buffer_store(frag, out_rsrc, idx_out)
 
                     mfma_epilog(
@@ -1806,7 +2077,11 @@ def compile_moe_gemm1(
                         range_constexpr=range_constexpr,
                         tile_m=tile_m,
                         tile_n=tile_n,
-                        e_vec=4,
+                        e_vec=_e_vec,
+                        cshuffle_nlane=_cshuffle_nlane,
+                        block_size=total_threads,
+                        bfirst=_bfirst,
+                        lds_out_stride=_lds_out_stride,
                         m_repeat=m_repeat,
                         num_acc_n=num_acc_n,
                         tx=tx,
@@ -1832,7 +2107,9 @@ def compile_moe_gemm1(
                     t_valid = arith.cmpi(arith.CmpIPredicate.ult, t2, tokens_i32_v)
 
                     # Do NOT rely on buffer OOB semantics for scale loads; explicitly mask.
-                    if x_is_token_slot:
+                    if scalar_a_scale:
+                        sx0 = sx_scalar
+                    elif x_is_token_slot:
                         # slot-major: slot*tokens + token
                         ts2 = s2 * tokens_i32_v + t2
                         sx0 = (
@@ -1926,7 +2203,9 @@ def compile_moe_gemm1(
                     s2 = fused2 >> 24
                     t_valid = arith.cmpi(arith.CmpIPredicate.ult, t2, tokens_i32_v)
 
-                    if x_is_token_slot:
+                    if scalar_a_scale:
+                        sx = sx_scalar
+                    elif x_is_token_slot:
                         ts2 = s2 * tokens_i32_v + t2
                         sx = (
                             fx.Float32(1.0)
@@ -2012,7 +2291,9 @@ def compile_moe_gemm1(
                     s2 = fused2 >> 24
                     t_valid = arith.cmpi(arith.CmpIPredicate.ult, t2, tokens_i32_v)
 
-                    if x_is_token_slot:
+                    if scalar_a_scale:
+                        sx = sx_scalar
+                    elif x_is_token_slot:
                         ts2 = s2 * tokens_i32_v + t2
                         sx = (
                             fx.Float32(1.0)
