@@ -171,6 +171,7 @@ def compile_moe_gemm1(
     scale_is_bf16: bool = False,
     k_batch: int = 1,
     waves_per_eu: int = 0,
+    swiglu_limit: float = float("inf"),
 ):
     """Compile stage1 kernel (`moe_gemm1`) and return the compiled executable.
 
@@ -498,6 +499,37 @@ def compile_moe_gemm1(
                 den = 1.0 + emu
                 sig = rocdl.rcp(T.f32, den)
                 return x * sig
+
+            # SwiGLU clamp (DeepSeek-V4 uses swiglu_limit=10.0). gate is bounded
+            # above only, up on both sides -- same convention as the triton
+            # fused_clamp_act_mul and the gfx1250 / grouped FlyDSL kernels.
+            # min(x, lim) is written as -max(-x, -lim) because only maximumf is
+            # wrapped (mirrors mixed_moe_gemm_2stage._clamp_gate/_clamp_lin).
+            #
+            # swiglu_limit is a compile-time constant rather than a kernel arg so
+            # this needs no ABI change to _s1_args_std / the launcher, and at the
+            # default +inf no ops are emitted at all -- existing kernels compile
+            # bit-identically.
+            # The condition must go through const_expr: a bare Python `if` inside
+            # the traced kernel body is rewritten into a device-side branch, so
+            # both arms get traced and the no-clamp arm would feed a None limit
+            # into maximumf.
+            _clamp_act = swiglu_limit != float("inf")
+            _neg_lim = (
+                arith.constant(-float(swiglu_limit), type=T.f32)
+                if _clamp_act
+                else None
+            )
+
+            def clamp_gate(x):
+                if const_expr(not _clamp_act):
+                    return x
+                return -((-x).maximumf(_neg_lim))
+
+            def clamp_up(x):
+                if const_expr(not _clamp_act):
+                    return x
+                return (-((-x).maximumf(_neg_lim))).maximumf(_neg_lim)
 
             acc_init = (
                 arith.constant_vector(0, T.i32x4)
@@ -2164,7 +2196,7 @@ def compile_moe_gemm1(
                             vg = vg * sx * sw_gate
                             vu = vu * sx * sw_up
 
-                            y = silu(vg) * vu
+                            y = silu(clamp_gate(vg)) * clamp_up(vu)
                             if const_expr(doweight_stage1):
                                 y = y * tw
                             y16 = arith.trunc_f(T.f16, y)
@@ -2299,7 +2331,7 @@ def compile_moe_gemm1(
                             vg = vg * sx * sw_gate
                             vu = vu * sx * sw_up
 
-                            y = silu(vg) * vu
+                            y = silu(clamp_gate(vg)) * clamp_up(vu)
                             if const_expr(doweight_stage1):
                                 y = y * tw
                             y = arith.trunc_f(out_mlir(), y)

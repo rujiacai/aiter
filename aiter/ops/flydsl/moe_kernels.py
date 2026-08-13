@@ -729,8 +729,16 @@ def compile_flydsl_moe_stage1(
     a_scale_one: bool = False,
     xcd_swizzle: int = 0,
     k_wave: int = 1,
+    swiglu_limit: float = float("inf"),
 ):
-    """Compile stage1 kernel (cached via underlying lru_cache)."""
+    """Compile stage1 kernel (cached via underlying lru_cache).
+
+    ``swiglu_limit`` is the activation clamp bound (+inf = no clamp). The
+    ``fp4``/``fp8`` family takes it as a runtime kernel arg; the moe_gemm_2stage
+    family (int4 / mxfp4 / mxfp8) takes it as a compile-time constant, so it must
+    be threaded in here or the clamp is silently dropped -- which is exactly the
+    bug this parameter fixes for DeepSeek-V4 (swiglu_limit=10.0).
+    """
     if b_dtype in ("fp4", "fp8"):
         from .kernels.mixed_moe_gemm_2stage import compile_mixed_moe_gemm1
         from .moe_common import GateMode
@@ -783,6 +791,7 @@ def compile_flydsl_moe_stage1(
             use_cshuffle_epilog=_use_cshuffle,
             scale_is_bf16=True,
             k_batch=k_batch,
+            swiglu_limit=swiglu_limit,
         )
     elif a_dtype == "bf16" and b_dtype == "mxfp4":
         # a16w4: bf16 activations, mxfp4 (e2m1) weights with E8M0 per-32 scale.
@@ -807,6 +816,7 @@ def compile_flydsl_moe_stage1(
             use_cshuffle_epilog=_use_cshuffle,
             scale_is_bf16=True,
             k_batch=k_batch,
+            swiglu_limit=swiglu_limit,
         )
     elif a_dtype == "fp8" and b_dtype == "mxfp8":
         # a8w4 Phase0 (CDNA3): fp8 activation x mxfp8 weight (fp8 e4m3fnuz codebook
@@ -831,6 +841,7 @@ def compile_flydsl_moe_stage1(
             use_cshuffle_epilog=_use_cshuffle,
             scale_is_bf16=True,
             k_batch=k_batch,
+            swiglu_limit=swiglu_limit,
         )
     elif a_dtype == "fp8" and b_dtype == "mxfp4":
         # a8w4 Phase1 (CDNA3): fp8 activation x mxfp4 (e2m1) 4-bit-STORED weight,
@@ -856,6 +867,7 @@ def compile_flydsl_moe_stage1(
             use_cshuffle_epilog=_use_cshuffle,
             scale_is_bf16=True,
             k_batch=k_batch,
+            swiglu_limit=swiglu_limit,
         )
     else:
         raise ValueError(
@@ -1836,6 +1848,11 @@ def flydsl_moe_stage1(
         a_scale_one=a_scale_one,
         xcd_swizzle=xcd_swizzle,
         k_wave=k_wave,
+        # The fp4/fp8 family gets the clamp bound as a runtime arg via
+        # _s1_args_fp4; the moe_gemm_2stage family (int4 / mxfp4 / mxfp8) has no
+        # slot for it in _s1_args_std, so it has to travel as a compile-time
+        # constant. Passing it in both places keeps every b_dtype clamped.
+        swiglu_limit=_swiglu_limit_val,
     )
     _run_compiled(exe, args)
 
