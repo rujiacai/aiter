@@ -1307,6 +1307,42 @@ def _load_groupwise_scale(
     return scale_val
 
 
+def load_block_scale_f32(
+    buffer_ops,
+    arith,
+    *,
+    scale_rsrc,
+    n_blk,
+    n_intra,
+    k_pos,
+    num_k_blocks: int,
+    scale_blk_n: int,
+    scale_blk_k: int,
+):
+    """Load one f32 scale from a DeepSeek-style ``(E, N/blk_n, K/blk_k)`` tensor.
+
+    ``n_blk``/``n_intra`` already carry the expert offset (callers build them from
+    ``expert_off + col``), so ``n_blk * 16 + n_intra`` is the row index across all
+    experts. Because ``N_per_expert % scale_blk_n == 0`` the per-expert stride
+    folds into the N-block index and no separate expert term is needed.
+
+    Everything is coerced to i32 and the block division is done with shifts: the
+    operands arrive as a mix of ``index`` and i32 (``idx2crd`` yields i32), and
+    mixed-type ``//`` against ``fx.Index`` constants does not lower to the integer
+    division we want.
+    """
+    if scale_blk_n & (scale_blk_n - 1) or scale_blk_k & (scale_blk_k - 1):
+        raise ValueError(
+            f"block scale sizes must be powers of two, got "
+            f"scale_blk_n={scale_blk_n}, scale_blk_k={scale_blk_k}"
+        )
+    n_global = fx.Int32(n_blk) * fx.Int32(16) + fx.Int32(n_intra)
+    nb = n_global >> fx.Int32(scale_blk_n.bit_length() - 1)
+    kb = fx.Int32(k_pos) >> fx.Int32(scale_blk_k.bit_length() - 1)
+    elem_idx = nb * fx.Int32(num_k_blocks) + kb
+    return buffer_ops.buffer_load(scale_rsrc, elem_idx, vec_width=1, dtype=T.f32)
+
+
 def extract_bf16_scale(arith, scale_raw_i32, ku: int):
     """Extract f32 scale from raw i32 dword loaded by bf16 groupwise path.
 

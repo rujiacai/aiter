@@ -715,6 +715,7 @@ _PER1X32_BF16_FP4 = (aiter.QuantType.per_1x32, dtypes.bf16, dtypes.fp4x2)
 _PER1X32_FP8_FP4 = (aiter.QuantType.per_1x32, dtypes.fp8, dtypes.fp4x2)
 _PER1X32_FP4_FP4 = (aiter.QuantType.per_1x32, dtypes.fp4x2, dtypes.fp4x2)
 _PER1X32_BF16_I4 = (aiter.QuantType.per_1x32, dtypes.bf16, dtypes.i4x2)
+_PER128X128_FP8_FP8 = (aiter.QuantType.per_128x128, dtypes.fp8, dtypes.fp8)
 
 
 def _effective_gate_mode(aq_dtype, wq_dtype):
@@ -727,7 +728,17 @@ def _effective_gate_mode(aq_dtype, wq_dtype):
 
 
 def _effective_swiglu_limit(quant_type, aq_dtype, wq_dtype, swiglu_limit):
+    # Only the families whose stage1 actually consumes the clamp get it; every
+    # other backend silently drops swiglu_limit, so forwarding it there would make
+    # the reference disagree with the kernel. Blockwise fp8 only honours it on the
+    # FlyDSL path (AITER_FLYDSL_BLKFP8=1); the asm/CK kernels ignore it.
     if (quant_type, aq_dtype, wq_dtype) in (_PER1X32_BF16_FP4, _PER1X32_FP8_FP4):
+        return swiglu_limit
+    if (
+        quant_type,
+        aq_dtype,
+        wq_dtype,
+    ) == _PER128X128_FP8_FP8 and os.environ.get("AITER_FLYDSL_BLKFP8", "0") == "1":
         return swiglu_limit
     return None
 

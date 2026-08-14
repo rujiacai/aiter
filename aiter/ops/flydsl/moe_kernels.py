@@ -737,6 +737,76 @@ def get_flydsl_stage2_kernels_mxfp4_fp8(out_dtype: str) -> Dict[str, Dict]:
     return kernels
 
 
+def get_flydsl_stage1_kernels_fp8_blk(out_dtype: str) -> Dict[str, Dict]:
+    """Return {kernelName: params} for blockwise fp8 (DeepSeek 128x128) stage1.
+
+    ``b_dtype="fp8blk"`` rather than ``"fp8"`` because the latter already names the
+    per-1x32 mxfp8 family that routes to mixed_moe_gemm.
+    """
+    kernels = {}
+    a_dtype = "fp8"
+    b_dtype = "fp8blk"
+    # tile_k must be a multiple of the 128-element scale block.
+    for tm in (16, 32, 64, 128):
+        for tn in (64, 128):
+            for tk in (128, 256):
+                for w in (0, 1, 2, 3, 4):
+                    name = flydsl_kernel_name(
+                        1, a_dtype, b_dtype, out_dtype, tm, tn, tk
+                    )
+                    if w:
+                        name += f"_w{w}"
+                    kernels[name] = {
+                        "stage": 1,
+                        "a_dtype": a_dtype,
+                        "b_dtype": b_dtype,
+                        "out_dtype": out_dtype,
+                        "tile_m": tm,
+                        "tile_n": tn,
+                        "tile_k": tk,
+                        "MPerBlock": tm,
+                        "in_dtype": "fp8_blk",
+                        "waves_per_eu": w,
+                    }
+    return kernels
+
+
+def get_flydsl_stage2_kernels_fp8_blk(out_dtype: str) -> Dict[str, Dict]:
+    """Return {kernelName: params} for blockwise fp8 (DeepSeek 128x128) stage2."""
+    kernels = {}
+    a_dtype = "fp8"
+    b_dtype = "fp8blk"
+    for tm in (16, 32, 64, 128):
+        for tn in (128, 256):
+            for tk in (128, 256):
+                for mode in ("atomic",):
+                    for w in (0, 1, 2, 3, 4):
+                        base_name = flydsl_kernel_name(
+                            2, a_dtype, b_dtype, out_dtype, tm, tn, tk, mode
+                        )
+                        if w:
+                            base_name += f"_w{w}"
+                        base_params = {
+                            "stage": 2,
+                            "a_dtype": a_dtype,
+                            "b_dtype": b_dtype,
+                            "out_dtype": out_dtype,
+                            "tile_m": tm,
+                            "tile_n": tn,
+                            "tile_k": tk,
+                            "mode": mode,
+                            "MPerBlock": tm,
+                            "in_dtype": "fp8_blk",
+                            "waves_per_eu": w,
+                        }
+                        kernels[base_name] = base_params
+                        kernels[base_name + "_persist"] = {
+                            **base_params,
+                            "persist": True,
+                        }
+    return kernels
+
+
 def _register_all_configs():
     """Pre-populate _KERNEL_PARAMS with all supported configs at import time."""
     for a in ("fp8", "fp4", "fp16"):
@@ -764,6 +834,10 @@ def _register_all_configs():
     for out in ("bf16", "f16"):
         _KERNEL_PARAMS.update(get_flydsl_stage1_kernels_mxfp4_fp8(out))
         _KERNEL_PARAMS.update(get_flydsl_stage2_kernels_mxfp4_fp8(out))
+    # fp8_blk (a8w8 blockwise: fp8 activation + fp8 weight, DeepSeek 128x128 f32 scale)
+    for out in ("bf16", "f16"):
+        _KERNEL_PARAMS.update(get_flydsl_stage1_kernels_fp8_blk(out))
+        _KERNEL_PARAMS.update(get_flydsl_stage2_kernels_fp8_blk(out))
 
 
 _register_all_configs()
@@ -934,6 +1008,29 @@ def compile_flydsl_moe_stage1(
             k_batch=k_batch,
             swiglu_limit=swiglu_limit,
         )
+    elif a_dtype == "fp8" and b_dtype == "fp8blk":
+        # a8w8 blockwise: fp8 activation + fp8 weight with DeepSeek 128x128 f32
+        # weight scales and 1x128 f32 activation scales, folded in per K block.
+        from .kernels.moe_gemm_2stage import compile_moe_gemm1
+
+        _use_cshuffle = None if k_batch > 1 else False
+
+        return compile_moe_gemm1(
+            model_dim=model_dim,
+            inter_dim=inter_dim,
+            experts=experts,
+            topk=topk,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            tile_k=tile_k,
+            doweight_stage1=doweight_stage1,
+            in_dtype="fp8_blk",
+            out_dtype=out_dtype,
+            waves_per_eu=waves_per_eu,
+            use_cshuffle_epilog=_use_cshuffle,
+            k_batch=k_batch,
+            swiglu_limit=swiglu_limit,
+        )
     else:
         raise ValueError(
             f"Unsupported stage1 dtype combination: a_dtype={a_dtype}, b_dtype={b_dtype}"
@@ -1080,6 +1177,25 @@ def compile_flydsl_moe_stage2(
             out_dtype=out_dtype,
             accumulate=accumulate,
             scale_is_bf16=True,
+            waves_per_eu=waves_per_eu or 0,
+        )
+    elif a_dtype == "fp8" and b_dtype == "fp8blk":
+        # a8w8 blockwise (stage2): fp8 A2 with 1x128 f32 scales x fp8 W2 with
+        # DeepSeek 128x128 f32 scales.
+        from .kernels.moe_gemm_2stage import compile_moe_gemm2
+
+        return compile_moe_gemm2(
+            model_dim=model_dim,
+            inter_dim=inter_dim,
+            experts=experts,
+            topk=topk,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            tile_k=tile_k,
+            doweight_stage2=doweight_stage2,
+            in_dtype="fp8_blk",
+            out_dtype=out_dtype,
+            accumulate=accumulate,
             waves_per_eu=waves_per_eu or 0,
         )
     else:
