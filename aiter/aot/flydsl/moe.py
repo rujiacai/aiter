@@ -260,6 +260,9 @@ def _precompile_to_cache(
 
     dev = torch.device("cpu")
     use_mx_gemm = b_dtype in ("fp4", "fp8")
+    # Blockwise fp8 (DeepSeek 128x128): f32 scales, no e8m0 packing and no sorting.
+    is_blockscale = b_dtype == "fp8blk"
+    _BLK = 128
     tokens = token_num if token_num > 0 else tile_m
     E = experts
     _sort_block_m = sort_block_m if sort_block_m > 0 else tile_m
@@ -316,6 +319,11 @@ def _precompile_to_cache(
 
     def _make_a1_scale():
         """Mirror fused_moe_2stages a1_scale construction (per_1x32 + fp4-weight path)."""
+        if is_blockscale:
+            # per_1x128 activation quant: (tokens, K/128) f32, original token order.
+            return torch.zeros(
+                tokens * (model_dim // _BLK), dtype=torch.float32, device=dev
+            )
         if not use_mx_gemm:
             return None
         if a_dtype == "fp8":
@@ -350,6 +358,13 @@ def _precompile_to_cache(
         buffer is padded to 256 rows and 8 cols.  Otherwise stage2 quantizes
         its own input and the resulting sorted scale uses 32-row alignment.
         """
+        if is_blockscale:
+            # a2 is quantized per (token, slot) row into 1x128 f32 groups.
+            return torch.zeros(
+                tokens * topk * (inter_dim // _BLK),
+                dtype=torch.float32,
+                device=dev,
+            )
         if not use_mx_gemm:
             return None
         if stage1_fuse_quant in ("fp4", "fp8"):
@@ -495,7 +510,14 @@ def _precompile_to_cache(
 
             a1_scale = _make_a1_scale()
             # w1_scale: per-32 group along K dimension. Storage size in bytes.
-            if use_mx_gemm:
+            if is_blockscale:
+                # (E, 2*inter_dim/128, K/128) f32 block scales.
+                w1_scale = torch.zeros(
+                    E * ((2 * inter_dim) // _BLK) * (model_dim // _BLK),
+                    device=dev,
+                    dtype=torch.float32,
+                )
+            elif use_mx_gemm:
                 w1_scale = _make_w_scale(E * 2 * inter_dim * (model_dim // 32))
             else:
                 w1_scale = torch.zeros(1, device=dev, dtype=torch.float32)
@@ -669,7 +691,14 @@ def _precompile_to_cache(
             w2 = _alloc(w2_shape, _storage_dtype(b_dtype))
 
             a2_scale = _make_a2_scale_for_stage2()
-            if use_mx_gemm:
+            if is_blockscale:
+                # (E, model_dim/128, inter_dim/128) f32 block scales.
+                w2_scale = torch.zeros(
+                    E * (model_dim // _BLK) * (inter_dim // _BLK),
+                    device=dev,
+                    dtype=torch.float32,
+                )
+            elif use_mx_gemm:
                 w2_scale = _make_w_scale(E * model_dim * (inter_dim // 32))
             else:
                 w2_scale = torch.zeros(1, device=dev, dtype=torch.float32)

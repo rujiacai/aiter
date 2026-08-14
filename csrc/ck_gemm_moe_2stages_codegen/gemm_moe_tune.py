@@ -83,8 +83,10 @@ if is_flydsl_available():
             flydsl_moe_stage1,
             flydsl_moe_stage2,
             get_flydsl_stage1_kernels,
+            get_flydsl_stage1_kernels_fp8_blk,
             get_flydsl_stage1_kernels_int4_bf16,
             get_flydsl_stage2_kernels,
+            get_flydsl_stage2_kernels_fp8_blk,
             get_flydsl_stage2_kernels_int4_bf16,
             get_flydsl_stage2_v2_kernels,
         )
@@ -1743,8 +1745,14 @@ class FmoeTuner(TunerCommon):
             w2_scale_aiter = w2_scale
         else:
             if w1_scale_aiter is None:
-                w1_scale_aiter = fp4_utils.e8m0_shuffle(w1_scale)
-                w2_scale_aiter = fp4_utils.e8m0_shuffle(w2_scale)
+                if q_type == QuantType.per_1x128:
+                    # f32 block scales are consumed as-is; e8m0_shuffle would
+                    # reinterpret the tensor as uint8.
+                    w1_scale_aiter = w1_scale
+                    w2_scale_aiter = w2_scale
+                else:
+                    w1_scale_aiter = fp4_utils.e8m0_shuffle(w1_scale)
+                    w2_scale_aiter = fp4_utils.e8m0_shuffle(w2_scale)
 
             w1_qt_shffle_flydsl = w1_qt_shffle_ck
             w2_qt_shffle_flydsl = w2_qt_shffle_ck
@@ -2105,6 +2113,7 @@ class FmoeTuner(TunerCommon):
         blockM=32,
         fuse_fp4=False,
         fuse_fp8=False,
+        skip_inter_quant=False,
         situ_beta=DEFAULT_SITUV2_BETA,
         situ_linear_beta=DEFAULT_SITUV2_LINEAR_BETA,
         output_sorted=False,
@@ -2151,7 +2160,9 @@ class FmoeTuner(TunerCommon):
                     a2, sorted_ids, num_valid_ids, token_num, mark_padding=True
                 )
             return a2
-        if quant_type == QuantType.per_1x128:
+        if quant_type == QuantType.per_1x128 and not skip_inter_quant:
+            # The asm/CK blockscale stage1 fuses the a2 quant; the FlyDSL blockwise
+            # kernel writes bf16 and lets the host quantize, so it opts out here.
             ref1, _ref_scale = aiter.pertoken_quant(
                 ref1.view(ref1.shape[0], -1, 128), quant_dtype=a1_qt.dtype
             )
@@ -4222,6 +4233,186 @@ class FmoeTuner(TunerCommon):
 
         return tasks_opus
 
+    def gen_flydsl_blockscale_2stages_task(self, info, blockMs):
+        """FlyDSL candidates for blockwise fp8 (per_1x128, DeepSeek 128x128).
+
+        Kept separate from gen_flydsl_2stages_task, which is built around the
+        per_1x32 microscale families and their fused-quant stage1 variants.
+        Blockwise fp8 has no fused inter-stage quant yet: stage1 writes bf16 and
+        the harness quantizes a2 with the per_1x128 quant op.
+        """
+        tasks_flydsl = []
+        if not is_flydsl_available():
+            return tasks_flydsl
+        (
+            gfx,
+            cu_num,
+            token,
+            model_dim,
+            inter_dim,
+            expert,
+            topk,
+            act_type,
+            dtype,
+            q_dtype_a,
+            q_dtype_w,
+            q_type,
+            use_g1u1,
+            doweight_stage1,
+        ) = info
+
+        if (
+            q_type != QuantType.per_1x128
+            or q_dtype_a != dtypes.fp8
+            or q_dtype_w != dtypes.fp8
+            or not use_g1u1
+        ):
+            return tasks_flydsl
+
+        out_dtype_str = "bf16" if dtype == dtypes.bf16 else "f16"
+        s1_kernels = get_flydsl_stage1_kernels_fp8_blk(out_dtype_str)
+        s2_kernels = get_flydsl_stage2_kernels_fp8_blk(out_dtype_str)
+
+        def _tile_k_ok(tile_k, k):
+            # tile_k must cover whole 128-element scale blocks, and the ping-pong
+            # tail consumes exactly two tiles so the tile count has to be even.
+            return k % tile_k == 0 and (k // tile_k) % 2 == 0
+
+        data_args = (
+            token,
+            model_dim,
+            inter_dim,
+            expert,
+            topk,
+            act_type,
+            dtype,
+            q_dtype_a,
+            q_dtype_w,
+            q_type,
+            use_g1u1,
+            doweight_stage1,
+        )
+
+        for blockM in blockMs:
+            for kname, kparams in s1_kernels.items():
+                if kparams["tile_m"] != blockM:
+                    continue
+                if not _tile_k_ok(kparams["tile_k"], model_dim):
+                    continue
+                tasks_flydsl.append(
+                    (
+                        (info, "stage1", kname, blockM),
+                        FmoeTuner.generate_data_2stages,
+                        data_args + (blockM, 1),
+                        FmoeTuner.run_flydsl_stage1_out,
+                        (
+                            [
+                                "a1_qt",
+                                "w1_qt_shffle_ck",
+                                "sorted_ids",
+                                "sorted_expert_ids",
+                                "sorted_weights",
+                                "num_valid_ids",
+                                "w1_scale_aiter",
+                                "a1_scale",
+                                "bias",
+                            ],
+                            dtype,
+                            topk,
+                            kparams,
+                            blockM,
+                            q_dtype_a,
+                            q_type,
+                            act_type,
+                        ),
+                        {},
+                        FmoeTuner.run_torch_moe_stage1,
+                        (
+                            [
+                                "a1_qt",
+                                "w1_qt",
+                                "w2_qt",
+                                "topk_weights",
+                                "topk_ids",
+                                "a1_scale",
+                                "w1_scale",
+                                "sorted_ids",
+                                "num_valid_ids",
+                                "bias",
+                            ],
+                            dtype,
+                            act_type,
+                            q_type,
+                            doweight_stage1,
+                            topk,
+                            blockM,
+                        ),
+                        {"skip_inter_quant": True},
+                        (None),
+                        0.01,
+                        0.01,
+                        cosine_diff_compare,
+                    )
+                )
+
+            for kname, kparams in s2_kernels.items():
+                if kparams["tile_m"] != blockM:
+                    continue
+                if not _tile_k_ok(kparams["tile_k"], inter_dim):
+                    continue
+                tasks_flydsl.append(
+                    (
+                        (info, "stage2", kname, blockM),
+                        FmoeTuner.generate_data_2stages,
+                        data_args + (blockM, 2),
+                        FmoeTuner.run_flydsl_stage2_out,
+                        (
+                            [
+                                "a2_qt",
+                                "w2_qt_shffle_ck",
+                                "sorted_ids",
+                                "sorted_expert_ids",
+                                "sorted_weights",
+                                "num_valid_ids",
+                                "w2_scale_aiter",
+                                "a2_scale_mxfp4_sort",
+                                "moe_buf",
+                                "bias",
+                            ],
+                            dtype,
+                            topk,
+                            kparams,
+                            blockM,
+                            q_type,
+                            act_type,
+                        ),
+                        {},
+                        FmoeTuner.run_torch_moe_stage2,
+                        (
+                            [
+                                "a2_qt",
+                                "w1_qt",
+                                "w2_qt",
+                                "topk_weights",
+                                "topk_ids",
+                                "a2_scale",
+                                "w2_scale",
+                                "bias",
+                            ],
+                            dtype,
+                            q_type,
+                            doweight_stage1,
+                        ),
+                        {},
+                        (None),
+                        0.01,
+                        0.01,
+                        cosine_diff_compare,
+                    )
+                )
+
+        return tasks_flydsl
+
     def gen_flydsl_i4_2stages_task(self, info, blockMs):
         tasks_flydsl = []
         if not is_flydsl_available():
@@ -4920,6 +5111,10 @@ class FmoeTuner(TunerCommon):
                 tasks_ck.extend(self.gen_flydsl_v2_2stages_task(info, blockMs))
             if _want("flydsli4"):
                 tasks_ck.extend(self.gen_flydsl_i4_2stages_task(info, blockMs))
+            if _want("flydslblk"):
+                tasks_ck.extend(
+                    self.gen_flydsl_blockscale_2stages_task(info, blockMs)
+                )
             if _want("opus"):
                 tasks_ck.extend(
                     self.gen_opus_2stages_task(

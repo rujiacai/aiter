@@ -2336,7 +2336,11 @@ def get_2stage_cfgs(
         ) in fused_moe_1stage_dict.get(get_gfx(), {}):
             if q_type == QuantType.per_1x128:
                 # for fp8 blockscale, ck has better performance so disable assembly kernel
-                run_1stage = token > 32 and (inter_dim % 128 == 0)
+                run_1stage = (
+                    token > 32
+                    and (inter_dim % 128 == 0)
+                    and os.environ.get("AITER_FLYDSL_BLKFP8", "0") != "1"
+                )
             elif q_type == QuantType.per_Token and q_dtype_w == dtypes.i8:
                 run_1stage = token > 32
             elif q_type == QuantType.per_Token and q_dtype_w == dtypes.fp8:
@@ -2454,6 +2458,55 @@ def get_2stage_cfgs(
             run_1stage,
             flat=cfg_flat,
             **route_bucket_metadata,
+        )
+    if (
+        q_type == QuantType.per_1x128
+        and q_dtype_w == dtypes.fp8
+        and q_dtype_a == dtypes.fp8
+        and os.environ.get("AITER_FLYDSL_BLKFP8", "0") == "1"
+        and is_flydsl_available()
+    ):
+        # a8w8 blockwise (FlyDSL): fp8 x fp8 with DeepSeek 128x128 f32 weight scales
+        # and 1x128 f32 activation scales. Opt-in via AITER_FLYDSL_BLKFP8=1 until the
+        # family is tuned; without it per_1x128 keeps going to the asm/CK kernels.
+        # Unlike the mixed (scaled-MFMA) pipeline this family also runs on gfx942.
+        #
+        # Defaults measured on gfx942 with the DSv4 shape (7168/512/385/7): tile_m
+        # above 32 is dominated by per-expert padding, stage1 prefers tile_k=128
+        # while stage2 prefers 256, and waves_per_eu=2 avoids the register-pressure
+        # cliff that the wrapper default of 3 falls off. Replace with tuned CSV rows
+        # once the fp8blk family goes through the fmoe tuner.
+        _out_str = "bf16"
+        _tile_m = 16 if token < 2048 else 32
+        # tile_k must cover whole 128-element scale blocks, and the ping-pong tail
+        # consumes exactly two tiles, so the tile count also has to be even.
+        _tile_k2 = 256 if (inter_dim % 512 == 0) else 128
+        from aiter.ops.flydsl.moe_kernels import flydsl_kernel_name
+
+        kn1 = flydsl_kernel_name(1, "fp8", "fp8blk", _out_str, _tile_m, 128, 128) + "_w2"
+        kn2 = (
+            flydsl_kernel_name(
+                2, "fp8", "fp8blk", _out_str, _tile_m, 256, _tile_k2, "atomic"
+            )
+            + "_w2"
+        )
+        return MOEMetadata(
+            functools.partial(
+                _flydsl_stage1_wrapper,
+                kernelName=kn1,
+                activation=activation,
+                inter_dim_pad=intermediate_pad,
+                model_dim_pad=hidden_pad,
+            ),
+            functools.partial(
+                _flydsl_stage2_wrapper,
+                kernelName=kn2,
+                inter_dim_pad=intermediate_pad,
+                model_dim_pad=hidden_pad,
+            ),
+            _tile_m,
+            1,  # no split-K
+            False,
         )
     is_flydsl1 = isinstance(kernelName1, str) and kernelName1.startswith("flydsl_")
     is_flydsl2 = isinstance(kernelName2, str) and kernelName2.startswith("flydsl_")
