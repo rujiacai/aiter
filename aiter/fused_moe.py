@@ -1559,7 +1559,12 @@ def get_2stage_cfgs(
         _tile_k = 128
         from aiter.ops.flydsl.moe_kernels import flydsl_kernel_name
 
-        kn1 = flydsl_kernel_name(1, "fp8", "mxfp4", _out_str, _tile_m, 128, _tile_k)
+        # stage1 tile_n=64 measured 1.15x faster on the V4-Flash TP4 shape
+        # (inter_dim=512, too few N-blocks at 128); wider inter_dim keeps 128.
+        _s1_tile_n = 64 if inter_dim <= 512 else 128
+        kn1 = flydsl_kernel_name(
+            1, "fp8", "mxfp4", _out_str, _tile_m, _s1_tile_n, _tile_k
+        )
         _s2_tile_n = 128
         kn2 = flydsl_kernel_name(
             2, "fp8", "mxfp4", _out_str, _tile_m, _s2_tile_n, _tile_k, "atomic"
