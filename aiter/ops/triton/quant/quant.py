@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import os
+
 import triton
 import torch
 from aiter.ops.triton._triton_kernels.quant.quant import (
@@ -27,6 +29,17 @@ __all__ = [
 
 
 _LOGGER = AiterTritonLogger()
+
+# AITER_QUANT_PT_BIGTILE — _quant_from_per_tensor_amax_kernel re-reduces the
+# whole per-block amax array in *every* program, so its cost scales with
+# n_blocks rather than with the data. At 32k the a2 quant runs 27648 programs
+# that each reduce 32768 amax values: 16x more max-ops than there are elements
+# to quantize. Widening the tile keeps n_blocks (and that redundant reduction)
+# small. The scale is unaffected: max is associative, so any tiling gives the
+# same per-tensor amax.
+_PT_BIGTILE = os.environ.get("AITER_QUANT_PT_BIGTILE", "0") in ("1", "true", "True")
+_PT_TILE_MAX = int(os.environ.get("AITER_QUANT_PT_TILE", "32768"))
+_PT_NBLOCKS_CAP = 2048
 
 
 def static_per_tensor_quant_fp8_i8(
@@ -114,6 +127,14 @@ def dynamic_per_tensor_quant_fp8_i8_nozero(
     qx_flat = qx.reshape(-1)
     x_flat = x_in.reshape(-1)
     n_elements = x_flat.numel()
+    if _PT_BIGTILE:
+        block_size = min(
+            _PT_TILE_MAX,
+            max(
+                block_size,
+                triton.next_power_of_2(triton.cdiv(n_elements, _PT_NBLOCKS_CAP)),
+            ),
+        )
     n_blocks = triton.cdiv(n_elements, block_size)
     assert amax.numel() >= n_blocks
     amax_block_size = triton.next_power_of_2(n_blocks)

@@ -81,7 +81,10 @@ def _quant_from_per_tensor_amax_kernel(
     amax_offsets = tl.arange(0, AMAX_BLOCK_SIZE)
     amax_mask = amax_offsets < n_blocks
     amax_values = tl.load(amax_ptr + amax_offsets, mask=amax_mask, other=0.0)
-    scale = tl.max(amax_values) / DTYPE_MAX
+    # Clamped like _per_tensor_quant_fused_small_kernel: an all-zero input gives
+    # amax=0 -> 0/0 = fp8 NaN(0x80). Producing a clean zero here lets the caller
+    # skip the [HY3_FIX_V14] guard, which costs two full passes over qx.
+    scale = tl.maximum(tl.max(amax_values) / DTYPE_MAX, 1e-12)
     scale_recip = 1 / scale
 
     offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)

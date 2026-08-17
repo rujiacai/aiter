@@ -43,6 +43,16 @@ _USE_FLYDSL_MOE_SORTING = (
 # set =0 to fall back.
 _FAST_PT_QUANT = os.environ.get("AITER_FUSED_MOE_FAST_PT_QUANT", "1") == "1"
 
+# AITER_QUANT_PT_FUSE_GUARD — _quant_from_per_tensor_amax_kernel now clamps the
+# scale itself, so the zero-input guard below (an eq + a masked_fill_ over the
+# whole quantized buffer) can no longer change the result. At 32k it costs
+# ~158us on the a2 buffer alone.
+_PT_FUSE_GUARD = os.environ.get("AITER_QUANT_PT_FUSE_GUARD", "0") in (
+    "1",
+    "true",
+    "True",
+)
+
 
 def _flydsl_moe_sorting_supported(expert_mask, num_local_tokens):
     """The FlyDSL atomic sort only covers the plain (no-EP) sorting path."""
@@ -1012,7 +1022,8 @@ def _direct_per_tensor_quant_cached(
     ):
         amax = torch.empty(n_blocks, dtype=dtypes.fp32, device=x.device)
     dynamic_per_tensor_quant_fp8_i8_nozero(qbuf, quant_input, sbuf, amax)
-    _guard_zero_input(qbuf, sbuf)
+    if not _PT_FUSE_GUARD:
+        _guard_zero_input(qbuf, sbuf)
     return qbuf, sbuf, amax, sbuf.view(1)
 
 
