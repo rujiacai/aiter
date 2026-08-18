@@ -74,7 +74,7 @@ STAGES=(
   "f2|flydsl_moe1_afp8_wfp8_bf16_t64x64x128_n16|lds_tid 塞进 CShuffle 用不到的那半 X 区：LDS 16640->16384，每 CU 从 3 个 workgroup 变 4 个|FLYDSL_MOE_STAGE1_LDSTIGHT=1"
   "f3|flydsl_moe1_afp8_wfp8_bf16_t64x64x128_n16|per-tensor 激活 scale 提到入口读一次：epilogue 每 wave 少 16 次 buffer_load 同一个 float|FLYDSL_MOE_STAGE1_SCALAR_ASCALE=1"
   "f4|flydsl_moe1_afp8_wfp8_bf16_t64x64x128_n16_bnt0|去掉权重加载的 nt（非临时）标记：同一个专家的权重被约 25 个 M-block 复用，nt 让它每次都回 HBM。L2 命中率 13%->48%|"
-  "f5|flydsl_moe1_afp8_wfp8_bf16_t64x64x128_n16_bnt0|B-first 累加器 + lds_out 行填充：Step1 从 16 次 ds_write_b16 变 4 次 ds_write_b64，LDS 指令数与 bank 冲突双双对齐 PR（时间不变，见 5b）|FLYDSL_MOE_STAGE1_BFIRST=1 FLYDSL_MOE_STAGE1_LDSPAD=8"
+  "f5|flydsl_moe1_afp8_wfp8_bf16_t64x64x128_n16_bnt0|B-first 累加器 + lds_out 行填充：Step1 从 16 次 ds_write_b16 变 4 次 ds_write_b64，LDS 指令数与 bank 冲突双双对齐 PR（时间不变，见第六章；pad=4 是零冲突值）|FLYDSL_MOE_STAGE1_BFIRST=1 FLYDSL_MOE_STAGE1_LDSPAD=4"
   "f6|flydsl_moe1_afp8_wfp8_bf16_t64x64x128_n16_bnt0|a2 量化的 amax tile 加宽：那个 kernel 每个 program 都重做一遍整个 amax 数组的归约，代价随 n_blocks 而不是随数据长（stage1 不动，只动 e2e）|AITER_QUANT_PT_BIGTILE=1"
   "f7|flydsl_moe1_afp8_wfp8_bf16_t64x64x128_n16_bnt0|零值守卫折进 quant kernel：scale 在 kernel 里 clamp，省掉 qx 上的 eq + masked_fill_ 两趟满量程 elementwise|AITER_QUANT_PT_FUSE_GUARD=1"
   "ck|moe_ck2stages_gemm1_256x64x64x128_1x4_MulABScale_v1_Nswizzle0_Quant1_MulRoutedWeight0_silu_F8_F8_B16|CK stage1（生产默认，参照点）|!"
