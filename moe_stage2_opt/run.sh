@@ -43,7 +43,7 @@ RESERVED_GPUS="${RESERVED_GPUS-0,1,2,3}"
 # ---------------------------------------------------------------------------
 STAGES=(
   "base|old|旧内核 reduce，未做任何改动（起点）|"
-  "f1|old|sorted-row 输出路径：partial 按 sorted 行排 + 去掉哨兵掩码|AITER_FLYDSL_STAGE2_SORTED_PARTIAL=1 FLYDSL_MOE_STAGE2_FASTVALID=1"
+  "f1|old|partial 存储从 (token, slot) 改成 sorted 行序 + 去掉哨兵掩码|AITER_FLYDSL_STAGE2_SORTED_PARTIAL=1 FLYDSL_MOE_STAGE2_FASTVALID=1"
   "f2|old|拆掉 epilogue 的逐行标量链：per-tensor scale 提到入口 + 向量化缩放 + per-block buffer 存储|FLYDSL_MOE_STAGE2_SCALAR_ASCALE=1 FLYDSL_MOE_STAGE2_VEC_SCALE=1 FLYDSL_MOE_STAGE2_BUFSTORE=1"
   "f3|old|循环不变量外提（路由权重 / guard / X 的 LDS 读不再逐 N-tile 重做）+ 输出宽度 e_vec=4|FLYDSL_MOE_STAGE2_HOIST_PF=1 FLYDSL_MOE_STAGE2_HOIST_X=1 FLYDSL_MOE_STAGE2_EVEC=4"
   "f4|old|删掉掩码 epilogue：sorted 行布局下 padding 行的写无害，整条掩码路径是死代码|FLYDSL_MOE_STAGE2_NO_MASK=1"
