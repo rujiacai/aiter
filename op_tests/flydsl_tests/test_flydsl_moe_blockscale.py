@@ -109,6 +109,14 @@ def run_stage1(args):
     score = torch.randn((token, E), dtype=dtypes.bf16, device=dev)
     topk_weights, topk_ids = fused_topk(x, score, topk, True)
 
+    # (E, inter_dim) f32 factor folded into the stage1 activation, i.e. the
+    # fc2_smooth_scale convention: act = silu(gate) * up * smooth[expert].
+    smooth = None
+    if args.smooth_scale:
+        smooth = (
+            torch.rand((E, inter_dim), dtype=torch.float32, device=dev) + 0.5
+        ).contiguous()
+
     if args.in_dtype == "fp8":
         # Control group: the pre-existing per-token/per-row fp8 path, driven through
         # exactly the same harness. Tells apart harness bugs from blockwise bugs.
@@ -154,19 +162,26 @@ def run_stage1(args):
                 device=dev,
             )
 
+        # With smooth_scale the reference keeps stage1 in fp32 and rounds once at
+        # the end, because the kernel folds the factor into the f32 accumulator
+        # before its single bf16 truncation. Rounding to bf16 first would add a
+        # second rounding and cost the bit-exact comparison.
         ref = torch_moe_stage1(
             a_q,
             w1_q,
             w2,
             topk_weights,
             topk_ids,
-            dtype=dtypes.bf16,
+            dtype=dtypes.fp32 if smooth is not None else dtypes.bf16,
             activation=aiter.ActivationType.Silu,
             quant_type=aiter.QuantType.per_128x128,
             a1_scale=a_s,
             w1_scale=w1_s,
             swiglu_limit=args.swiglu_limit,
         )
+        if smooth is not None:
+            # ref[t, k, :] *= smooth[topk_ids[t, k], :]  (fc2_smooth_scale convention)
+            ref = (ref * smooth[topk_ids]).to(dtypes.bf16)
 
     sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, _ = moe_sorting(
         topk_ids, topk_weights, E, model_dim, dtypes.bf16, block_m
@@ -195,6 +210,7 @@ def run_stage1(args):
             a1_scale=a_s,
             waves_per_eu=args.waves_per_eu,
             swiglu_limit=args.swiglu_limit,
+            smooth_scale=smooth,
         )
 
     _launch()
@@ -293,6 +309,11 @@ def main():
     p.add_argument("--tile-k", type=int, default=128)
     p.add_argument("--waves-per-eu", type=int, default=0)
     p.add_argument("--swiglu-limit", type=float, default=None)
+    p.add_argument(
+        "--smooth-scale",
+        action="store_true",
+        help="Fold a random (E, inter_dim) f32 factor into the stage1 activation.",
+    )
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--repeat", type=int, default=1)
     p.add_argument("--bench", action="store_true")

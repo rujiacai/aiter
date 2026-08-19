@@ -197,23 +197,22 @@ harness：`op_tests/flydsl_tests/test_flydsl_moe_blockscale.py`
 
 ```bash
 cd /data/aiter_main/aiter
-export PY=./.aiter310/bin/python        # 该环境的 import aiter 指向 main
 export HIP_VISIBLE_DEVICES=0
 
 # 冒烟
-$PY op_tests/flydsl_tests/test_flydsl_moe_blockscale.py \
+python op_tests/flydsl_tests/test_flydsl_moe_blockscale.py \
     -t 128 -dim 1024 -idim 256 -e 8 -k 2 --swiglu-limit 10.0
 
 # DSv4 + 计时
-$PY op_tests/flydsl_tests/test_flydsl_moe_blockscale.py \
+python op_tests/flydsl_tests/test_flydsl_moe_blockscale.py \
     -t 512 -dim 7168 -idim 512 -e 385 -k 7 --swiglu-limit 10.0 --bench
 
 # 端到端
-AITER_FLYDSL_BLKFP8=1 $PY op_tests/test_moe_2stage.py \
+AITER_FLYDSL_BLKFP8=1 AITER_BYPASS_TUNE_CONFIG=1 python op_tests/test_moe_2stage.py \
     -q 5 -t 128 -dim 4096,512 -e 32 -k 4 -sl 10.0 --no-flydsl-csv
 
 # tuner（TUNE_ONLY 必加，见第 7 节）
-TUNE_ONLY=flydslblk $PY csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py \
+TUNE_ONLY=flydslblk python csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py \
     -i /tmp/untuned_blk.csv -o /tmp/tuned_blk.csv --last
 ```
 

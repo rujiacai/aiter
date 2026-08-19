@@ -73,6 +73,36 @@ def parse_num_expert_activated():
 AITER_MOE_NUM_EXPERT_ACTIVATED = parse_num_expert_activated()
 
 
+# Gate thresholds on rel_err (the historical `logits_diff`); other op_tests and the
+# fmoe tuner use the same metric and the same numbers.
+REL_ERR_TOL = 0.01  # pass/fail gate
+REL_ERR_WARN = 1e-3  # "please check the implementation" warning
+
+
+# Timing loop sizes, shared by the whole-call and the per-stage measurements so
+# their numbers stay comparable. Overridable with --iters / --warmup.
+DEFAULT_ITERS = 50
+DEFAULT_WARMUP = 5
+
+
+def calc_cos_sim(x: torch.Tensor, y: torch.Tensor):
+    """Plain cosine similarity; 1.0 means the two agree up to a scale factor."""
+    return torch.nn.functional.cosine_similarity(
+        x.reshape(1, -1).double(), y.reshape(1, -1).double()
+    ).item()
+
+
+def calc_rel_err(x: torch.Tensor, y: torch.Tensor):
+    """``||x-y||^2 / (||x||^2 + ||y||^2)``; 0.0 means bit-exact.
+
+    This, not cosine, is what gates pass/fail: cosine is blind to a pure magnitude
+    error, so a kernel that drops a scale factor and returns 2x the reference still
+    scores 1.0 there while this metric reports 0.2.
+    """
+    x, y = x.double(), y.double()
+    return (1 - 2 * (x * y).sum() / ((x * x + y * y).sum())).item()
+
+
 @benchmark()
 def test_fmoe(
     dtype,
@@ -99,9 +129,19 @@ def test_fmoe(
     kernel_bench=False,
     disable_stage2_bias=False,
     ref_dtype="bf16",
+    use_smooth_scale=False,
+    iters=DEFAULT_ITERS,
+    warmup=DEFAULT_WARMUP,
 ):
     if get_gfx() not in ["gfx950"] and qType in [aiter.QuantType.per_1x32]:
         return
+    # fc2_smooth_scale convention: stage1's activation is scaled per (expert, n)
+    # so the down projection sees pre-scaled input. FlyDSL blockwise fp8 only.
+    smooth_scale = (
+        (torch.rand((E, inter_dim), dtype=torch.float32, device="cuda") + 0.5).contiguous()
+        if use_smooth_scale
+        else None
+    )
     torch_quant = aiter.get_torch_quant(qType)
     # mxfp8 (a8w8): per-1x32 e8m0 microscale on both fp8 activation and fp8 weight.
     is_mxfp8 = (
@@ -393,6 +433,11 @@ def test_fmoe(
     # the 2-stage flydsl/torch path does via its bf16 a2 buffer).
     if ref_dtype == "fp32":
         stage1_ref_dtype = dtypes.fp32
+    if smooth_scale is not None:
+        # The kernel folds smooth_scale into its f32 accumulator before the single
+        # bf16 truncation, so the reference has to stay in f32 until after the
+        # multiply below; rounding twice costs ~4e-06 of rel_err.
+        stage1_ref_dtype = dtypes.fp32
 
     out1_ref = torch_moe_stage1(
         a1_qt,
@@ -414,6 +459,11 @@ def test_fmoe(
         situ_beta=1.0 if beta is None else float(beta),
         situ_linear_beta=1.0 if linear_beta is None else float(linear_beta),
     )
+
+    # torch_moe_stage1 has no smooth_scale arg; apply the fc2_smooth_scale
+    # convention here: out1[t, k, :] *= smooth_scale[topk_ids[t, k], :].
+    if smooth_scale is not None:
+        out1_ref = (out1_ref * smooth_scale[topk_ids]).to(dtype)
 
     # ######################## stage 2 start ###########
     if qType == aiter.QuantType.per_128x128:
@@ -474,6 +524,7 @@ def test_fmoe(
         "beta": beta,
         "linear_beta": linear_beta,
         "gate_mode": gateMode,
+        "smooth_scale": smooth_scale,
     }
 
     if kernel_bench:
@@ -494,9 +545,26 @@ def test_fmoe(
             )
         finally:
             aiter.fused_moe.kernel_bench_callable = None
+        # Snapshot before timing: stage2 reduces with global atomics into moe_out,
+        # so replaying its launch below keeps accumulating into the same buffer.
+        out2_ck = out2_ck.clone()
+        # Time the whole call too, so `us` stays end-to-end (and comparable to a
+        # run without --kernel); the per-stage numbers below exclude the host-side
+        # quant + moe_sorting, so they do not add up to it.
+        _, us2 = run_perftest(
+            fused_moe,
+            input,
+            w1_qt_aiter,
+            w2_qt_aiter,
+            topk_weights,
+            topk_ids,
+            **_fused_moe_kwargs,
+            num_iters=iters,
+            num_warmup=warmup,
+        )
         kernel_us = {}
         for _name, _call in kernel_bench_callable:
-            _, _us = run_perftest(_call, num_iters=20, num_warmup=3)
+            _, _us = run_perftest(_call, num_iters=iters, num_warmup=warmup)
             kernel_us[_name] = _us
         us1 = kernel_us.get("stage1")
         us2_stage = kernel_us.get("stage2")
@@ -507,15 +575,20 @@ def test_fmoe(
             )
         else:
             logger.info(
-                "kernel_bench: stage1=%s us, stage2=%s us (quant:%s)",
+                "kernel_bench: total=%.2f us, stage1=%s us, stage2=%s us (quant:%s)",
+                us2,
                 "n/a" if us1 is None else f"{us1:.2f}",
                 "n/a" if us2_stage is None else f"{us2_stage:.2f}",
                 AQDType,
             )
+        # The eager call above already produced a correct output, so the accuracy
+        # number costs nothing extra and keeps perf sweeps from silently reporting
+        # timings for a wrong kernel.
         return {
-            "us": (us1 or 0.0) + (us2_stage or 0.0),
+            "us": us2,
             "us_stage1": us1,
             "us_stage2": us2_stage,
+            "cos_sim": float(calc_cos_sim(out2_ref, out2_ck)),
         }
 
     out2_ck, us2 = run_perftest(
@@ -525,13 +598,13 @@ def test_fmoe(
         w2_qt_aiter,
         topk_weights,
         topk_ids,
-        num_iters=5,
-        num_warmup=2,
+        num_iters=iters,
+        num_warmup=warmup,
         **_fused_moe_kwargs,
     )
     # Regression guard for aiter #3117 (MXFP4 fused-MoE stage2 EP-prefill):
     # the unfixed K-padding tail-tile path leaves the padded lanes uninitialized,
-    # producing NaN in the fused_moe output. checkAllclose's err/logits_diff can be
+    # producing NaN in the fused_moe output. checkAllclose's err/rel_err can be
     # masked by atomic-reduction noise, so detect NaN explicitly and deterministically.
     has_nan = out2_ck.isnan().any().item()
     if has_nan:
@@ -544,30 +617,26 @@ def test_fmoe(
         msg=f"ck_moe_2stages:{us2:>8.2f} us, {token*model_dim*inter_dim*3*topk*2/us2/1000/1000:>8.2f} tflops......(quant:{AQDType})",
     )
 
-    def calc_diff(x: torch.Tensor, y: torch.Tensor):
-        x, y = x.double(), y.double()
-        denominator = (x * x + y * y).sum()
-        sim = 2 * (x * y).sum() / denominator
-        return 1 - sim
-
-    logits_diff = calc_diff(out2_ref, out2_ck)
-    if logits_diff > 1e-3:
+    cos_sim = calc_cos_sim(out2_ref, out2_ck)
+    rel_err = calc_rel_err(out2_ref, out2_ck)
+    if rel_err > REL_ERR_WARN:
         logger.warning(
-            f"logits_diff: {logits_diff} is too large, please check the implementation"
+            f"rel_err: {rel_err} is too large (cos_sim={cos_sim}), "
+            "please check the implementation"
         )
     if strict_accuracy:
         assert not has_nan, "accuracy check failed: output contains NaN"
         assert not (
-            err != 0 and logits_diff > 0.01
-        ), f"accuracy check failed: checkAllclose err={err}, logits_diff={logits_diff}"
+            err != 0 and rel_err > REL_ERR_TOL
+        ), f"accuracy check failed: checkAllclose err={err}, rel_err={rel_err}"
     elif has_nan:
         logger.warning("accuracy check failed (non-strict): output contains NaN")
-    elif err != 0 and logits_diff > 0.01:
+    elif err != 0 and rel_err > REL_ERR_TOL:
         logger.warning(
-            f"accuracy check failed (non-strict): err={err}, logits_diff={logits_diff}"
+            f"accuracy check failed (non-strict): err={err}, rel_err={rel_err}"
         )
 
-    return {"us": us2, "logits_diff": float(logits_diff)}
+    return {"us": us2, "cos_sim": float(cos_sim)}
 
 
 l_quant = [
@@ -763,6 +832,36 @@ parser.add_argument(
     alone, excluding input prep) and report them as us_stage1 / us_stage2.
     Only the 2-stage path exposes per-kernel launches; the 1-stage path reports
     n/a.""",
+)
+parser.add_argument(
+    "--iters",
+    type=int,
+    default=DEFAULT_ITERS,
+    help=f"run_perftest iterations per timing loop. Default: {DEFAULT_ITERS}.",
+)
+parser.add_argument(
+    "--warmup",
+    type=int,
+    default=DEFAULT_WARMUP,
+    help=f"run_perftest warmup iterations per timing loop. Default: {DEFAULT_WARMUP}.",
+)
+parser.add_argument(
+    "--csv",
+    default=None,
+    help="Append shape/timing/cos_sim columns to this CSV (created if missing).",
+)
+parser.add_argument(
+    "--csv-tag",
+    default=None,
+    help="Value for a leading `variant` column in --csv, e.g. the backend name.",
+)
+parser.add_argument(
+    "--smooth-scale",
+    action="store_true",
+    help="""Fold a random (E, inter_dim) f32 factor into stage1's activation
+    (the fc2_smooth_scale convention). Only the FlyDSL blockwise-fp8 stage1
+    implements it, so this needs AITER_FLYDSL_BLKFP8=1; every other backend
+    raises rather than silently dropping it.""",
 )
 parser.add_argument(
     "--ref-dtype",
@@ -965,6 +1064,9 @@ def _effective_gate_mode(aq_dtype, wq_dtype):
     return GateMode.SEPARATED.value
 
 
+_swiglu_limit_dropped = set()
+
+
 def _effective_swiglu_limit(quant_type, aq_dtype, wq_dtype, swiglu_limit):
     # Only the families whose stage1 actually consumes the clamp get it; every other
     # backend silently drops swiglu_limit, so forwarding it there would make the
@@ -978,6 +1080,28 @@ def _effective_swiglu_limit(quant_type, aq_dtype, wq_dtype, swiglu_limit):
         wq_dtype,
     ) == _PER128X128_FP8_FP8 and os.environ.get("AITER_FLYDSL_BLKFP8", "0") == "1":
         return swiglu_limit
+    # Dropping it here is what keeps the torch reference in step with the kernel, but
+    # it also hides fused_moe's own guard (_check_swiglu_limit_supported), so say so
+    # once per family rather than reporting a clamped run that never happened.
+    key = (quant_type, aq_dtype, wq_dtype)
+    if swiglu_limit is not None and key not in _swiglu_limit_dropped:
+        _swiglu_limit_dropped.add(key)
+        hint = (
+            " Set AITER_FLYDSL_BLKFP8=1 to route to the FlyDSL kernel, which "
+            "implements it."
+            if key == _PER128X128_FP8_FP8
+            else ""
+        )
+        logger.warning(
+            "swiglu_limit=%s ignored for %s / %s / %s: this family's kernel does not "
+            "implement the clamp, so the reference drops it too and the reported "
+            "numbers are for an unclamped run.%s",
+            swiglu_limit,
+            quant_type,
+            aq_dtype,
+            wq_dtype,
+            hint,
+        )
     return None
 
 
@@ -1355,7 +1479,12 @@ for kwargs, extras in case_iter:
         )
         with aot_guard:
             ret = test_fmoe(
-                **kwargs, kernel_bench=args.kernel, ref_dtype=args.ref_dtype
+                **kwargs,
+                kernel_bench=args.kernel,
+                ref_dtype=args.ref_dtype,
+                use_smooth_scale=args.smooth_scale,
+                iters=args.iters,
+                warmup=args.warmup,
             )
     finally:
         if _force_moe_bound_zero:
@@ -1381,3 +1510,29 @@ aiter.logger.info(
 df = pd.DataFrame(df)
 df_md = df.to_markdown(index=False)
 aiter.logger.info("moe_2stage summary (markdown):\n%s", df_md)
+
+# --csv: just the shape + timings + accuracy, appended so a sweep over several
+# backends/shapes lands in one file. The markdown table above keeps every column.
+_CSV_COLS = [
+    "token", "model_dim", "inter_dim", "E", "topk",
+    "us", "us_stage1", "us_stage2", "cos_sim",
+]  # fmt: skip
+# 2 FLOP per MAC over token*topk routed rows. stage1 is A x [gate|up] so its N is
+# 2*inter_dim (factor 4), stage2 is A2 x down (factor 2), whole MoE is the sum.
+_TFLOPS_COLS = [("us", "tflops", 6), ("us_stage1", "tflops_s1", 4), ("us_stage2", "tflops_s2", 2)]
+if args.csv and len(df):
+    out_df = df.reindex(columns=[c for c in _CSV_COLS if c in df.columns])
+    macs = out_df["token"] * out_df["topk"] * out_df["model_dim"] * out_df["inter_dim"]
+    order = ["token", "model_dim", "inter_dim", "E", "topk"]
+    for us_col, tf_col, factor in _TFLOPS_COLS:
+        if us_col not in out_df.columns:
+            continue
+        # 0 us means the stage was never captured (1-stage path); leave it blank.
+        out_df[tf_col] = factor * macs / (out_df[us_col].replace(0, pd.NA) * 1e6)
+        order += [us_col, tf_col]
+    out_df = out_df.reindex(columns=order + ["cos_sim"])
+    if args.csv_tag:
+        out_df.insert(0, "variant", args.csv_tag)
+    _new = not os.path.exists(args.csv) or os.path.getsize(args.csv) == 0
+    out_df.to_csv(args.csv, mode="a", index=False, header=_new, float_format="%.7g")
+    aiter.logger.info("moe_2stage: appended %d rows to %s", len(out_df), args.csv)

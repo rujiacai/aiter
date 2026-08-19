@@ -10,7 +10,7 @@ import pandas as pd
 
 _DERIVED_METRIC_SUFFIXES = (" us",)
 _DROP_SUFFIXES = (" err", " TFLOPS", " TB/s")
-_DROP_COLS = {"logits_diff"}
+_DROP_COLS = {"logits_diff", "cos_sim"}
 
 
 def _is_missing(value) -> bool:

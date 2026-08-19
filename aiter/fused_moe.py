@@ -466,6 +466,9 @@ def fused_moe(
     w2_scale: torch.Tensor | None = None,  # [expert(local_expert:EP), model_dim, 1]
     a1_scale: torch.Tensor | None = None,  # [expert(local_expert:EP), 1, model_dim]
     a2_scale: torch.Tensor | None = None,  # [expert(local_expert:EP), 1, inter_dim]
+    # smoothquant pre-scaling of the down-projection input, folded into stage1's
+    # activation: act *= smooth_scale[expert]. [expert(local_expert:EP), inter_dim]
+    smooth_scale: torch.Tensor | None = None,
     # following for tuning
     block_size_M=None,
     num_local_tokens: torch.Tensor | None = None,
@@ -494,6 +497,10 @@ def fused_moe(
         )
         or shared_expert_id != -1
     ):
+        if smooth_scale is not None:
+            raise NotImplementedError(
+                "smooth_scale is not supported by the shared-expert (fhmoe) path"
+            )
         from aiter.fhmoe import _fhmoe
 
         return _fhmoe(
@@ -542,6 +549,7 @@ def fused_moe(
         w2_scale=w2_scale,
         a1_scale=a1_scale,
         a2_scale=a2_scale,
+        smooth_scale=smooth_scale,
         block_size_M=block_size_M,
         num_local_tokens=num_local_tokens,
         moe_sorting_dispatch_policy=moe_sorting_dispatch_policy,
@@ -572,6 +580,7 @@ def fused_moe_fake(
     w2_scale: torch.Tensor | None = None,  # [expert(local_expert:EP), model_dim, 1]
     a1_scale: torch.Tensor | None = None,  # [expert(local_expert:EP), 1, model_dim]
     a2_scale: torch.Tensor | None = None,  # [expert(local_expert:EP), 1, inter_dim]
+    smooth_scale: torch.Tensor | None = None,  # [expert(local_expert:EP), inter_dim]
     # following for tuning
     block_size_M: int = -1,
     num_local_tokens: torch.Tensor | None = None,
@@ -608,6 +617,7 @@ def fused_moe_(
     w2_scale: torch.Tensor | None = None,  # [expert(local_expert:EP), model_dim, 1]
     a1_scale: torch.Tensor | None = None,  # [expert(local_expert:EP), 1, model_dim]
     a2_scale: torch.Tensor | None = None,  # [expert(local_expert:EP), 1, inter_dim]
+    smooth_scale: torch.Tensor | None = None,  # [expert(local_expert:EP), inter_dim]
     # following for tuning
     block_size_M: int = -1,
     num_local_tokens: torch.Tensor | None = None,
@@ -636,6 +646,7 @@ def fused_moe_(
         w2_scale=w2_scale,
         a1_scale=a1_scale,
         a2_scale=a2_scale,
+        smooth_scale=smooth_scale,
         block_size_M=block_size_M,
         num_local_tokens=num_local_tokens,
         moe_sorting_dispatch_policy=moe_sorting_dispatch_policy,
@@ -665,6 +676,7 @@ def _fused_moe_impl(
     w2_scale: torch.Tensor | None = None,
     a1_scale: torch.Tensor | None = None,
     a2_scale: torch.Tensor | None = None,
+    smooth_scale: torch.Tensor | None = None,
     block_size_M: int = -1,
     num_local_tokens: torch.Tensor | None = None,
     moe_sorting_dispatch_policy: int = 0,
@@ -858,6 +870,9 @@ def _fused_moe_impl(
     if _metadata_transform is not None:
         metadata = _metadata_transform(metadata)
 
+    _check_swiglu_limit_supported(metadata, swiglu_limit, activation)
+    _check_smooth_scale_supported(metadata, smooth_scale)
+
     block_size_M = metadata.block_m if block_size_M is None else block_size_M
     # Ensure block_size_M is int (metadata.block_m from CSV may be float)
     if block_size_M is not None:
@@ -999,6 +1014,7 @@ def _fused_moe_impl(
             bias2=bias2,
             topk_ids=local_topk_ids if local_topk_ids is not None else topk_ids,
             topk_weights=topk_weight,
+            smooth_scale=smooth_scale,
             # only for flydsl dsv4
             swiglu_limit=swiglu_limit,
             beta=beta,
@@ -1403,6 +1419,7 @@ def _flydsl_stage1_wrapper(
     model_dim_pad: int = 0,
     out_dtype: str | None = None,
     v2_output_layout: bool = False,
+    smooth_scale=None,
     **_kwargs,
 ):
     inter_dim_pad, model_dim_pad = _get_padding_for_flydsl(
@@ -1454,6 +1471,70 @@ def _flydsl_stage1_wrapper(
         swiglu_limit=swiglu_limit,
         k_wave=parsed.get("k_wave", 1),
         v2_output_layout=v2_output_layout,
+        smooth_scale=smooth_scale,
+    )
+
+
+# Stage1 implementations that take `swiglu_limit` as a real operand. Must stay in
+# sync with the forwarding in fused_moe_2stages.
+_SWIGLU_LIMIT_STAGE1_FUNCS = (_flydsl_stage1_wrapper, _opus_a8w4_stage1_wrapper)
+
+# asm / CK / cktile have no clamp operand. Their ActivationType.Swiglu path does
+# clamp, but at the OAI constant baked into the kernel (swiglu_and_mul in
+# csrc/kernels/activation_kernels.cu), so only that value is honest there.
+_OAI_SWIGLU_LIMIT = 7.0
+
+
+def _check_swiglu_limit_supported(metadata, swiglu_limit, activation):
+    """Reject a clamp that the selected backend would silently drop.
+
+    Only the FlyDSL and Opus stage1 kernels read `swiglu_limit`; the asm 1-stage /
+    2-stage, CK and cktile kernels have no operand for it, so without this a
+    caller asking for e.g. the DeepSeek-V4 limit of 10.0 would get an unclamped
+    result with no diagnostic.
+    """
+    if not swiglu_limit:
+        return
+    stage1_func = getattr(metadata.stage1, "func", metadata.stage1)
+    if stage1_func in _SWIGLU_LIMIT_STAGE1_FUNCS:
+        return
+    if (
+        activation == ActivationType.Swiglu
+        and abs(float(swiglu_limit) - _OAI_SWIGLU_LIMIT) < 1e-6
+    ):
+        return
+    backend = getattr(stage1_func, "__name__", repr(stage1_func))
+    raise NotImplementedError(
+        f"swiglu_limit={swiglu_limit} was requested but the selected stage1 "
+        f"backend ({backend}) has no clamp operand and would drop it, returning "
+        f"an unclamped result. For blockwise fp8 (per_128x128 / per_1x128) set "
+        f"AITER_FLYDSL_BLKFP8=1 to route to the FlyDSL kernel, which bakes the "
+        f"clamp in; if a tuned CSV row still forces the asm 1-stage kernel, add "
+        f"AITER_BYPASS_TUNE_CONFIG=1."
+    )
+
+
+def _check_smooth_scale_supported(metadata, smooth_scale):
+    """Reject a smooth_scale the selected backend would silently drop.
+
+    Only the FlyDSL blockwise-fp8 stage1 folds the factor into its activation. The
+    asm 1-stage entry does have an `fc2_smooth_scale` argument but fused_moe always
+    passes None, and CK / cktile take no such operand at all, so without this the
+    down projection would silently see unscaled input.
+    """
+    if smooth_scale is None:
+        return
+    stage1_func = getattr(metadata.stage1, "func", metadata.stage1)
+    if stage1_func is _flydsl_stage1_wrapper:
+        return
+    backend = getattr(stage1_func, "__name__", repr(stage1_func))
+    raise NotImplementedError(
+        f"smooth_scale was passed but the selected stage1 backend ({backend}) does "
+        f"not implement it and would drop it, leaving the down projection input "
+        f"unscaled. Only the FlyDSL blockwise-fp8 stage1 supports it: use "
+        f"QuantType.per_128x128 with AITER_FLYDSL_BLKFP8=1 (add "
+        f"AITER_BYPASS_TUNE_CONFIG=1 if a tuned CSV row forces the asm 1-stage "
+        f"kernel)."
     )
 
 
@@ -2994,6 +3075,7 @@ def fused_moe_2stages(
     w2_scale=None,  # [expert(local_expert:EP), model_dim, 1]
     a1_scale=None,  # [expert(local_expert:EP), 1, model_dim]
     a2_scale=None,  # [expert(local_expert:EP), 1, inter_dim]
+    smooth_scale=None,  # [expert(local_expert:EP), inter_dim]
     num_local_tokens: torch.Tensor | None = None,
     # following for cktile support
     hidden_pad=0,
@@ -3172,8 +3254,11 @@ def fused_moe_2stages(
                 extra_stage1_args["topk_ids"] = topk_ids
         if metadata.stage2_has_bias:
             extra_stage2_args["bias2"] = _normalize_bias_for_kernel(bias2)
-    if stage1_func in (_flydsl_stage1_wrapper, _opus_a8w4_stage1_wrapper):
+    if stage1_func in _SWIGLU_LIMIT_STAGE1_FUNCS:
         extra_stage1_args["swiglu_limit"] = swiglu_limit
+    if smooth_scale is not None:
+        # _check_smooth_scale_supported already rejected every other backend.
+        extra_stage1_args["smooth_scale"] = smooth_scale
     if stage1_func is _flydsl_stage1_wrapper:
         if metadata.skip_inter_quant:
             extra_stage1_args["v2_output_layout"] = True

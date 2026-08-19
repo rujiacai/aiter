@@ -705,6 +705,9 @@ def compile_flydsl_moe_stage1(
     # Only the blockwise-fp8 kernel takes the clamp at compile time; the mixed
     # pipeline receives it as a runtime kernel argument instead.
     swiglu_limit: float | None = None,
+    # Blockwise-fp8 only: fold a per-(expert, inter_dim) f32 factor into the stage1
+    # activation (the fc2_smooth_scale / smoothquant convention).
+    enable_smooth_scale: bool = False,
 ):
     """Compile stage1 kernel (cached via underlying lru_cache)."""
     # a16w-mix (bf16 A x {fp4 mxfp4, int4} W): build the ported gemm1
@@ -791,6 +794,7 @@ def compile_flydsl_moe_stage1(
             use_cshuffle_epilog=None if k_batch > 1 else False,
             k_batch=k_batch,
             swiglu_limit=float("inf") if swiglu_limit is None else float(swiglu_limit),
+            enable_smooth_scale=enable_smooth_scale,
         )
     else:
         raise ValueError(
@@ -1005,6 +1009,50 @@ def _s1_args_std(
         ptr_arg(sorted_expert_ids),
         ptr_arg(sorted_weights),
         ptr_arg(num_valid_ids),
+        token_num,
+        n_in,
+        k_in,
+        size_expert_ids_in,
+        stream,
+    )
+
+
+def _s1_args_blk(
+    out,
+    a,
+    w,
+    a_scale,
+    w_scale,
+    sorted_ids,
+    sorted_expert_ids,
+    sorted_weights,
+    num_valid_ids,
+    smooth_scale,
+    token_num,
+    n_in,
+    k_in,
+    size_expert_ids_in,
+    stream=None,
+):
+    """`_s1_args_std` plus the blockscale kernel's trailing smooth_scale pointer.
+
+    Kept separate because the extra pointer is part of moe_2stage_blockscale's
+    kernel signature only; the other families that share `_s1_args_std` would
+    get an argument their kernel never declared.
+    """
+    if stream is None:
+        stream = torch.cuda.current_stream()
+    return (
+        ptr_arg(out),
+        ptr_arg(a),
+        ptr_arg(w),
+        ptr_arg(a_scale),
+        ptr_arg(w_scale),
+        ptr_arg(sorted_ids),
+        ptr_arg(sorted_expert_ids),
+        ptr_arg(sorted_weights),
+        ptr_arg(num_valid_ids),
+        ptr_arg(smooth_scale),
         token_num,
         n_in,
         k_in,
@@ -1570,6 +1618,7 @@ def _flydsl_moe_stage1_impl(
     swiglu_limit: float | None = None,
     k_wave: int = 1,
     v2_output_layout: bool = False,
+    smooth_scale: torch.Tensor | None = None,
     _compile_kernel=compile_flydsl_moe_stage1,
     _build_mx_args=_s1_args_fp4,
 ):
@@ -1795,6 +1844,27 @@ def _flydsl_moe_stage1_impl(
             ),
             swiglu_limit=_swiglu_limit_val,
         )
+    elif b_dtype in ("fp8blk", "fp8row"):
+        args = _s1_args_blk(
+            _kernel_out.view(-1),
+            a.view(-1),
+            w1.view(-1),
+            flat_a_scale,
+            flat_w_scale,
+            sorted_token_ids,
+            sorted_expert_ids,
+            sw,
+            num_valid_ids,
+            (
+                smooth_scale.contiguous().view(-1)
+                if smooth_scale is not None
+                else torch.empty(0, dtype=torch.float32, device=dev)
+            ),
+            token_num,
+            _n_in,
+            _k_in,
+            _grid_y,
+        )
     else:
         args = _s1_args_std(
             _kernel_out.view(-1),
@@ -1844,6 +1914,15 @@ def _flydsl_moe_stage1_impl(
         # Blockwise fp8 bakes the clamp into the kernel instead of taking it as a
         # runtime arg, so it has to reach compile time.
         compile_kwargs["swiglu_limit"] = _swiglu_limit_val
+    if b_dtype in ("fp8blk", "fp8row"):
+        # Same story for the smooth_scale pointer: gating it at compile time keeps
+        # kernels without it byte-identical to before.
+        compile_kwargs["enable_smooth_scale"] = smooth_scale is not None
+    elif smooth_scale is not None:
+        raise NotImplementedError(
+            f"smooth_scale is only implemented for the blockwise fp8 stage1 kernel "
+            f"(b_dtype='fp8blk'), got b_dtype={b_dtype!r}"
+        )
     # The injected FHMoE compiler does not implement the v2 sorted-row layout.
     if _v2_output_layout:
         compile_kwargs["v2_output_layout"] = True
@@ -2022,6 +2101,7 @@ def flydsl_moe_stage1(
     swiglu_limit: float | None = None,
     k_wave: int = 1,
     v2_output_layout: bool = False,
+    smooth_scale: torch.Tensor | None = None,
 ):
     """Fused gate+up GEMM (MOE stage1).
 
@@ -2030,6 +2110,11 @@ def flydsl_moe_stage1(
     bias: optional (E, 2*inter_dim) f32 bias added before activation.
     For fp4 stage1, `w1`/`w1_scale` must use the same preshuffle layout as
     `shuffle_weight_a16w4(w1, 16, True)` and `shuffle_scale_a16w4(w1_scale, E, True)`.
+
+    smooth_scale: optional (E, inter_dim) f32, multiplied into the activation
+    (``act = act(gate, up) * smooth_scale[expert]``) so the down projection sees
+    pre-scaled input. Same convention as torch_moe's `fc2_smooth_scale`.
+    Blockwise fp8 (`b_dtype="fp8blk"`) only.
 
     When fuse_quant=True, the kernel fuses quantization (fp4/fp8, inferred from
     out_dtype) and writes e8m0 scales in sorted tiled layout directly.
@@ -2079,6 +2164,7 @@ def flydsl_moe_stage1(
         swiglu_limit=swiglu_limit,
         k_wave=k_wave,
         v2_output_layout=v2_output_layout,
+        smooth_scale=smooth_scale,
     )
 
 

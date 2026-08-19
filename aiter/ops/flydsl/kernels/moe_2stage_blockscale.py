@@ -150,6 +150,7 @@ def compile_moe_gemm1(
     swiglu_limit: float = float("inf"),
     scale_blk_n: int = 128,
     scale_blk_k: int = 128,
+    enable_smooth_scale: bool = False,
 ):
     """Compile stage1 kernel (`moe_gemm1`) and return the compiled executable.
 
@@ -174,6 +175,11 @@ def compile_moe_gemm1(
       usage to fit that many waves per SIMD. At tile_m>=64 the a8w4 path otherwise
       needs ~500 VGPRs and drops to 1 wave/SIMD, which leaves the SIMD idle 35-60%
       of the time waiting on memory (see aiter_logs/prof_a8w4_breakdown.py).
+    enable_smooth_scale: fold a per-(expert, inter_dim) f32 factor into the stage1
+      output, i.e. ``act = act(gate, up) * smooth_scale[expert, n]``. Matches the
+      ``fc2_smooth_scale`` convention already used by torch_moe / the asm kernels
+      (smoothquant pre-scaling of the down-projection input). Compile-time so the
+      pointer and the extra multiply disappear entirely when unused.
     """
 
     gpu_arch = get_hip_arch()
@@ -295,6 +301,12 @@ def compile_moe_gemm1(
 
     # Split-K validation
     _is_splitk = k_batch > 1
+    if enable_smooth_scale and _is_splitk:
+        # Split-K stage1 stores raw gate/up partials and the activation runs on the
+        # host afterwards, so there is no epilogue here to fold the factor into.
+        raise NotImplementedError(
+            "smooth_scale is not supported with split-K stage1 (k_batch>1)"
+        )
     if _is_splitk:
         _k_per_batch = model_dim // k_batch
         assert (
@@ -479,6 +491,7 @@ def compile_moe_gemm1(
             arg_expert_ids: fx.Pointer,
             arg_sorted_weights: fx.Pointer,
             arg_max_token_ids: fx.Pointer,
+            arg_smooth_scale: fx.Pointer,
             i32_tokens_in: fx.Int32,
             i32_inter_in: fx.Int32,
             i32_k_in: fx.Int32,
@@ -693,6 +706,12 @@ def compile_moe_gemm1(
                     sw_rsrc = None
                 else:
                     sw_rsrc = _ptr_buffer_resource(arg_scale_w, sw_nbytes)
+
+                # smooth_scale: [experts, inter_dim] f32, indexed by (expert, n).
+                if const_expr(enable_smooth_scale):
+                    smooth_rsrc = _ptr_buffer_resource(
+                        arg_smooth_scale, experts * inter_dim * 4
+                    )
 
                 sorted_nbytes_idx = size_expert_ids_in * fx.Index(tile_m) * fx.Index(4)
                 sorted_rsrc = _ptr_buffer_resource(
@@ -1698,6 +1717,22 @@ def compile_moe_gemm1(
                 lane_div_16 * fx.Index(4)
                 inter_i32_local = inter_i32_v
 
+                # smooth_scale row base for this tile's expert; the column term is
+                # added per `ni` in the epilogue.
+                if const_expr(enable_smooth_scale):
+                    smooth_base_i32 = expert_i32 * inter_i32_local
+
+                def apply_smooth(y, col_i32):
+                    """Multiply the activation by smooth_scale[expert, col]."""
+                    if const_expr(not enable_smooth_scale):
+                        return y
+                    return y * buffer_ops.buffer_load(
+                        smooth_rsrc,
+                        smooth_base_i32 + col_i32,
+                        vec_width=1,
+                        dtype=T.f32,
+                    )
+
                 # Uses EVec=4 (buffer store "x4" of fp16 elements).
                 use_cshuffle_epilog_flag = _use_cshuffle_epilog
 
@@ -2034,6 +2069,11 @@ def compile_moe_gemm1(
                             vu = vu * sx * sw_up
 
                             y = silu(clamp_gate(vg)) * clamp_up(vu)
+                            # `col_local` is tile-local; by_n makes it the column
+                            # within this expert's inter_dim (== col_g_list[ni]).
+                            y = apply_smooth(
+                                y, arith.index_cast(T.i32, by_n + col_local)
+                            )
                             if const_expr(doweight_stage1):
                                 y = y * tw
                             y16 = arith.trunc_f(T.f16, y)
@@ -2169,6 +2209,7 @@ def compile_moe_gemm1(
                             vu = vu * sx * sw_up
 
                             y = silu(clamp_gate(vg)) * clamp_up(vu)
+                            y = apply_smooth(y, col_i32)
                             if const_expr(doweight_stage1):
                                 y = y * tw
                             y = arith.trunc_f(out_mlir(), y)
@@ -2197,6 +2238,7 @@ def compile_moe_gemm1(
         arg_expert_ids: fx.Pointer,
         arg_sorted_weights: fx.Pointer,
         arg_max_token_ids: fx.Pointer,
+        arg_smooth_scale: fx.Pointer,
         i32_tokens_in: fx.Int32,
         i32_inter_in: fx.Int32,
         i32_k_in: fx.Int32,
@@ -2223,6 +2265,7 @@ def compile_moe_gemm1(
             arg_expert_ids,
             arg_sorted_weights,
             arg_max_token_ids,
+            arg_smooth_scale,
             i32_tokens_in,
             i32_inter_in,
             i32_k_in,
