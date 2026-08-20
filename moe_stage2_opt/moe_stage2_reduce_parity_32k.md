@@ -703,7 +703,7 @@ GEMM 本体省 957 us，归约那边因为要 gather 多花 64 us，净赚 824 u
 
 ---
 
-## 三、Feature 2：拆掉 epilogue 的逐行标量链
+## 三、Feature 2：epilogue 的 scale 与地址从逐元素重算改成提前算一次
 
 **e2e −239.7 us（累计补上总差距的 64.9%）；stage2 GEMM −261.5 us**
 
@@ -891,32 +891,188 @@ per-tensor 时那个数组里每个元素都一样，读一次就够：
 
 #### (b) 缩放按 f32x4 整体做
 
-关键观察：`write_row_to_lds` 对固定的 `mi` 会被调用 `ii = 0..3` 四次，而
-`acc[mi*num_acc_n + ni]` 这个 f32x4 装的**正好就是那四行**。所以缩放可以一次做完，
-缓存起来，后三次直接 extract：
+##### 先看清楚这个 f32x4 是什么
 
-```python
-def _scaled_acc(mi, ni, ii, row):
-    """acc[mi,ni] * scale, as an f32x4 covering ii = 0..3."""
-    key = (bool(_epi["masked"]), mi, ni)
-    got = _vec_scale_cache.get(key)
-    if got is None:
-        if doweight_stage2:
-            tws = [tw_pf[(mi * 4) + jj] for jj in range_constexpr(4)]
-            tw_vec = vector.from_elements(T.vec(4, T.f32), tws)
-            svec = tw_vec * _sw_x[ni]
-        else:
-            svec = _sw_x[ni]
-        got = acc[mi * num_acc_n + ni] * svec
-        _vec_scale_cache[key] = got
-    return got
+取 wave 0 的 lane 5（`lane/16 = 0`、`lane%16 = 5`），它的 `acc[mi=0, ni=0]`：
+
+```
+                          列 (通道) →
+              0   1   2   3   4   5   6  ...  15
+            ┌────────────────────────────────────
+     行 0   │                   ●                  ← ii=0
+     行 1   │                   ●                  ← ii=1
+     行 2   │                   ●                  ← ii=2
+     行 3   │                   ●                  ← ii=3
+     行 4   │                   ·
+      ↓     │                   ·
+                                ↑
+                          全都在第 5 列
 ```
 
-`_sw_x[ni]` 是 `sx * sw_vals[ni]` 提前折好并 splat 成向量的结果——**MLIR 的 `arith.mulf`
-不做 vector×scalar 广播**，标量必须先 splat，否则报
-`'arith.mulf' op requires the same type for all operands and results`。
+**这 4 个数是「同一列的 4 个连续行」**（下标含义见 1.0 的累加器布局）。
 
-**LDS 写仍然逐行**（四行落在四个不同的 LDS 行），这里只向量化了算术。
+##### 三个 scale 因子在这 4 个格子上怎么变
+
+每个输出元素最终要乘 `sx × sw × tw` 三样：
+
+```
+                ii=0     ii=1     ii=2     ii=3
+ acc (f32x4)  [  a0   ,   a1   ,   a2   ,   a3  ]   ← 行 0/1/2/3 的第 5 列
+
+ sx  激活scale[  SX   ,   SX   ,   SX   ,   SX  ]   per-tensor  → 全一样 ✓
+ sw  权重scale[  SW5  ,   SW5  ,   SW5  ,   SW5 ]   逐"列"变    → 同一列 → 全一样 ✓
+ tw  路由权重 [  TW0  ,   TW1  ,   TW2  ,   TW3 ]   逐"行"变    → 4 个都不同 ★
+```
+
+| | 变量 | 来自 | 粒度 |
+|---|---|---|---|
+| 激活 scale | `sx` | `arg_scale_x`（A2 scale，fp8 反量化） | per-tensor（本 feature 的前提） |
+| 权重 scale | `sw` | `arg_scale_w`（W2 scale） | per-channel，`sw_vals[ni]` |
+| 路由权重 | `tw` | `sorted_weights` | per-row，`doweight_stage2` 时才有 |
+
+> `sx` 只在**输入是 fp8/int8** 时存在；f16/bf16 输入下 `sx_rsrc = None`、`sx` 恒为 1.0。
+
+**注意这里不是"per-tensor 所以 scale 相同、算一次就够"**——最终乘的 scale 在 4 个元素上
+**并不相同**（`tw` 逐行变）。三个因子里两个在向量内是常量，只有一个在变。
+
+##### 改之前：4 条独立的标量链
+
+```
+ii=0:  SX ─┬─× TW0 ──→ sx_row ──× SW5 ──→ scale ──× a0 ──→ 结果0     3 条标量乘
+ii=1:  SX ─┼─× TW1 ──→ sx_row ──× SW5 ──→ scale ──× a1 ──→ 结果1     3 条
+ii=2:  SX ─┼─× TW2 ──→ sx_row ──× SW5 ──→ scale ──× a2 ──→ 结果2     3 条
+ii=3:  SX ─┴─× TW3 ──→ sx_row ──× SW5 ──→ scale ──× a3 ──→ 结果3     3 条
+                                  ↑
+                          SX×SW5 明明不变，却算了 4 遍
+```
+
+##### 改之后：不变的提到外层，变的拼成向量
+
+```
+【每个 N-tile 折一次】  SX × SW5  ──→ splat ──→ SXSW = [ S, S, S, S ]     ← 不随行变
+
+【每个 (mi,ni) 折一次】 TW_vec = [ TW0, TW1, TW2, TW3 ]                    ← 随行变，拼成向量
+                        svec   = TW_vec × SXSW      ← 1 条向量乘
+                        got    = acc    × svec      ← 1 条向量乘
+
+【ii = 0..3】           extract(got, ii)            ← 不再有任何乘法
+```
+
+所以省的是两处，**都不是"值相同所以只算一次"**：
+
+1. **把不变的因子提到外层**——`SX × SW5` 跨 4 行不变，从算 4 遍变成每 N-tile 算 1 遍；
+2. **把变的因子拼成向量**——`TW` 是 4 个不同的值，但一条 `v_pk_mul_f32` 能处理 2 个 f32，
+   所以 f32x4 乘一次只要 2 条机器指令，而不是 4 条标量乘。
+
+##### 对应代码
+
+```4611:4623:aiter/ops/flydsl/kernels/moe_gemm_2stage.py
+                        _sw_x = [
+                            (
+                                sw_vals[ni]
+                                * vector.from_elements(
+                                    T.vec(4, T.f32), [sx_scalar] * 4
+                                )
+                                if _bfirst
+                                else vector.from_elements(
+                                    T.vec(4, T.f32), [sx_scalar * sw_vals[ni]] * 4
+                                )
+                            )
+                            for ni in range(num_acc_n)
+                        ]
+```
+
+A-first 走 `else` 那支：`splat(sx_scalar * sw_vals[ni])`，就是图里的 `[S,S,S,S]`。
+这是**普通 Python 列表推导**，emit 时执行一次，整个 N-tile 只发出 `num_acc_n = 2` 条乘法。
+
+`_sw_x[ni]` 必须先 splat 成向量——**MLIR 的 `arith.mulf` 不做 vector×scalar 广播**，
+否则报 `'arith.mulf' op requires the same type for all operands and results`。
+
+```4678:4701:aiter/ops/flydsl/kernels/moe_gemm_2stage.py
+                                else:
+                                    tws = []
+                                    for jj in range_constexpr(4):
+                                        if tw_pf is not None:
+                                            tws.append(tw_pf[(mi * 4) + jj])
+                                        else:
+                                            # `row` is this call's row; the sibling rows of the
+                                            # same mi differ by (jj - ii).
+                                            tws.append(
+                                                buffer_ops.buffer_load(
+                                                    sorted_w_rsrc,
+                                                    row + fx.Index(jj - ii),
+                                                    vec_width=1,
+                                                    dtype=T.f32,
+                                                )
+                                            )
+                                    tw_vec = vector.from_elements(T.vec(4, T.f32), tws)
+                                svec = tw_vec * _sw_x[ni]
+                            else:
+                                svec = _sw_x[ni]
+                            a = acc[mi * num_acc_n + ni]
+                            if is_int8:
+                                a = arith.sitofp(T.vec(4, T.f32), a)
+                            got = a * svec
+```
+
+和改之前逐处对照：
+
+| 图里的 | 改之前 | 改之后 |
+|---|---|---|
+| 取 `TW` | 4829 单个 `tw_pf[mi*4+ii]` | 4682 四个 `tw_pf[mi*4+jj]`，`jj=0..3` |
+| `SX × SW` | 4850 内联，每次重算 | 4611 提到 N-tile 层，只算 1 次 |
+| `× TW` | 4840 标量 | 4695 向量 |
+| `× acc` | 4850 标量（extract 后乘） | 4701 向量（整块乘） |
+| `ii` 展开 | 4841 每次全算 | 4632 缓存命中，只剩 extract |
+| 写 LDS | 4856 `alignment=2` | 4759 `alignment=2`（**不变**） |
+
+##### 缓存键里为什么可以不带 `ii`
+
+```4632:4634:aiter/ops/flydsl/kernels/moe_gemm_2stage.py
+                        key = (bool(_epi["masked"]), mi, ni)
+                        got = _vec_scale_cache.get(key)
+                        if got is None:
+```
+
+`write_row_to_lds` 每个输出行被调一次，固定 `mi` 下 `ii = 0..3` 共 4 次，
+**四次要的是同一个 f32x4 的四个元素**：
+
+```
+调用 1 (ii=0) → _scaled_acc(mi,ni,0)  未命中 → 算出 got=[g0,g1,g2,g3] 存缓存 → extract(got,0)
+调用 2 (ii=1) → _scaled_acc(mi,ni,1)  命中 ───────────────────────────────→ extract(got,1)
+调用 3 (ii=2) → _scaled_acc(mi,ni,2)  命中 ───────────────────────────────→ extract(got,2)
+调用 4 (ii=3) → _scaled_acc(mi,ni,3)  命中 ───────────────────────────────→ extract(got,3)
+```
+
+之所以安全，是因为 **`_scaled_acc` 的返回值根本不依赖 `ii`**。`ii` 在函数体里只出现一处，
+就是 `tw_pf` 为空时的兜底 `row + fx.Index(jj - ii)`，而这个偏移恰好互相抵消：
+
+| 谁来调 | `row` 是 | `jj - ii`（jj=0..3） | 实际取的行 |
+|---|---|---|---|
+| `ii=0` | base+0 | 0, 1, 2, 3 | base+0 ~ base+3 |
+| `ii=2` | base+2 | −2, −1, 0, 1 | base+0 ~ base+3 |
+
+不管谁来调，取到的都是同一组 4 行，结果恒等。
+
+> **这不是运行时缓存。** `_vec_scale_cache` 是普通 Python 字典，`range_constexpr` 也是编译期
+> 展开——命中缓存等于那几条乘法**根本没被写进 IR**，不是运行时跳过。同理 `mi`/`ii`/`ni`
+> 全是 Python `int`，最终 ISA 里是 16 份展开的直线代码，没有循环也没有查表。
+
+##### f2 没有减少调用次数
+
+一个容易产生的误解：既然四次要的是同一个 f32x4，是不是该合并成一次调用？
+**f2 做不到，因为 A-first 下这 4 个值落在 4 个不同的 LDS 行上，地址不连续，
+每行必须单独写一次 `ds_write_b16`。**
+
+```
+f2 之前：调用 16 次，每次算完整标量链              → 80 条乘法
+f2 之后：调用 16 次，其中 12 次命中缓存只做 extract → 34 条乘法
+         ↑ 次数没变，LDS 写指令也没变（1024 条）
+```
+
+`default_epilog`（`mfma_epilogues.py:75-81`）那个 `for mi: for ii:` 双层循环在 f2 前后
+**一字未改**。真正把它塌成每 `mi` 一次（`_step1`，16 → 4 次调用）的是 **f5 的 B-first**，
+那时一个 lane 的 4 个值变成同一行的 4 个连续通道、地址连续了，一次能写完。见第六章。
 
 按每个 N-tile 数（`tile_m=64`、`num_acc_n=2`）：标量形式是每 `(mi, ii)` 5 条乘法共 **80 条**；
 向量形式是 `2 (sx*sw) + 16 (tw_vec*sw) + 16 (acc*scale)` = **34 条**。
@@ -2584,7 +2740,7 @@ bit 3~5；16 行落到 8 个不同的 bank，**2 路冲突，而 pad 是 0 路**
 |---|---|---|---|---|---|
 | `base` | **7834.5** | — | — | 0% | 旧内核 reduce，未改动 |
 | `f1` | **7064.0** | −770.6 | −770.6 | **48.3%** | partial 存储从 (token, slot) 改成 sorted 行序 |
-| `f2` | **6715.0** | −349.0 | −1119.5 | **70.2%** | 拆掉 epilogue 的逐行标量链 |
+| `f2` | **6715.0** | −349.0 | −1119.5 | **70.2%** | epilogue 的 scale 与地址从逐元素重算改成提前算一次 |
 | `f3` | **6470.1** | −244.9 | −1364.4 | **85.5%** | 循环不变量外提 + 输出宽度 |
 | `f4` | **6443.1** | −27.0 | −1391.4 | **87.2%** | 删掉掩码 epilogue |
 | `f5` | **6340.4** | −102.7 | −1494.1 | **93.7%** | CShuffle 两端一起加宽（第六章） |
@@ -2720,7 +2876,7 @@ GPU=3 ./run.sh                   # 换卡
 STAGES=(
   "base|old|旧内核 reduce，未做任何改动（起点）|"
   "f1|old|partial 存储从 (token, slot) 改成 sorted 行序 + 去掉哨兵掩码|AITER_FLYDSL_STAGE2_SORTED_PARTIAL=1 FLYDSL_MOE_STAGE2_FASTVALID=1"
-  "f2|old|拆掉 epilogue 的逐行标量链：...|FLYDSL_MOE_STAGE2_SCALAR_ASCALE=1 FLYDSL_MOE_STAGE2_VEC_SCALE=1 FLYDSL_MOE_STAGE2_BUFSTORE=1"
+  "f2|old|epilogue 的 scale 与地址从逐元素重算改成提前算一次：per-tensor scale 提到入口 + 向量化缩放 + per-block buffer 存储|FLYDSL_MOE_STAGE2_SCALAR_ASCALE=1 FLYDSL_MOE_STAGE2_VEC_SCALE=1 FLYDSL_MOE_STAGE2_BUFSTORE=1"
   "f3|old|<下一个 feature>|<它自己的 knob>"          # <-- 加在这里
   "target|new|新内核 pr1x4 + Triton 归约（目标）|!AITER_PR1X4_TRITON_REDUCE=1"
 )
@@ -3095,3 +3251,44 @@ PTL 前置检查已经加了（`check_ptl`，关着就 exit 3，`--no-ptl-check`
 比同组中位数高 23%，当时被当成噪声记下来了——现在回看，**那正是 PTL 掉下去的那一刻**。
 
 组内单点偏离中位数超过 5% 就该打警告。这类信号出现时往往不是噪声，而是机器状态在变。
+
+### T6. `FASTIDX` 改成按专家数自动启用
+
+**现状**：`FLYDSL_MOE_STAGE2_FASTIDX` 手工开、默认关，host 侧没有任何判断。
+
+和 T1 不同，**这个 knob 不存在算错的风险**——被删掉的那个取模在任何 shape 下都是恒等的：
+
+```
+row = expert_off_idx + col_g = expert_idx * model_dim + col_g
+      expert_idx < experts，col_g < model_dim
+⟹  row < experts * model_dim
+⟹  row / 16 < experts * model_dim / 16 = c_n0_static
+⟹  (row / 16) % c_n0_static 恒等
+```
+
+推导只用到 `expert_idx < experts` 和 `col_g < model_dim`，与 tile 尺寸、token 数、topk
+都无关（唯一的隐含前提 `model_dim % 16 == 0` 本来就被 B 的 layout 要求了）。
+**所以它永远安全，问题只在于有没有收益。**
+
+**收益判据**：`c_n0_static = experts × model_dim / 16`。`model_dim` 实际总是 2 的幂、
+`/16` 也是，所以
+
+> `c_n0_static` 是不是 2 的幂 ⟺ **`experts` 是不是 2 的幂**。
+
+| 专家数 | 2 的幂？ | 有收益？ |
+|---|---|---|
+| 8（Mixtral）、64、128、256 | 是 | ✗ 编译器本来就降成掩码 |
+| 160（DeepSeek-V2 路由专家） | 否 | ✓ |
+| 60（Qwen MoE） | 否 | ✓ |
+| **193（本文）** | 否 | ✓ **f6 的 −806 静态 VALU 全靠这个 193** |
+
+**目标形态**：host 侧一行判断即可，`experts & (experts - 1) != 0` 就自动开，
+env 退化成 kill-switch。`experts` 在 `compile_moe_gemm2` 的参数里现成就有，
+不像 T1 那样需要新增编译参数。
+
+**注意收益随展开度变**：那 64 条 `srem` 来自 `_compute_nidx_for` 被调
+`N-tile 数 × num_acc_n` 次。N-tile 数 = `model_dim / tile_n`，所以 `model_dim` 越大、
+`tile_n` 越小，重复份数越多、收益越大；非 persist 路径没有这个放大效应，收益会小很多。
+
+**做完的收益**：f6 的 −59.4 us（stage2 GEMM，见 7.5）对所有专家数非 2 的幂的模型
+自动生效，且零风险。
