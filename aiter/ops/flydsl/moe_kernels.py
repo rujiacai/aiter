@@ -702,8 +702,6 @@ def compile_flydsl_moe_stage1(
     xcd_swizzle: int = 0,
     k_wave: int = 1,
     v2_output_layout: bool = False,
-    # Only the blockwise-fp8 kernel takes the clamp at compile time; the mixed
-    # pipeline receives it as a runtime kernel argument instead.
     swiglu_limit: float | None = None,
     # Blockwise-fp8 only: fold a per-(expert, inter_dim) f32 factor into the stage1
     # activation (the fc2_smooth_scale / smoothquant convention).
@@ -793,7 +791,6 @@ def compile_flydsl_moe_stage1(
             waves_per_eu=waves_per_eu,
             use_cshuffle_epilog=None if k_batch > 1 else False,
             k_batch=k_batch,
-            swiglu_limit=float("inf") if swiglu_limit is None else float(swiglu_limit),
             enable_smooth_scale=enable_smooth_scale,
         )
     else:
@@ -1032,6 +1029,7 @@ def _s1_args_blk(
     n_in,
     k_in,
     size_expert_ids_in,
+    swiglu_limit=float("inf"),
     stream=None,
 ):
     """`_s1_args_std` plus the blockscale kernel's trailing smooth_scale pointer.
@@ -1057,6 +1055,7 @@ def _s1_args_blk(
         n_in,
         k_in,
         size_expert_ids_in,
+        float(swiglu_limit),
         stream,
     )
 
@@ -1864,6 +1863,7 @@ def _flydsl_moe_stage1_impl(
             _n_in,
             _k_in,
             _grid_y,
+            swiglu_limit=_swiglu_limit_val,
         )
     else:
         args = _s1_args_std(
@@ -1910,10 +1910,6 @@ def _flydsl_moe_stage1_impl(
         "xcd_swizzle": xcd_swizzle,
         "k_wave": k_wave,
     }
-    if b_dtype == "fp8blk":
-        # Blockwise fp8 bakes the clamp into the kernel instead of taking it as a
-        # runtime arg, so it has to reach compile time.
-        compile_kwargs["swiglu_limit"] = _swiglu_limit_val
     if b_dtype in ("fp8blk", "fp8row"):
         # Same story for the smooth_scale pointer: gating it at compile time keeps
         # kernels without it byte-identical to before.

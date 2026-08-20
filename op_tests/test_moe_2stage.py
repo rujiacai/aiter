@@ -1074,11 +1074,12 @@ def _effective_swiglu_limit(quant_type, aq_dtype, wq_dtype, swiglu_limit):
     # path (AITER_FLYDSL_BLKFP8=1); the asm/CK blockscale kernels ignore it.
     if (quant_type, aq_dtype, wq_dtype) in (_PER1X32_BF16_FP4, _PER1X32_FP8_FP4):
         return swiglu_limit
-    if (
-        quant_type,
-        aq_dtype,
-        wq_dtype,
-    ) == _PER128X128_FP8_FP8 and os.environ.get("AITER_FLYDSL_BLKFP8", "0") == "1":
+    # Blockwise fp8 honours the clamp on the FlyDSL kernel and on the code object
+    # exported from it; both are opt-in, and neither env var means asm/CK.
+    if (quant_type, aq_dtype, wq_dtype) == _PER128X128_FP8_FP8 and (
+        os.environ.get("AITER_FLYDSL_BLKFP8", "0") == "1"
+        or os.environ.get("AITER_MOE_BLK_CO", "0") == "1"
+    ):
         return swiglu_limit
     # Dropping it here is what keeps the torch reference in step with the kernel, but
     # it also hides fused_moe's own guard (_check_swiglu_limit_supported), so say so
@@ -1515,6 +1516,9 @@ aiter.logger.info("moe_2stage summary (markdown):\n%s", df_md)
 # backends/shapes lands in one file. The markdown table above keeps every column.
 _CSV_COLS = [
     "token", "model_dim", "inter_dim", "E", "topk",
+    # Recorded because they change what is being measured: a row without them is
+    # an unclamped, unscaled run, and the variant name alone does not say so.
+    "swiglu_limit", "use_smooth_scale",
     "us", "us_stage1", "us_stage2", "cos_sim",
 ]  # fmt: skip
 # 2 FLOP per MAC over token*topk routed rows. stage1 is A x [gate|up] so its N is
@@ -1523,7 +1527,12 @@ _TFLOPS_COLS = [("us", "tflops", 6), ("us_stage1", "tflops_s1", 4), ("us_stage2"
 if args.csv and len(df):
     out_df = df.reindex(columns=[c for c in _CSV_COLS if c in df.columns])
     macs = out_df["token"] * out_df["topk"] * out_df["model_dim"] * out_df["inter_dim"]
-    order = ["token", "model_dim", "inter_dim", "E", "topk"]
+    order = [
+        c
+        for c in ("token", "model_dim", "inter_dim", "E", "topk",
+                  "swiglu_limit", "use_smooth_scale")
+        if c in out_df.columns
+    ]  # fmt: skip
     for us_col, tf_col, factor in _TFLOPS_COLS:
         if us_col not in out_df.columns:
             continue

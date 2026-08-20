@@ -52,6 +52,7 @@ from aiter.ops.flydsl.mxfp4_kname import (
     parse_flydsl_v2_gemm2_kernel,
     parse_g2_kname_any,
 )
+from aiter.ops import moe_blk
 from aiter.ops.opus import moe_stage2_a8w4_fused_adapter as _opus_a8w4
 
 BLOCK_SIZE_M = 32
@@ -1477,7 +1478,15 @@ def _flydsl_stage1_wrapper(
 
 # Stage1 implementations that take `swiglu_limit` as a real operand. Must stay in
 # sync with the forwarding in fused_moe_2stages.
-_SWIGLU_LIMIT_STAGE1_FUNCS = (_flydsl_stage1_wrapper, _opus_a8w4_stage1_wrapper)
+_SWIGLU_LIMIT_STAGE1_FUNCS = (
+    _flydsl_stage1_wrapper,
+    _opus_a8w4_stage1_wrapper,
+    moe_blk.moe_blk_stage1_fwd,
+)
+
+# Stage1 implementations that consume `smooth_scale`. The FlyDSL kernel and the
+# code object exported from it are the same binary, so both qualify.
+_SMOOTH_SCALE_STAGE1_FUNCS = (_flydsl_stage1_wrapper, moe_blk.moe_blk_stage1_fwd)
 
 # asm / CK / cktile have no clamp operand. Their ActivationType.Swiglu path does
 # clamp, but at the OAI constant baked into the kernel (swiglu_and_mul in
@@ -1525,16 +1534,16 @@ def _check_smooth_scale_supported(metadata, smooth_scale):
     if smooth_scale is None:
         return
     stage1_func = getattr(metadata.stage1, "func", metadata.stage1)
-    if stage1_func is _flydsl_stage1_wrapper:
+    if stage1_func in _SMOOTH_SCALE_STAGE1_FUNCS:
         return
     backend = getattr(stage1_func, "__name__", repr(stage1_func))
     raise NotImplementedError(
         f"smooth_scale was passed but the selected stage1 backend ({backend}) does "
         f"not implement it and would drop it, leaving the down projection input "
-        f"unscaled. Only the FlyDSL blockwise-fp8 stage1 supports it: use "
-        f"QuantType.per_128x128 with AITER_FLYDSL_BLKFP8=1 (add "
-        f"AITER_BYPASS_TUNE_CONFIG=1 if a tuned CSV row forces the asm 1-stage "
-        f"kernel)."
+        f"unscaled. Only the blockwise-fp8 stage1 supports it: use "
+        f"QuantType.per_128x128 with AITER_FLYDSL_BLKFP8=1 (or AITER_MOE_BLK_CO=1 "
+        f"for the prebuilt code objects), adding AITER_BYPASS_TUNE_CONFIG=1 if a "
+        f"tuned CSV row forces the asm 1-stage kernel."
     )
 
 
@@ -2417,10 +2426,13 @@ def get_2stage_cfgs(
         ) in fused_moe_1stage_dict.get(get_gfx(), {}):
             if q_type == QuantType.per_1x128:
                 # for fp8 blockscale, ck has better performance so disable assembly kernel
+                # Both blockwise routes below are 2-stage, so neither can be
+                # reached while this heuristic claims the shape for 1-stage asm.
                 run_1stage = (
                     token > 32
                     and (inter_dim % 128 == 0)
                     and os.environ.get("AITER_FLYDSL_BLKFP8", "0") != "1"
+                    and not moe_blk.use_co_path()
                 )
             elif q_type == QuantType.per_Token and q_dtype_w == dtypes.i8:
                 run_1stage = token > 32
@@ -2540,10 +2552,35 @@ def get_2stage_cfgs(
             flat=cfg_flat,
             **route_bucket_metadata,
         )
-    if (
+    _is_blockwise_fp8 = (
         q_type == QuantType.per_1x128
         and q_dtype_w == dtypes.fp8
         and q_dtype_a == dtypes.fp8
+    )
+    if _is_blockwise_fp8 and moe_blk.use_co_path():
+        # Same kernels as the FlyDSL branch below, loaded from prebuilt code
+        # objects (hsa/{arch}/moe_blk/) instead of JIT-compiled, so neither the
+        # kernel sources nor FlyDSL itself has to be present. The tiles come from
+        # moe_blk.tiles_for, which hsa/flydsl_export.py also drives, so the name
+        # built here always matches a binary that was actually exported.
+        (s1_m, s1_n, s1_k, s1_w), (s2_m, s2_n, s2_k, s2_w) = moe_blk.tiles_for(
+            token, model_dim, inter_dim, expert, topk
+        )
+        return MOEMetadata(
+            functools.partial(
+                moe_blk.moe_blk_stage1_fwd, out_dtype="bf16",
+                tile_m=s1_m, tile_n=s1_n, tile_k=s1_k, waves_per_eu=s1_w,
+            ),  # fmt: skip
+            functools.partial(
+                moe_blk.moe_blk_stage2_fwd, out_dtype="bf16",
+                tile_m=s2_m, tile_n=s2_n, tile_k=s2_k, waves_per_eu=s2_w,
+            ),  # fmt: skip
+            s1_m,
+            1,  # no split-K
+            False,
+        )
+    if (
+        _is_blockwise_fp8
         and os.environ.get("AITER_FLYDSL_BLKFP8", "0") == "1"
         and is_flydsl_available()
     ):

@@ -42,6 +42,7 @@ from aiter.ops.flydsl.moe_kernels import (
     _get_compiled_silu_fused,
     _run_compiled,
     _s1_args_fp4,
+    _s1_args_blk,
     _s1_args_std,
     _s2_args_fp4,
     _s2_args_std,
@@ -236,6 +237,11 @@ def _precompile_to_cache(
     stage1_fuse_quant=None,
     k_wave: int = 1,
     v2_output_layout: bool = False,
+    # Blockwise-fp8 only. enable_smooth_scale is baked into the binary, so an
+    # artifact built without it will not satisfy a runtime that requests it;
+    # swiglu_limit is only used to fill the kernel argument here.
+    swiglu_limit: float | None = None,
+    enable_smooth_scale: bool = False,
     # Stage2-only kernel tuning knobs (registered by the production-variant
     # entries in `get_flydsl_stage2_kernels`). Forwarded into
     # `compile_flydsl_moe_stage2` for stage 2 AOT compilation.
@@ -591,6 +597,31 @@ def _precompile_to_cache(
                     swiglu_limit=runtime_swiglu_limit(None, act),
                     pass_swiglu_limit=not (a_dtype == "bf16" and b_dtype == "fp4"),
                 )
+            elif is_blockscale:
+                # The blockwise kernel carries one extra pointer (smooth_scale);
+                # _s1_args_std would hand it one argument short.
+                args = _s1_args_blk(
+                    _kernel_out.view(-1),
+                    a.view(-1),
+                    w1.view(-1),
+                    flat_a_scale,
+                    flat_w_scale,
+                    sorted_token_ids,
+                    sorted_expert_ids,
+                    sw_arg,
+                    num_valid_ids,
+                    (
+                        torch.zeros(E * inter_dim, dtype=torch.float32, device=dev)
+                        if enable_smooth_scale
+                        else torch.empty(0, dtype=torch.float32, device=dev)
+                    ),
+                    tokens,
+                    _n_in,
+                    _k_in,
+                    _grid_y,
+                    swiglu_limit=runtime_swiglu_limit(swiglu_limit, act),
+                    stream=0,
+                )
             else:
                 args = _s1_args_std(
                     _kernel_out.view(-1),
@@ -637,6 +668,10 @@ def _precompile_to_cache(
                 xcd_swizzle=xcd_swizzle,
                 k_wave=k_wave,
                 v2_output_layout=_v2_output_layout,
+                # smooth_scale is a compile-time constant for the blockwise family
+                # (the clamp is not -- it rides in as a kernel argument), so the
+                # AOT artifact only matches a runtime asking for the same setting.
+                **({"enable_smooth_scale": enable_smooth_scale} if is_blockscale else {}),
             )
             _run_compiled(exe, args)
 

@@ -147,7 +147,6 @@ def compile_moe_gemm1(
     scale_is_bf16: bool = False,
     k_batch: int = 1,
     waves_per_eu: int = 0,
-    swiglu_limit: float = float("inf"),
     scale_blk_n: int = 128,
     scale_blk_k: int = 128,
     enable_smooth_scale: bool = False,
@@ -496,6 +495,7 @@ def compile_moe_gemm1(
             i32_inter_in: fx.Int32,
             i32_k_in: fx.Int32,
             i32_size_expert_ids_in: fx.Int32,
+            f32_swiglu_limit: fx.Float32,
         ):
             tokens_in = arith.index_cast(T.index, i32_tokens_in)
             inter_in = arith.index_cast(T.index, i32_inter_in)
@@ -544,29 +544,18 @@ def compile_moe_gemm1(
             # min(x, lim) is written as -max(-x, -lim) because only maximumf is
             # wrapped (mirrors mixed_moe_gemm_2stage._clamp_gate/_clamp_lin).
             #
-            # swiglu_limit is a compile-time constant rather than a kernel arg so
-            # this needs no ABI change to _s1_args_std / the launcher, and at the
-            # default +inf no ops are emitted at all -- existing kernels compile
-            # bit-identically.
-            # The condition must go through const_expr: a bare Python `if` inside
-            # the traced kernel body is rewritten into a device-side branch, so
-            # both arms get traced and the no-clamp arm would feed a None limit
-            # into maximumf.
-            _clamp_act = swiglu_limit != float("inf")
-            _neg_lim = (
-                arith.constant(-float(swiglu_limit), type=T.f32)
-                if _clamp_act
-                else None
-            )
+            # The limit is a kernel argument, not a compile-time constant, so one
+            # binary serves every clamp value -- which is what makes shipping
+            # prebuilt code objects tractable. "No clamp" is +inf and needs no
+            # specialisation: max(-x, -inf) == -x and max(x, -inf) == x, so both
+            # clamps degenerate to the identity. The cost is 2-3 unconditional
+            # VALU ops per output element.
+            _neg_lim = -f32_swiglu_limit
 
             def clamp_gate(x):
-                if const_expr(not _clamp_act):
-                    return x
                 return -((-x).maximumf(_neg_lim))
 
             def clamp_up(x):
-                if const_expr(not _clamp_act):
-                    return x
                 return (-((-x).maximumf(_neg_lim))).maximumf(_neg_lim)
 
             acc_init = (
@@ -2243,6 +2232,7 @@ def compile_moe_gemm1(
         i32_inter_in: fx.Int32,
         i32_k_in: fx.Int32,
         i32_size_expert_ids_in: fx.Int32,
+        f32_swiglu_limit: fx.Float32,
         stream: fx.Stream,
     ):
         allocator.finalized = False
@@ -2270,6 +2260,7 @@ def compile_moe_gemm1(
             i32_inter_in,
             i32_k_in,
             i32_size_expert_ids_in,
+            f32_swiglu_limit,
         )
         if const_expr(waves_per_eu > 0):
             for op in ctx.gpu_module_body.operations:

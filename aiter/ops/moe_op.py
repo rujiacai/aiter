@@ -221,6 +221,49 @@ def fmoe_g1u1_a16(
 ) -> None: ...
 
 
+# Prebuilt blockwise-fp8 (DeepSeek 128x128) MoE code objects. `co_name` selects
+# the binary under hsa/{arch}/moe_blk/; its shape/tile/flags are baked in, so the
+# caller has to name the one matching the layout it is passing.
+@compile_ops("module_moe_blk", ffi_type="ctypes")
+def moe_blk_stage1(
+    out: Tensor,
+    input: Tensor,
+    w1: Tensor,
+    a1_scale: Tensor,
+    w1_scale: Tensor,
+    sorted_token_ids: Tensor,
+    sorted_expert_ids: Tensor,
+    sorted_weights: Tensor | None,
+    num_valid_ids: Tensor,
+    smooth_scale: Tensor | None,
+    tokens: int,
+    inter_dim: int,
+    model_dim: int,
+    tile_n: int,
+    swiglu_limit: float,
+    co_name: str,
+) -> None: ...
+
+
+@compile_ops("module_moe_blk", ffi_type="ctypes")
+def moe_blk_stage2(
+    out: Tensor,
+    inter_states: Tensor,
+    w2: Tensor,
+    a2_scale: Tensor,
+    w2_scale: Tensor,
+    sorted_token_ids: Tensor,
+    sorted_expert_ids: Tensor,
+    sorted_weights: Tensor | None,
+    num_valid_ids: Tensor,
+    tokens: int,
+    model_dim: int,
+    inter_dim: int,
+    tile_n: int,
+    co_name: str,
+) -> None: ...
+
+
 @compile_ops("module_moe_fmoe_asm", ffi_type="ctypes")
 def fmoe_fp8_blockscale_g1u1(
     out: Tensor,
