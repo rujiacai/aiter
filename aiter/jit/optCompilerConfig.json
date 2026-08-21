@@ -1840,5 +1840,16 @@
         "extra_include": [],
         "verbose": "False",
         "blob_gen_cmd": "''"
+    },
+    "module_moe_blk": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/moe_blk.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
     }
 }
