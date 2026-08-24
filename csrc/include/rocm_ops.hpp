@@ -102,6 +102,16 @@ namespace py = pybind11;
           "Activation function used in GPT-OSS SwiGLU.", \
           py::arg("out"),                                \
           py::arg("input"));                             \
+    m.def("silu_and_mul_smooth",                         \
+          &aiter::silu_and_mul_smooth,                   \
+          "SiLU gating with a per-(expert, column) "     \
+          "multiplicative factor applied after the "     \
+          "clamp.",                                      \
+          py::arg("out"),                                \
+          py::arg("input"),                              \
+          py::arg("expert_ids"),                         \
+          py::arg("smooth"),                             \
+          py::arg("limit") = 0.0f);                      \
     m.def("silu_and_mul_bias",                           \
           &aiter::silu_and_mul_bias,                     \
           "SiLU gating with per-expert bias.",           \

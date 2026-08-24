@@ -7,6 +7,11 @@ namespace aiter {
 
 void silu_and_mul(const aiter_tensor_t& out, const aiter_tensor_t& input, float limit = 0.0f);
 void swiglu_and_mul(const aiter_tensor_t& out, const aiter_tensor_t& input);
+void silu_and_mul_smooth(const aiter_tensor_t& out,
+                         const aiter_tensor_t& input,
+                         const aiter_tensor_t& expert_ids,
+                         const aiter_tensor_t& smooth,
+                         float limit = 0.0f);
 void silu_and_mul_bias(const aiter_tensor_t& out,
                        const aiter_tensor_t& input,
                        const aiter_tensor_t& expert_ids,

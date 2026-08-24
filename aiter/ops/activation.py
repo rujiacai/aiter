@@ -17,6 +17,16 @@ def swiglu_and_mul(out: Tensor, input: Tensor) -> None: ...
 
 
 @compile_ops("module_activation", develop=True)
+def silu_and_mul_smooth(
+    out: Tensor,
+    input: Tensor,
+    expert_ids: Tensor,
+    smooth: Tensor,
+    limit: float = 0.0,
+) -> None: ...
+
+
+@compile_ops("module_activation", develop=True)
 def silu_and_mul_bias(
     out: Tensor, input: Tensor, expert_ids: Tensor, bias: Tensor
 ) -> None: ...

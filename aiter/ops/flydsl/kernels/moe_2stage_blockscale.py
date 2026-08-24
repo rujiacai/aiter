@@ -301,10 +301,16 @@ def compile_moe_gemm1(
     # Split-K validation
     _is_splitk = k_batch > 1
     if enable_smooth_scale and _is_splitk:
-        # Split-K stage1 stores raw gate/up partials and the activation runs on the
-        # host afterwards, so there is no epilogue here to fold the factor into.
-        raise NotImplementedError(
-            "smooth_scale is not supported with split-K stage1 (k_batch>1)"
+        # Not a missing feature: split-K *does* support smooth_scale, just one
+        # layer up. This kernel emits raw gate/up partials and the activation runs
+        # in silu_and_mul_smooth afterwards, which is also the only place the
+        # factor may be applied -- it has to land after the clamp, and
+        # clamp(u)*s != clamp(u*s). Baking it in here as well would apply it
+        # twice, so the launcher pairs k_batch>1 with enable_smooth_scale=False.
+        raise ValueError(
+            "enable_smooth_scale must be False for a split-K stage1 kernel "
+            "(k_batch>1): the reduction applies smooth_scale after the clamp, so "
+            "baking it in here would apply it twice"
         )
     if _is_splitk:
         _k_per_batch = model_dim // k_batch
@@ -455,7 +461,13 @@ def compile_moe_gemm1(
         _use_cshuffle_epilog = True
     # bf16 split-K: use bf16 atomics (halves bandwidth, gfx950 has buffer_atomic_pk_add_bf16).
     # Other dtypes keep f32 for precision.
-    _splitk_use_bf16 = _is_splitk and is_bf16
+    #
+    # Blockwise fp8 is excluded: its partials are the raw gate/up sums, which run
+    # far wider than the post-activation range the bf16 path was sized for, and
+    # accumulating them across K splits in bf16 produced NaN in the partial buffer
+    # (7 of 4096 elements at k_batch=2). f32 partials cost 2x the atomic traffic
+    # but are what the reduction needs to stay finite.
+    _splitk_use_bf16 = _is_splitk and is_bf16 and not is_fp8_blk
     _cshuffle_elem_bytes = 2 if (not _is_splitk or _splitk_use_bf16) else 4
     lds_x_bytes = 2 * int(tile_m) * int(lds_stride) * int(elem_bytes)
     lds_out_bytes = (

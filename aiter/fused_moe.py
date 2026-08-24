@@ -2599,9 +2599,30 @@ def get_2stage_cfgs(
         # tile_k must cover whole 128-element scale blocks, and the ping-pong tail
         # consumes exactly two tiles, so the tile count also has to be even.
         _tile_k2 = 256 if (inter_dim % 512 == 0) else 128
+        # Few tokens means few active experts, and stage1's workgroup count is
+        # (active experts) x (inter_dim / tile_n) -- at 8 tokens that leaves most
+        # of the machine idle, so halve the N tile to double the grid. Past ~8
+        # tokens the grid is large enough and the wider tile reads better.
+        # Measured on gfx942 d6144x256 E256 k8: -20% at 1-2 tokens, -12% at 8,
+        # +14% at 16.
+        _tile_n1 = 64 if token <= 8 else 128
+        # Split-K for the same reason, one level down: even at tile_n=64 a single
+        # token lights up 8 experts x 4 N tiles = 32 workgroups against ~240 slots.
+        # Splitting K multiplies the grid; past a couple of tokens the grid is
+        # already big enough and the extra f32 atomic traffic costs more than the
+        # parallelism gains. Measured on gfx942 d6144x256 E256 k8 (stage1 alone):
+        # 1 token 55.1 -> 27.4 us, 2 tokens 45.5 -> 29.7, 4 tokens ~flat, 16 worse.
+        # swiglu_limit and smooth_scale both survive: the host reduction that
+        # replaces the fused epilogue takes the clamp as an operand and applies
+        # smooth_scale after it (silu_and_mul_smooth).
+        _k_batch1 = 4 if token <= 2 else 1
         from aiter.ops.flydsl.moe_kernels import flydsl_kernel_name
 
-        kn1 = flydsl_kernel_name(1, "fp8", "fp8blk", _out_str, _tile_m, 128, 128) + "_w2"
+        kn1 = (
+            flydsl_kernel_name(1, "fp8", "fp8blk", _out_str, _tile_m, _tile_n1, 128)
+            + "_w2"
+            + (f"_kb{_k_batch1}" if _k_batch1 > 1 else "")
+        )
         kn2 = (
             flydsl_kernel_name(
                 2, "fp8", "fp8blk", _out_str, _tile_m, 256, _tile_k2, "atomic"
@@ -3296,6 +3317,11 @@ def fused_moe_2stages(
     if smooth_scale is not None:
         # _check_smooth_scale_supported already rejected every other backend.
         extra_stage1_args["smooth_scale"] = smooth_scale
+        if stage1_func is _flydsl_stage1_wrapper:
+            # Under split-K the factor is applied by the host reduction, which
+            # needs the row -> expert mapping. Harmless otherwise: the fused
+            # epilogue reads the expert from the sorted ids and ignores this.
+            extra_stage1_args["topk_ids"] = topk_ids
     if stage1_func is _flydsl_stage1_wrapper:
         if metadata.skip_inter_quant:
             extra_stage1_args["v2_output_layout"] = True

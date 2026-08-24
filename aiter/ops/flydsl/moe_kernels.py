@@ -589,28 +589,36 @@ def get_flydsl_stage1_kernels_fp8_blk(out_dtype: str) -> dict[str, dict]:
     kernels = {}
     a_dtype = "fp8"
     b_dtype = "fp8blk"
+    # Split-K exists for the decode end, where only a handful of experts are live
+    # and the grid (active experts x inter_dim/tile_n) leaves most of the machine
+    # idle. The kernel asserts K/k_batch/tile_k is even and >=4, so only factors
+    # that can satisfy that for some model_dim are worth naming.
     # tile_k must cover whole 128-element scale blocks.
     for tm in (16, 32, 64, 128):
         for tn in (64, 128):
             for tk in (128, 256):
                 for w in (0, 1, 2, 3, 4):
-                    name = flydsl_kernel_name(
-                        1, a_dtype, b_dtype, out_dtype, tm, tn, tk
-                    )
-                    if w:
-                        name += f"_w{w}"
-                    kernels[name] = {
-                        "stage": 1,
-                        "a_dtype": a_dtype,
-                        "b_dtype": b_dtype,
-                        "out_dtype": out_dtype,
-                        "tile_m": tm,
-                        "tile_n": tn,
-                        "tile_k": tk,
-                        "MPerBlock": tm,
-                        "in_dtype": "fp8_blk",
-                        "waves_per_eu": w,
-                    }
+                    for kb in (1, 2, 4, 8):
+                        name = flydsl_kernel_name(
+                            1, a_dtype, b_dtype, out_dtype, tm, tn, tk
+                        )
+                        if w:
+                            name += f"_w{w}"
+                        if kb != 1:
+                            name += f"_kb{kb}"
+                        kernels[name] = {
+                            "stage": 1,
+                            "a_dtype": a_dtype,
+                            "b_dtype": b_dtype,
+                            "out_dtype": out_dtype,
+                            "tile_m": tm,
+                            "tile_n": tn,
+                            "tile_k": tk,
+                            "MPerBlock": tm,
+                            "in_dtype": "fp8_blk",
+                            "waves_per_eu": w,
+                            "k_batch": kb,
+                        }
     return kernels
 
 
@@ -1760,7 +1768,16 @@ def _flydsl_moe_stage1_impl(
             )
 
     if _is_splitk:
-        torch_tmp_out_dtype = dtypes.bf16 if _base_out_dtype == "bf16" else dtypes.fp16
+        # Must mirror the kernel's _splitk_use_bf16: it accumulates straight into
+        # this buffer with atomics, so a dtype mismatch is a silent miscompute.
+        # blockwise fp8 needs f32 partials (see moe_2stage_blockscale); the
+        # reduction below takes f32 in and bf16 out.
+        if _base_out_dtype == "bf16":
+            torch_tmp_out_dtype = (
+                dtypes.fp32 if b_dtype == "fp8blk" else dtypes.bf16
+            )
+        else:
+            torch_tmp_out_dtype = dtypes.fp16
         tmp_out = torch.zeros(
             (token_num, topk, inter_dim * 2), dtype=torch_tmp_out_dtype, device=dev
         )
@@ -1912,8 +1929,12 @@ def _flydsl_moe_stage1_impl(
     }
     if b_dtype in ("fp8blk", "fp8row"):
         # Same story for the smooth_scale pointer: gating it at compile time keeps
-        # kernels without it byte-identical to before.
-        compile_kwargs["enable_smooth_scale"] = smooth_scale is not None
+        # kernels without it byte-identical to before. Split-K instead applies it
+        # in the reduction (silu_and_mul_smooth), because it has to land after the
+        # clamp -- clamp(u)*s != clamp(u*s).
+        compile_kwargs["enable_smooth_scale"] = (
+            smooth_scale is not None and not _is_splitk
+        )
     elif smooth_scale is not None:
         raise NotImplementedError(
             f"smooth_scale is only implemented for the blockwise fp8 stage1 kernel "
@@ -2029,6 +2050,7 @@ def _flydsl_moe_stage1_impl(
         from aiter.ops.activation import (
             silu_and_mul,
             silu_and_mul_bias,
+            silu_and_mul_smooth,
             swiglu_and_mul,
             swiglu_and_mul_bias,
         )
@@ -2036,6 +2058,18 @@ def _flydsl_moe_stage1_impl(
         post_input = tmp_out.view(-1, inter_dim * 2)
         post_out = out.view(-1, inter_dim)
         post_bias = bias.contiguous() if bias is not None else None
+        # The GEMM emitted raw gate/up partials, so everything the fused epilogue
+        # would have done has to happen here instead. Note the clamp convention
+        # flips: the kernels encode "no clamp" as +inf, these take 0.0.
+        _post_limit = float(swiglu_limit) if swiglu_limit else 0.0
+        if act == "swiglu" and swiglu_limit and float(swiglu_limit) != 7.0:
+            # swiglu_and_mul bakes the OAI constant; there is no operand to pass
+            # a different bound through, and dropping it silently is how the
+            # clamp went missing here in the first place.
+            raise NotImplementedError(
+                f"split-K stage1 cannot apply swiglu_limit={swiglu_limit} to the "
+                "swiglu activation (only the baked 7.0). Use k_batch=1."
+            )
         if bias is not None and act == "swiglu":
             swiglu_and_mul_bias(post_out, post_input, topk_ids_arg, post_bias)
         elif bias is not None and act == "silu":
@@ -2047,8 +2081,22 @@ def _flydsl_moe_stage1_impl(
                 post_input = post_input + bias[topk_ids.to(torch.long)].view(
                     -1, inter_dim * 2
                 )
-            silu_and_mul(post_out, post_input)
-
+            if smooth_scale is not None:
+                # The factor has to land after the clamp, which is why it cannot
+                # ride along in the GEMM partials: clamp(u)*s != clamp(u*s).
+                if topk_ids is None:
+                    raise ValueError(
+                        "split-K stage1 needs topk_ids to apply smooth_scale"
+                    )
+                silu_and_mul_smooth(
+                    post_out,
+                    post_input,
+                    topk_ids.to(torch.int32).contiguous().view(-1),
+                    smooth_scale,
+                    _post_limit,
+                )
+            else:
+                silu_and_mul(post_out, post_input, _post_limit)
     if _fuse_any_quant and _need_sort:
         from aiter.utility.dtypes import fp8_e8m0
 
