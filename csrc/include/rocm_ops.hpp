@@ -1705,6 +1705,29 @@ namespace py = pybind11;
           py::arg("max_kv"),           \
           py::arg("n_dense"));
 
+#define VSA_QK_FP8_PV_FP4_CSR_PYBIND   \
+    m.def("vsa_qk_fp8_pv_fp4_csr",     \
+          &vsa_qk_fp8_pv_fp4_csr,      \
+          "QK=FP8 / PV=FP4 mixed-precision VSA block-sparse attention, CSR " \
+          "connectivity ABI (MI355X gfx950 asm-kernel binding).", \
+          py::arg("q"),                \
+          py::arg("k"),                \
+          py::arg("v"),                \
+          py::arg("qscale"),           \
+          py::arg("kscale"),           \
+          py::arg("vscale"),           \
+          py::arg("q2k_col_indices"),  \
+          py::arg("q2k_row_meta"),     \
+          py::arg("vbs"),              \
+          py::arg("lim"),              \
+          py::arg("out"),              \
+          py::arg("lse"),              \
+          py::arg("counters"),         \
+          py::arg("B"),                \
+          py::arg("T"),                \
+          py::arg("num_q_blks"),       \
+          py::arg("n_dense"));
+
 #define MLA_METADATA_PYBIND                              \
     m.def("get_mla_metadata_v1",                         \
           &get_mla_metadata_v1,                          \

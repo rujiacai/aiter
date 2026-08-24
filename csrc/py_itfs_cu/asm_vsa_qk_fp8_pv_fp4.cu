@@ -233,3 +233,144 @@ void vsa_qk_fp8_pv_fp4(const torch::Tensor& q,
     VsaQkFp8PvFp4AsmKernel::launch_one(
         picked.func, &a, sizeof(a), grid_x, kBlockX, kLdsBytes, stream);
 }
+
+namespace {
+
+// ---------------------------------------------------------------------------
+// CSR kernarg layout — same kernel, same translation unit, built with
+// -DVSA_CSR_ABI=1.  The (q2k_index, q2k_num) pair gives way to
+//       const int32_t* q2k_col_indices,  // flat CSR payload, nnz entries
+//       const int32_t* q2k_row_meta,     // (n_rows, 4) {nnz, start, first_kv, _}
+// with the metadata in schedule order: record t describes the tile lim[t].
+//
+// The metadata is packed rather than passed as three arrays so the prologue can
+// fetch a row with one global_load_dwordx4 out of one cache line, and it is
+// stored in schedule order so that load does not chain behind the logical_idx
+// fetch.  Packing also holds the layout at 14 pointers, matching KernelArgs
+// field for field, so both kernels see the same kernarg preload window.
+// max_kv_blks is retained as a placeholder; CSR rows have no fixed stride.
+// ---------------------------------------------------------------------------
+struct __attribute__((packed)) KernelArgsCsr {
+    int32_t B;
+    int32_t T;
+    int32_t num_q_blks;
+    int32_t max_kv_blks;
+    void*   logical_idx_mapping;
+    void*   Q;
+    void*   K;
+    void*   V;
+    void*   q2k_col_indices;
+    void*   q2k_row_meta;
+    void*   variable_block_sizes;
+    void*   qscale;
+    void*   kscale;
+    void*   vscale;
+    void*   Out;
+    void*   Lse;
+    void*   d_counter;
+    void*   s_counter;
+    int32_t n_dense;
+    char    _pad[400 - (4 * 4 + 8 * 14 + 4)];
+};
+static_assert(sizeof(KernelArgsCsr) == 400,
+              "VSA QK-FP8 PV-FP4 KernelArgsCsr must be 400 bytes");
+
+}  // namespace
+
+void vsa_qk_fp8_pv_fp4_csr(const torch::Tensor& q,
+                           const torch::Tensor& k,
+                           const torch::Tensor& v,
+                           const torch::Tensor& qscale,
+                           const torch::Tensor& kscale,
+                           const torch::Tensor& vscale,
+                           const torch::Tensor& q2k_col_indices,
+                           const torch::Tensor& q2k_row_meta,
+                           const torch::Tensor& vbs,
+                           const torch::Tensor& lim,
+                           const torch::Tensor& out,
+                           const torch::Tensor& lse,
+                           const torch::Tensor& counters,
+                           int64_t B,
+                           int64_t T,
+                           int64_t num_q_blks,
+                           int64_t n_dense) {
+    TORCH_CHECK(counters.dtype() == torch::kInt32 && counters.numel() >= 2,
+                "vsa_qk_fp8_pv_fp4_csr: counters must be int32 with >= 2 "
+                "elements");
+    TORCH_CHECK(counters.is_contiguous(),
+                "vsa_qk_fp8_pv_fp4_csr: counters must be contiguous");
+
+    const int64_t BH = q.size(0);
+    TORCH_CHECK(BH % B == 0,
+                "vsa_qk_fp8_pv_fp4_csr: q.size(0)=", BH,
+                " must be divisible by B=", B);
+    const int64_t total_tiles = BH * num_q_blks;
+    TORCH_CHECK(total_tiles > 0,
+                "vsa_qk_fp8_pv_fp4_csr: empty workload (BH*num_q_blks == 0)");
+
+    TORCH_CHECK(q2k_col_indices.dtype() == torch::kInt32 &&
+                    q2k_col_indices.is_contiguous(),
+                "vsa_qk_fp8_pv_fp4_csr: q2k_col_indices must be contiguous "
+                "int32");
+    TORCH_CHECK(q2k_row_meta.dtype() == torch::kInt32 &&
+                    q2k_row_meta.is_contiguous(),
+                "vsa_qk_fp8_pv_fp4_csr: q2k_row_meta must be contiguous int32");
+    TORCH_CHECK(lim.dtype() == torch::kInt32 && lim.is_contiguous(),
+                "vsa_qk_fp8_pv_fp4_csr: lim must be contiguous int32");
+    TORCH_CHECK(lim.numel() == total_tiles,
+                "vsa_qk_fp8_pv_fp4_csr: lim must hold BH*num_q_blks=",
+                total_tiles, " entries, got ", lim.numel());
+    // The kernel fetches a row's metadata with one 16-byte dwordx4, so the
+    // record has to be exactly 4 lanes wide and the base 16-byte aligned.
+    TORCH_CHECK(q2k_row_meta.dim() == 2 &&
+                    q2k_row_meta.size(0) == total_tiles &&
+                    q2k_row_meta.size(1) == 4,
+                "vsa_qk_fp8_pv_fp4_csr: q2k_row_meta must be (", total_tiles,
+                ", 4) int32, got ", q2k_row_meta.sizes());
+    TORCH_CHECK(reinterpret_cast<uintptr_t>(q2k_row_meta.data_ptr()) % 16 == 0,
+                "vsa_qk_fp8_pv_fp4_csr: q2k_row_meta must be 16-byte aligned");
+    // row_start rides in the metadata as int32, so the payload has to stay
+    // addressable in 32 bits.
+    TORCH_CHECK(q2k_col_indices.numel() <= INT32_MAX,
+                "vsa_qk_fp8_pv_fp4_csr: nnz=", q2k_col_indices.numel(),
+                " exceeds the int32 row_start range");
+
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(q));
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
+
+    HIP_CALL(hipMemsetAsync(counters.data_ptr(), 0,
+                            counters.numel() * sizeof(int32_t),
+                            stream));
+
+    static VsaQkFp8PvFp4AsmKernel impl("vsa_qk_fp8_pv_fp4_csr_kernel",
+                                       "vsa/vsa_qk_fp8_pv_fp4_csr.co");
+    const auto picked   = impl.select_for_bh(BH);
+    const int32_t B_eff = static_cast<int32_t>(BH / picked.num_heads);
+
+    KernelArgsCsr a{};
+    a.B                    = B_eff;
+    a.T                    = static_cast<int32_t>(T);
+    a.num_q_blks           = static_cast<int32_t>(num_q_blks);
+    a.max_kv_blks          = 0;      // placeholder; unused by the CSR ABI
+    a.logical_idx_mapping  = lim.data_ptr();
+    a.Q                    = q.data_ptr();
+    a.K                    = k.data_ptr();
+    a.V                    = v.data_ptr();
+    a.q2k_col_indices      = q2k_col_indices.data_ptr();
+    a.q2k_row_meta         = q2k_row_meta.data_ptr();
+    a.variable_block_sizes = vbs.data_ptr();
+    a.qscale               = qscale.data_ptr();
+    a.kscale               = kscale.data_ptr();
+    a.vscale               = vscale.data_ptr();
+    a.Out                  = out.data_ptr();
+    a.Lse                  = lse.data_ptr();
+    a.d_counter            = counters.data_ptr();
+    a.s_counter            = reinterpret_cast<int32_t*>(counters.data_ptr()) + 1;
+    a.n_dense              = static_cast<int32_t>(n_dense);
+
+    const int grid_x = (total_tiles < kGridCap)
+                           ? static_cast<int>(total_tiles)
+                           : kGridCap;
+    VsaQkFp8PvFp4AsmKernel::launch_one(
+        picked.func, &a, sizeof(a), grid_x, kBlockX, kLdsBytes, stream);
+}

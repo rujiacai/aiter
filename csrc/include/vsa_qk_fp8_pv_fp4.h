@@ -51,3 +51,35 @@ void vsa_qk_fp8_pv_fp4(const torch::Tensor& q,        // (BH, T, 128)  float8_e4
                        int64_t num_q_blks,
                        int64_t max_kv,
                        int64_t n_dense);
+
+// CSR connectivity ABI.  Identical maths to vsa_qk_fp8_pv_fp4 — the two are
+// built from one translation unit with only -DVSA_CSR_ABI flipped — but the
+// (q2k_idx, q2k_num, max_kv) rectangle gives way to a flat CSR payload plus one
+// packed record per tile.  The rectangle costs O(BH * num_q_blks * max_kv),
+// which reaches tens of GiB per head at long contexts; CSR is O(nnz + rows).
+//
+//   q2k_col_indices : (nnz,) int32, each row's KV block ids contiguous and in
+//                     the order the kernel should consume them.
+//   q2k_row_meta    : (BH*num_q_blks, 4) int32 {nnz, row_start, first_kv, _},
+//                     16-byte aligned, in SCHEDULE order — record t describes
+//                     the tile lim[t], not logical row t.
+//
+// Both come from `aiter.build_l2_aware_lim_vsa_qk_fp8_pv_fp4_csr(...)`.
+// row_start is int32, so a single launch is capped at 2^31 CSR entries.
+void vsa_qk_fp8_pv_fp4_csr(const torch::Tensor& q,
+                           const torch::Tensor& k,
+                           const torch::Tensor& v,
+                           const torch::Tensor& qscale,
+                           const torch::Tensor& kscale,
+                           const torch::Tensor& vscale,
+                           const torch::Tensor& q2k_col_indices,
+                           const torch::Tensor& q2k_row_meta,
+                           const torch::Tensor& vbs,
+                           const torch::Tensor& lim,
+                           const torch::Tensor& out,
+                           const torch::Tensor& lse,
+                           const torch::Tensor& counters,
+                           int64_t B,
+                           int64_t T,
+                           int64_t num_q_blks,
+                           int64_t n_dense);
