@@ -872,7 +872,7 @@ def _fused_moe_impl(
         metadata = _metadata_transform(metadata)
 
     _check_swiglu_limit_supported(metadata, swiglu_limit, activation)
-    _check_smooth_scale_supported(metadata, smooth_scale)
+    _check_smooth_scale_supported(metadata, smooth_scale, quant_type, q_dtype_a, q_dtype_w)
 
     block_size_M = metadata.block_m if block_size_M is None else block_size_M
     # Ensure block_size_M is int (metadata.block_m from CSV may be float)
@@ -1523,15 +1523,25 @@ def _check_swiglu_limit_supported(metadata, swiglu_limit, activation):
     )
 
 
-def _check_smooth_scale_supported(metadata, smooth_scale):
+def _check_smooth_scale_supported(metadata, smooth_scale, quant_type=None, q_dtype_a=None, q_dtype_w=None):
     """Reject a smooth_scale the selected backend would silently drop.
 
     Only the FlyDSL blockwise-fp8 stage1 folds the factor into its activation. The
     asm 1-stage entry does have an `fc2_smooth_scale` argument but fused_moe always
     passes None, and CK / cktile take no such operand at all, so without this the
     down projection would silently see unscaled input.
+
+    mxfp8 (per_1x32, fp8 A, fp8 W) is handled via a host-side multiply applied
+    to the stage1 output before it is quantized for stage2.
     """
     if smooth_scale is None:
+        return
+    # mxfp8 a8w8: host-side smooth multiply applied between stage1 and stage2.
+    if (
+        quant_type == QuantType.per_1x32
+        and q_dtype_a == dtypes.fp8
+        and q_dtype_w == dtypes.fp8
+    ):
         return
     stage1_func = getattr(metadata.stage1, "func", metadata.stage1)
     if stage1_func in _SMOOTH_SCALE_STAGE1_FUNCS:
@@ -1540,10 +1550,9 @@ def _check_smooth_scale_supported(metadata, smooth_scale):
     raise NotImplementedError(
         f"smooth_scale was passed but the selected stage1 backend ({backend}) does "
         f"not implement it and would drop it, leaving the down projection input "
-        f"unscaled. Only the blockwise-fp8 stage1 supports it: use "
-        f"QuantType.per_128x128 with AITER_FLYDSL_BLKFP8=1 (or AITER_MOE_BLK_CO=1 "
-        f"for the prebuilt code objects), adding AITER_BYPASS_TUNE_CONFIG=1 if a "
-        f"tuned CSV row forces the asm 1-stage kernel."
+        f"unscaled. Only the blockwise-fp8 stage1 supports it (use "
+        f"QuantType.per_128x128 with AITER_FLYDSL_BLKFP8=1), or use mxfp8 "
+        f"(QuantType.per_1x32 with fp8 A+W) which applies smooth_scale host-side."
     )
 
 
@@ -3314,8 +3323,15 @@ def fused_moe_2stages(
             extra_stage2_args["bias2"] = _normalize_bias_for_kernel(bias2)
     if stage1_func in _SWIGLU_LIMIT_STAGE1_FUNCS:
         extra_stage1_args["swiglu_limit"] = swiglu_limit
-    if smooth_scale is not None:
+    _mxfp8_host_smooth = (
+        smooth_scale is not None
+        and quant_type == QuantType.per_1x32
+        and q_dtype_a == dtypes.fp8
+        and q_dtype_w == dtypes.fp8
+    )
+    if smooth_scale is not None and not _mxfp8_host_smooth:
         # _check_smooth_scale_supported already rejected every other backend.
+        # mxfp8 is handled host-side after stage1, so skip passing it to kernel.
         extra_stage1_args["smooth_scale"] = smooth_scale
         if stage1_func is _flydsl_stage1_wrapper:
             # Under split-K the factor is applied by the host reduction, which
@@ -3427,6 +3443,12 @@ def fused_moe_2stages(
         and w1.dtype in (dtypes.fp4x2, dtypes.fp8)
     ):
         # a8w4 / mxfp8: quantize stage1 output to mxfp8 for stage2's fp8 operand.
+        # host-side smooth_scale for mxfp8 a8w8: a2 at this point is
+        # [token_num, topk, inter_dim] in the original (token, slot) order,
+        # so topk_ids[i, k] directly gives the expert for a2[i, k, :].
+        if smooth_scale is not None and w1.dtype == dtypes.fp8:
+            _smooth = smooth_scale[topk_ids].to(a2.dtype)  # [T, K, inter_dim]
+            a2 = a2 * _smooth
         if not _MOE_A8W4_BYPASS_QUANT:
             a2 = a2.view(-1, inter_dim)
             a2, a2_scale = fused_dynamic_mxfp8_quant_moe_sort(
