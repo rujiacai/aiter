@@ -902,6 +902,8 @@ def fused_dynamic_mx_quant_moe_sort_hip(
     block_m: int,
     group_size: int = 32,
     sorted_weights: torch.Tensor | None = None,
+    smooth_scale: torch.Tensor | None = None,
+    topk_ids: torch.Tensor | None = None,
 ) -> None:
     """
     HIP path for fused dynamic MX (fp4 or fp8) quantization and MoE scale
@@ -1044,6 +1046,8 @@ def fused_dynamic_mx_quant_moe_sort(
     num_rows: torch.Tensor | None = None,
     group_size: int = 32,
     sorted_weights: torch.Tensor | None = None,
+    smooth_scale: torch.Tensor | None = None,
+    topk_ids: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Unified fused dynamic MX quant + MoE-sort entry (MXFP4 / MXFP8).
 
@@ -1126,6 +1130,8 @@ def fused_dynamic_mx_quant_moe_sort(
             block_size,
             group_size,
             sorted_weights,
+            smooth_scale,
+            topk_ids,
         )
     else:
         # Split path: per-token quant produces unswizzled e8m0 byte scale,
@@ -1190,6 +1196,8 @@ def fused_dynamic_mxfp8_quant_moe_sort(
     num_rows: torch.Tensor | None = None,
     group_size: int = 32,
     sorted_weights: torch.Tensor | None = None,
+    smooth_scale: torch.Tensor | None = None,
+    topk_ids: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Backward-compat wrapper around :func:`fused_dynamic_mx_quant_moe_sort`.
 
@@ -1218,6 +1226,8 @@ def fused_dynamic_mxfp8_quant_moe_sort(
         num_rows=num_rows,
         group_size=group_size,
         sorted_weights=sorted_weights,
+        smooth_scale=smooth_scale,
+        topk_ids=topk_ids,
     )
 
 

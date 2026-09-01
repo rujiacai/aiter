@@ -3323,21 +3323,23 @@ def fused_moe_2stages(
             extra_stage2_args["bias2"] = _normalize_bias_for_kernel(bias2)
     if stage1_func in _SWIGLU_LIMIT_STAGE1_FUNCS:
         extra_stage1_args["swiglu_limit"] = swiglu_limit
-    _mxfp8_host_smooth = (
-        smooth_scale is not None
-        and quant_type == QuantType.per_1x32
-        and q_dtype_a == dtypes.fp8
-        and q_dtype_w == dtypes.fp8
-    )
-    if smooth_scale is not None and not _mxfp8_host_smooth:
+    if smooth_scale is not None:
         # _check_smooth_scale_supported already rejected every other backend.
-        # mxfp8 is handled host-side after stage1, so skip passing it to kernel.
-        extra_stage1_args["smooth_scale"] = smooth_scale
-        if stage1_func is _flydsl_stage1_wrapper:
-            # Under split-K the factor is applied by the host reduction, which
-            # needs the row -> expert mapping. Harmless otherwise: the fused
-            # epilogue reads the expert from the sorted ids and ignores this.
-            extra_stage1_args["topk_ids"] = topk_ids
+        # blockwise-fp8: kernel epilogue fuses smooth_scale.
+        # mxfp8 a8w8: fused into fused_dynamic_mxfp8_quant_moe_sort (inter-stage quant).
+        #   -> do NOT pass to stage1 kernel (it doesn't support it for b_dtype=fp8).
+        _is_mxfp8_a8w8 = (
+            quant_type == QuantType.per_1x32
+            and q_dtype_a == dtypes.fp8
+            and q_dtype_w == dtypes.fp8
+        )
+        if not _is_mxfp8_a8w8:
+            extra_stage1_args["smooth_scale"] = smooth_scale
+            if stage1_func is _flydsl_stage1_wrapper:
+                # Under split-K the factor is applied by the host reduction, which
+                # needs the row -> expert mapping. Harmless otherwise: the fused
+                # epilogue reads the expert from the sorted ids and ignores this.
+                extra_stage1_args["topk_ids"] = topk_ids
     if stage1_func is _flydsl_stage1_wrapper:
         if metadata.skip_inter_quant:
             extra_stage1_args["v2_output_layout"] = True
@@ -3443,12 +3445,11 @@ def fused_moe_2stages(
         and w1.dtype in (dtypes.fp4x2, dtypes.fp8)
     ):
         # a8w4 / mxfp8: quantize stage1 output to mxfp8 for stage2's fp8 operand.
-        # host-side smooth_scale for mxfp8 a8w8: a2 at this point is
-        # [token_num, topk, inter_dim] in the original (token, slot) order,
-        # so topk_ids[i, k] directly gives the expert for a2[i, k, :].
-        if smooth_scale is not None and w1.dtype == dtypes.fp8:
-            _smooth = smooth_scale[topk_ids].to(a2.dtype)  # [T, K, inter_dim]
-            a2 = a2 * _smooth
+        # smooth_scale for mxfp8 a8w8 is fused into the quant kernel:
+        # fused_dynamic_mxfp8_quant_moe_sort reads input, multiplies smooth_scale,
+        # then quantizes — one pass instead of two.
+        _mxfp8_smooth = smooth_scale if (w1.dtype == dtypes.fp8) else None
+        _mxfp8_topk_ids = topk_ids.view(-1).contiguous() if _mxfp8_smooth is not None else None
         if not _MOE_A8W4_BYPASS_QUANT:
             a2 = a2.view(-1, inter_dim)
             a2, a2_scale = fused_dynamic_mxfp8_quant_moe_sort(
@@ -3459,6 +3460,8 @@ def fused_moe_2stages(
                 topk=topk,
                 block_size=block_size_M,
                 sorted_weights=sorted_weights,
+                smooth_scale=_mxfp8_smooth,
+                topk_ids=_mxfp8_topk_ids,
             )
             a2 = a2.view(token_num, topk, -1)
         else:

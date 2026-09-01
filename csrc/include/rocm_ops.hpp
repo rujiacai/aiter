@@ -1652,7 +1652,9 @@ namespace py = pybind11;
           py::arg("token_num"),                                          \
           py::arg("block_m"),                                            \
           py::arg("group_size")     = 32,                                \
-          py::arg("sorted_weights") = py::none());                       \
+          py::arg("sorted_weights") = py::none(),                        \
+          py::arg("smooth_scale")   = py::none(),                        \
+          py::arg("topk_ids")       = py::none());                       \
     m.def("mxfp4_moe_sort_hip",                                          \
           &aiter::mxfp4_moe_sort_hip,                                    \
           py::arg("out_scale"),                                          \

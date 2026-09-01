@@ -88,7 +88,9 @@ void fused_dynamic_mx_quant_moe_sort_hip(aiter_tensor_t& out,         // [token_
                                             int token_num,
                                             int block_m,
                                             int group_size = 32,
-                                            std::optional<aiter_tensor_t> sorted_weights = std::nullopt);
+                                            std::optional<aiter_tensor_t> sorted_weights = std::nullopt,
+                                            std::optional<aiter_tensor_t> smooth_scale = std::nullopt,
+                                            std::optional<aiter_tensor_t> topk_ids = std::nullopt);
 
 void mxfp4_moe_sort_hip(aiter_tensor_t& out_scale,
                          const aiter_tensor_t& scale,

@@ -1742,7 +1742,9 @@ __global__ void fused_mx_quant_moe_sort_kernel(
     const int32_t num_blocks,
     const int32_t num_tg,
     const int32_t topk,
-    const int32_t input_stride)
+    const int32_t input_stride,
+    float const* __restrict__ smooth_scale_ptr,
+    int32_t const* __restrict__ topk_ids_ptr)
 {
     int num_thread_per_group = group_size / thread_data_size;
     int num_valid_ids_value  = num_valid_ids[0];
@@ -1835,7 +1837,25 @@ __global__ void fused_mx_quant_moe_sort_kernel(
             for(int j = 0; j < vec_size_i; j++)
             {
                 vec_input_f[j] = static_cast<float>(vec_input[j]);
-                absMax         = max(absMax, abs(vec_input_f[j]));
+            }
+            // smooth_scale[expert_id, col]: fused multiply before mxfp8 quant.
+            // expert_id = topk_ids_flat[token_idx * topk + topk_id] = topk_ids_flat[offset_base]
+            // Guard: only threads whose column range falls within [0, cols) are active.
+            if(smooth_scale_ptr != nullptr && (int32_t)(threadIdx.x * vec_size_i) < cols)
+            {
+                int32_t expert_id = topk_ids_ptr[static_cast<int32_t>(offset_base)];
+                int32_t smooth_col_base = expert_id * cols + threadIdx.x * vec_size_i;
+                #pragma unroll
+                for(int j = 0; j < vec_size_i; j++)
+                {
+                    if((int32_t)(threadIdx.x * vec_size_i + j) < cols)
+                        vec_input_f[j] *= smooth_scale_ptr[smooth_col_base + j];
+                }
+            }
+            #pragma unroll
+            for(int j = 0; j < vec_size_i; j++)
+            {
+                absMax = max(absMax, abs(vec_input_f[j]));
             }
             absMax = multithread_reduce(absMax, aiter::Max(), num_thread_per_group);
 
@@ -1900,7 +1920,9 @@ __global__ void fused_mx_quant_moe_sort_kernel(
                 num_blocks,                                                                     \
                 num_tg,                                                                         \
                 topk,                                                                           \
-                input_stride);                                                                  \
+                input_stride,                                                                   \
+                smooth_scale_ptr,                                                               \
+                topk_ids_ptr);                                                                  \
     });
 
 
@@ -1939,7 +1961,9 @@ void fused_dynamic_mx_quant_moe_sort_hip(
     int token_num,
     int block_m,
     int group_size,
-    std::optional<aiter_tensor_t> sorted_weights
+    std::optional<aiter_tensor_t> sorted_weights,
+    std::optional<aiter_tensor_t> smooth_scale,
+    std::optional<aiter_tensor_t> topk_ids
 )
 {
     int cols = input.size(-1);
@@ -1956,6 +1980,10 @@ void fused_dynamic_mx_quant_moe_sort_hip(
     }
     float const* sorted_weights_ptr =
         sorted_weights.has_value() ? reinterpret_cast<float const*>(sorted_weights->data_ptr()) : nullptr;
+    float const* smooth_scale_ptr =
+        smooth_scale.has_value() ? reinterpret_cast<float const*>(smooth_scale->data_ptr()) : nullptr;
+    int32_t const* topk_ids_ptr =
+        topk_ids.has_value() ? reinterpret_cast<int32_t const*>(topk_ids->data_ptr()) : nullptr;
 
     const int num_cu = get_num_cu_func();
     int sub_block_m = (token_num * topk) > (num_cu * 8) || num_experts < 64 ? 2 : 4;
