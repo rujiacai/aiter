@@ -1589,7 +1589,8 @@ namespace py = pybind11;
           py::arg("scale_ub")        = std::nullopt,                     \
           py::arg("shuffle_scale")   = false,                            \
           py::arg("num_rows")        = std::nullopt,                     \
-          py::arg("num_rows_factor") = 1);                               \
+          py::arg("num_rows_factor") = 1,                                \
+          py::arg("grid_rows")       = 0);                               \
     m.def("dynamic_per_group_scaled_quant",                              \
           &aiter::dynamic_per_group_scaled_quant,                        \
           py::arg("out"),                                                \
@@ -1598,7 +1599,8 @@ namespace py = pybind11;
           py::arg("group_size")      = 32,                               \
           py::arg("shuffle_scale")   = true,                             \
           py::arg("num_rows")        = std::nullopt,                     \
-          py::arg("num_rows_factor") = 1);                               \
+          py::arg("num_rows_factor") = 1,                                \
+          py::arg("grid_rows")       = 0);                               \
     m.def("dynamic_per_group_scaled_quant_fp4",                          \
           &aiter::dynamic_per_group_scaled_quant_fp4,                    \
           py::arg("out"),                                                \
@@ -1607,7 +1609,8 @@ namespace py = pybind11;
           py::arg("group_size")      = 32,                               \
           py::arg("shuffle_scale")   = true,                             \
           py::arg("num_rows")        = std::nullopt,                     \
-          py::arg("num_rows_factor") = 1);                               \
+          py::arg("num_rows_factor") = 1,                                \
+          py::arg("grid_rows")       = 0);                               \
     m.def("smooth_per_token_scaled_quant",                               \
           &aiter::smooth_per_token_scaled_quant,                         \
           py::arg("out"),                                                \

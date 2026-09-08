@@ -109,6 +109,48 @@ def resolve_flydsl_grid_y_persist_m(
     return max(requested_persist_m, required_persist_m)
 
 
+def resolve_flydsl_gemm_grid_y(
+    *,
+    tile_m: int,
+    sort_block_m: int,
+    sorted_token_ids: torch.Tensor,
+    sorted_expert_ids: torch.Tensor,
+    token_num: int,
+    topk: int,
+    num_experts: int,
+    max_m: int | None,
+) -> int:
+    """Host grid.y for FlyDSL MoE GEMM (M-blocks at ``tile_m`` granularity).
+
+    When ``max_m`` is set, size the launch for CUDA-graph replay using a static
+    padded-row upper bound instead of the capacity-shaped buffers. The kernel
+    still reads ``num_valid_ids[0]`` on-device for early exit as a safety net.
+    """
+    tile_m = max(int(tile_m), 1)
+    sort_block_m = max(int(sort_block_m), 1)
+    cap_rows = int(sorted_token_ids.shape[0])
+    cap_grid_y = (cap_rows + tile_m - 1) // tile_m
+
+    if max_m is None:
+        # Bound the padded rows first, then convert to tile_m blocks once:
+        # ``sorted_expert_ids`` and the dense estimate both count
+        # ``sort_block_m``-sized blocks, while grid.y counts ``tile_m``-sized
+        # ones, and tuned configs do use sort_block_m != tile_m (``_sbm32``).
+        dense_rows = min(int(token_num) * int(topk) * sort_block_m, cap_rows)
+        rows = min(dense_rows, int(sorted_expert_ids.shape[0]) * sort_block_m)
+        return max(1, min((rows + tile_m - 1) // tile_m, cap_grid_y))
+
+    max_m = max(int(max_m), 0)
+    num_experts = max(int(num_experts), 1)
+    # After sorting, num_valid_ids[0] is at most this many padded rows.
+    max_sorted_rows = min(
+        cap_rows,
+        max_m * int(topk) + num_experts * (sort_block_m - 1),
+    )
+    grid_y = (max_sorted_rows + tile_m - 1) // tile_m
+    return max(1, min(grid_y, cap_grid_y))
+
+
 def requires_flydsl_stage2_reduce(
     token_num: int, model_dim: int, element_size: int
 ) -> bool:
@@ -1626,6 +1668,8 @@ def _flydsl_moe_stage1_impl(
     k_wave: int = 1,
     v2_output_layout: bool = False,
     smooth_scale: torch.Tensor | None = None,
+    max_m: int | None = None,
+    sort_block_m: int | None = None,
     _compile_kernel=compile_flydsl_moe_stage1,
     _build_mx_args=_s1_args_fp4,
 ):
@@ -1799,13 +1843,17 @@ def _flydsl_moe_stage1_impl(
     _need_quant = _fuse_any_quant or _splitk_fp4 or _gui_sk_fused
     _need_sort = _need_quant
 
-    _sort_block_m = tile_m
-    _all_blks = sorted_expert_ids.shape[0]
-    _dense_blks = (
-        min(token_num * topk * _sort_block_m, sorted_token_ids.shape[0])
-        // _sort_block_m
+    _sort_block_m = tile_m if sort_block_m is None else int(sort_block_m)
+    _grid_y = resolve_flydsl_gemm_grid_y(
+        tile_m=tile_m,
+        sort_block_m=_sort_block_m,
+        sorted_token_ids=sorted_token_ids,
+        sorted_expert_ids=sorted_expert_ids,
+        token_num=token_num,
+        topk=topk,
+        num_experts=E,
+        max_m=max_m,
     )
-    _grid_y = min(_dense_blks, _all_blks)
 
     _persist_m = resolve_flydsl_grid_y_persist_m(_grid_y, persist_m)
 
@@ -2146,6 +2194,8 @@ def flydsl_moe_stage1(
     k_wave: int = 1,
     v2_output_layout: bool = False,
     smooth_scale: torch.Tensor | None = None,
+    max_m: int | None = None,
+    sort_block_m: int | None = None,
 ):
     """Fused gate+up GEMM (MOE stage1).
 
@@ -2209,6 +2259,8 @@ def flydsl_moe_stage1(
         k_wave=k_wave,
         v2_output_layout=v2_output_layout,
         smooth_scale=smooth_scale,
+        max_m=max_m,
+        sort_block_m=sort_block_m,
     )
 
 
@@ -2244,6 +2296,7 @@ def _flydsl_moe_stage2_impl(
     return_per_slot: bool = False,
     expert_mask: torch.Tensor | None = None,
     topk_ids: torch.Tensor | None = None,
+    max_m: int | None = None,
     _compile_kernel=compile_flydsl_moe_stage2,
     _build_mx_args=_s2_args_fp4,
 ) -> torch.Tensor:
@@ -2369,11 +2422,16 @@ def _flydsl_moe_stage2_impl(
     )
 
     _sbm = sort_block_m if sort_block_m > 0 else tile_m
-    if _sbm == tile_m:
-        m_blocks = min(sorted_expert_ids.shape[0], token_num * topk)
-    else:
-        total_sorted = sorted_expert_ids.shape[0] * _sbm
-        m_blocks = (total_sorted + tile_m - 1) // tile_m
+    m_blocks = resolve_flydsl_gemm_grid_y(
+        tile_m=tile_m,
+        sort_block_m=_sbm,
+        sorted_token_ids=sorted_token_ids,
+        sorted_expert_ids=sorted_expert_ids,
+        token_num=token_num,
+        topk=topk,
+        num_experts=E,
+        max_m=max_m,
+    )
     if persist is True:
         _persist_m = -1
     elif persist is False:
@@ -2540,6 +2598,7 @@ def flydsl_moe_stage2(
     return_per_slot: bool = False,
     expert_mask: torch.Tensor | None = None,
     topk_ids: torch.Tensor | None = None,
+    max_m: int | None = None,
 ) -> torch.Tensor:
     """Down-projection GEMM (MOE stage2). Supports atomic/reduce modes.
 
@@ -2593,6 +2652,7 @@ def flydsl_moe_stage2(
         return_per_slot=return_per_slot,
         expert_mask=expert_mask,
         topk_ids=topk_ids,
+        max_m=max_m,
     )
 
 

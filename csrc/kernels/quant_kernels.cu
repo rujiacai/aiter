@@ -723,13 +723,19 @@ void dynamic_per_token_scaled_quant(aiter_tensor_t& out,         // [..., d]
                                     std::optional<aiter_tensor_t> scale_ub,
                                     bool shuffle_scale,
                                     std::optional<aiter_tensor_t> num_rows,
-                                    int num_rows_factor)
+                                    int num_rows_factor,
+                                    int grid_rows_limit)
 {
     AITER_CHECK(input.is_contiguous());
     AITER_CHECK(out.is_contiguous());
 
     int const cols        = input.size(-1);
     int const rows        = input.numel() / cols;
+    int launch_rows       = rows;
+    if(grid_rows_limit > 0)
+    {
+        launch_rows = std::min(rows, grid_rows_limit);
+    }
     int32_t* num_rows_ptr = num_rows.has_value() ? reinterpret_cast<int32_t*>(num_rows->data_ptr()) : nullptr;
 
     HipDeviceGuard device_guard(input.device_id);
@@ -773,13 +779,13 @@ void dynamic_per_token_scaled_quant(aiter_tensor_t& out,         // [..., d]
                 {
                     int ori_cols  = out.size(-1);
                     int ori_rows  = rows / (ori_cols / _GS);
-                    launch_group_quant(opus::fp8_t{}, ori_cols, ori_rows, rows, shuffle_tag);
+                    launch_group_quant(opus::fp8_t{}, ori_cols, ori_rows, launch_rows, shuffle_tag);
                 }
                 else if(out.dtype() == AITER_DTYPE_i8)
                 {
                     int ori_cols  = _GS;
                     int ori_rows  = rows;
-                    launch_group_quant(opus::i8_t{}, ori_cols, ori_rows, rows, shuffle_tag);
+                    launch_group_quant(opus::i8_t{}, ori_cols, ori_rows, launch_rows, shuffle_tag);
                 }
 #if defined(__Float4_e2m1fn_x2)
                 else if(out.dtype() == AITER_DTYPE_fp4x2)
@@ -787,7 +793,7 @@ void dynamic_per_token_scaled_quant(aiter_tensor_t& out,         // [..., d]
                     int ori_cols  = out.size(-1) * 2;
                     int ori_rows  = rows / (ori_cols / _GS);
                     constexpr bool ss = decltype(shuffle_tag)::value;
-                    int num_group = ss ? ori_rows * (((ori_cols / _GS) + 7) / 8 * 8) : rows;
+                    int num_group = ss ? ori_rows * (((ori_cols / _GS) + 7) / 8 * 8) : launch_rows;
                     launch_group_quant(opus::fp4_t{}, ori_cols, ori_rows, num_group, shuffle_tag);
                 }
 #endif
@@ -804,7 +810,7 @@ void dynamic_per_token_scaled_quant(aiter_tensor_t& out,         // [..., d]
     }
     else
     {
-        dim3 const grid(rows);
+        dim3 const grid(launch_rows);
         dim3 const block(BlockSize);
         if(out.dtype() == AITER_DTYPE_fp8)
         {
@@ -845,7 +851,8 @@ void dynamic_per_group_scaled_quant(aiter_tensor_t& out,         // [..., d]
                                     int group_size,
                                     bool shuffle_scale,
                                     std::optional<aiter_tensor_t> num_rows,
-                                    int num_rows_factor)
+                                    int num_rows_factor,
+                                    int grid_rows_limit)
 {
     AITER_CHECK(group_size == 32 || group_size == 64 || group_size == 128,
                 __func__,
@@ -854,6 +861,11 @@ void dynamic_per_group_scaled_quant(aiter_tensor_t& out,         // [..., d]
 
     int const cols        = input.size(-1);
     int const rows        = input.numel() / cols;
+    int launch_rows       = rows;
+    if(grid_rows_limit > 0)
+    {
+        launch_rows = std::min(rows, grid_rows_limit);
+    }
     int const row_stride  = input.stride(-2);
     int32_t* num_rows_ptr = num_rows.has_value() ? reinterpret_cast<int32_t*>(num_rows->data_ptr()) : nullptr;
 
@@ -890,11 +902,11 @@ void dynamic_per_group_scaled_quant(aiter_tensor_t& out,         // [..., d]
             int num_group;
             if constexpr(ee)
             {
-                num_group = (ss && _GS == 32) ? rows * ((scaleN + 7) / 8 * 8) : rows * scaleN;
+                num_group = (ss && _GS == 32) ? launch_rows * ((scaleN + 7) / 8 * 8) : launch_rows * scaleN;
             }
             else
             {
-                num_group = rows * scaleN;
+                num_group = launch_rows * scaleN;
             }
             static constexpr int32_t ooba = 4 / sizeof(out_t);
             const int64_t oob_elems =
@@ -967,13 +979,14 @@ void dynamic_per_group_scaled_quant_fp4(aiter_tensor_t& out,         // [..., d]
                                         int group_size,
                                         bool shuffle_scale,
                                         std::optional<aiter_tensor_t> num_rows,
-                                        int num_rows_factor)
+                                        int num_rows_factor,
+                                        int grid_rows_limit)
 {
     AITER_CHECK(out.dtype() == AITER_DTYPE_fp4x2 || out.dtype() == AITER_DTYPE_u8,
                 __func__,
                 " expects fp4x2 / uint8 output; use dynamic_per_group_scaled_quant for fp8/i8");
     dynamic_per_group_scaled_quant(
-        out, input, scales, group_size, shuffle_scale, num_rows, num_rows_factor);
+        out, input, scales, group_size, shuffle_scale, num_rows, num_rows_factor, grid_rows_limit);
 }
 
 #define SMOOTH_PER_TOKEN_SCALED_QUANT_KERNEL_IMPL(quant_kernel, DTYPE_O, THREAD_DATA, BLOCK_SIZE, TRANSPOSE_OUT_DIM01, HAS_MAP, HAS_HASH) \

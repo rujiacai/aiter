@@ -490,6 +490,9 @@ def fused_moe(
     shared_w1_scale: torch.Tensor | None = None,
     shared_w2_scale: torch.Tensor | None = None,
     shared_expert_id: int = -1,
+    # Static upper bound on live tokens for CUDA-graph replay. Must be >= the
+    # real count (see _resolve_moe_max_m) -- too small silently drops the tail.
+    max_m: int | None = None,
 ):
     if (
         any(
@@ -534,6 +537,9 @@ def fused_moe(
             shared_w2_scale=shared_w2_scale,
             shared_expert_id=shared_expert_id,
         )
+    resolved_max_m = _resolve_moe_max_m(
+        max_m, int(hidden_states.shape[0]), num_local_tokens
+    )
     if not block_size_M:
         block_size_M = -1
     return fused_moe_(
@@ -563,6 +569,7 @@ def fused_moe(
         beta=beta,
         linear_beta=linear_beta,
         gate_mode=gate_mode,
+        max_m=resolved_max_m,
     )
 
 
@@ -632,6 +639,7 @@ def fused_moe_(
     beta: float | None = None,
     linear_beta: float | None = None,
     gate_mode: str = GateMode.SEPARATED.value,
+    max_m: int | None = None,
 ) -> torch.Tensor:
     return _fused_moe_impl(
         hidden_states=hidden_states,
@@ -660,6 +668,7 @@ def fused_moe_(
         beta=beta,
         linear_beta=linear_beta,
         gate_mode=gate_mode,
+        max_m=max_m,
     )
 
 
@@ -690,6 +699,7 @@ def _fused_moe_impl(
     beta: float | None = None,
     linear_beta: float | None = None,
     gate_mode: str = GateMode.SEPARATED.value,
+    max_m: int | None = None,
     *,
     _q_dtype_a: torch.dtype | None = None,
     _metadata_transform: Callable | None = None,
@@ -704,6 +714,7 @@ def _fused_moe_impl(
         block_size_M = None
     """user API"""
     M, topk = topk_ids.shape
+    cfg_m = M if max_m is None else min(M, max_m)
     E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
 
     assert w1.shape[1] in [
@@ -846,7 +857,7 @@ def _fused_moe_impl(
                 )
 
     metadata = get_2stage_cfgs(
-        get_padded_M(M),  # consider token_num > 1024 as prefill
+        get_padded_M(cfg_m),  # consider token_num > 1024 as prefill
         model_dim,
         inter_dim,
         E,
@@ -1027,6 +1038,7 @@ def _fused_moe_impl(
             _metadata_transform=_metadata_transform,
             _stage1_extra_args=_stage1_extra_args,
             _stage2_extra_args=_stage2_extra_args,
+            max_m=max_m,
         )
 
 
@@ -1286,6 +1298,47 @@ def nextPow2(n):
 _PADDED_M_TIERS = [32768, 131072]
 
 
+def _resolve_moe_max_m(
+    max_m: int | None,
+    capacity_m: int,
+    num_local_tokens: torch.Tensor | None = None,
+) -> int | None:
+    """Static token upper bound for CUDA-graph kernel selection and FlyDSL grid.y.
+
+    ``max_m`` is a *contract*, not a hint: rows past it are cut from the quant
+    and GEMM launch grids, so a bound below the real token count drops the tail
+    instead of failing. The live count itself only exists on the device
+    (``num_local_tokens``) and reading it is the host sync ``max_m`` exists to
+    avoid, so callers own that half of the contract. What is checkable on the
+    host is the case below: no ``num_local_tokens`` means every row is live.
+    """
+    if max_m is None:
+        env = os.environ.get("AITER_MOE_MAX_M")
+        if not env:
+            return None
+        max_m = int(env)
+    max_m = max(int(max_m), 0)
+    if num_local_tokens is None and max_m < int(capacity_m):
+        raise ValueError(
+            f"max_m={max_m} is below the {capacity_m}-row input and "
+            "num_local_tokens is not set, so every row is live and rows "
+            f"[{max_m}, {capacity_m}) would be dropped. Pass num_local_tokens "
+            "for a capacity-shaped (EP dispatch) buffer, or raise max_m."
+        )
+    return min(int(capacity_m), max_m)
+
+
+def _resolve_moe_quant_grid_rows(max_m: int | None, *, topk: int = 1) -> int | None:
+    """Static flattened-row upper bound for quant launch grids (CUDA-graph safe).
+
+    Rows beyond the returned bound are never launched, so it relies on the
+    ``max_m`` contract checked in :func:`_resolve_moe_max_m`.
+    """
+    if max_m is None:
+        return None
+    return int(max_m) * int(topk)
+
+
 def get_padded_M(M):
     if M < _PADDED_M_TIERS[0]:
         return nextPow2(M)
@@ -1473,6 +1526,8 @@ def _flydsl_stage1_wrapper(
         k_wave=parsed.get("k_wave", 1),
         v2_output_layout=v2_output_layout,
         smooth_scale=smooth_scale,
+        max_m=_kwargs.get("max_m"),
+        sort_block_m=parsed.get("sort_block_m", parsed["tile_m"]),
     )
 
 
@@ -1622,6 +1677,7 @@ def _flydsl_stage2_wrapper(
         xcd_swizzle=parsed.get("xcd_swizzle", 0),
         expert_mask=expert_mask,
         topk_ids=topk_ids,
+        max_m=_kwargs.get("max_m"),
     )
 
 
@@ -3161,10 +3217,14 @@ def fused_moe_2stages(
     _metadata_transform: Callable | None = None,
     _stage1_extra_args: dict | None = None,
     _stage2_extra_args: dict | None = None,
+    max_m: int | None = None,
 ):
     quant_func = get_quant(quant_type)
     gate_mode = GateMode(gate_mode)
     token_num, _ = hidden_states.shape
+    cfg_m = token_num if max_m is None else min(token_num, max_m)
+    quant_grid_rows = _resolve_moe_quant_grid_rows(max_m, topk=1)
+    inter_quant_grid_rows = _resolve_moe_quant_grid_rows(max_m, topk=topk)
     E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
     dtype = moe_out.dtype
     device = hidden_states.device
@@ -3173,7 +3233,7 @@ def fused_moe_2stages(
         moe_out = torch.empty((token_num, model_dim), dtype=dtype, device=device)
     is_shuffled = getattr(w1, "is_shuffled", False) or getattr(w2, "is_shuffled", False)
     metadata = get_2stage_cfgs(
-        get_padded_M(token_num),  # consider token_num > 1024 as prefill
+        get_padded_M(cfg_m),  # consider token_num > 1024 as prefill
         model_dim,
         inter_dim,
         E,
@@ -3276,6 +3336,7 @@ def fused_moe_2stages(
             scale=a1_scale,
             quant_dtype=q_dtype_a,
             num_rows=num_local_tokens,
+            grid_rows=quant_grid_rows,
         )
     else:
         assert (
@@ -3348,6 +3409,8 @@ def fused_moe_2stages(
         extra_stage1_args["situ_linear_beta"] = (
             1.0 if linear_beta is None else float(linear_beta)
         )
+        if max_m is not None:
+            extra_stage1_args["max_m"] = max_m
     elif stage1_func is _opus_a8w4_stage1_wrapper:
         if metadata.skip_inter_quant:
             extra_stage1_args["output_sorted"] = True
@@ -3367,6 +3430,11 @@ def fused_moe_2stages(
     ):
         extra_stage2_args["expert_mask"] = expert_mask
         extra_stage2_args["topk_ids"] = topk_ids
+    if max_m is not None and stage2_func in (
+        _flydsl_stage2_wrapper,
+        _flydsl_v2_stage2_wrapper,
+    ):
+        extra_stage2_args["max_m"] = max_m
     if (
         stage2_func is _flydsl_v2_stage2_wrapper
         and not doweight_stage1
@@ -3499,6 +3567,7 @@ def fused_moe_2stages(
             quant_dtype=q_dtype_a,
             num_rows=num_local_tokens,
             num_rows_factor=topk,
+            grid_rows=inter_quant_grid_rows,
         )
         a2 = a2.view(token_num, topk, inter_dim)
 

@@ -410,6 +410,7 @@ def per_token_quant_hip(
     quant_dtype: torch.dtype = dtypes.i8,
     num_rows: Tensor | None = None,
     num_rows_factor: int = 1,
+    grid_rows: int | None = None,
 ) -> tuple[Tensor, Tensor]:
     shape = x.shape
     device = x.device
@@ -421,7 +422,12 @@ def per_token_quant_hip(
     if 1:
         y = torch.empty(shape, dtype=quant_dtype, device=device)
         dynamic_per_token_scaled_quant(
-            y, x, scale, num_rows=num_rows, num_rows_factor=num_rows_factor
+            y,
+            x,
+            scale,
+            num_rows=num_rows,
+            num_rows_factor=num_rows_factor,
+            grid_rows=0 if grid_rows is None else int(grid_rows),
         )
     elif quant_dtype == dtypes.i8:
         M, N = x.view(-1, shape[-1]).shape
@@ -446,6 +452,7 @@ def per_group_quant_hip(
     num_rows: "torch.Tensor | None" = None,
     num_rows_factor: int = 1,
     scale_type: torch.dtype = dtypes.fp32,
+    grid_rows: int | None = None,
 ) -> "tuple[Tensor, Tensor]":
     shape = x.shape
     device = x.device
@@ -461,6 +468,7 @@ def per_group_quant_hip(
         128,
     ], f"unsupported group size {group_size=}, only support [32, 64, 128]"
     y = torch.empty(shape, dtype=quant_dtype, device=device)
+    _grid_rows = 0 if grid_rows is None else int(grid_rows)
     if scale_type == dtypes.fp8_e8m0:
         dynamic_per_group_scaled_quant(
             y,
@@ -470,8 +478,16 @@ def per_group_quant_hip(
             shuffle_scale=transpose_scale,
             num_rows=num_rows,
             num_rows_factor=num_rows_factor,
+            grid_rows=_grid_rows,
         )
     else:
+        # The launcher caps its grid at `grid_rows` rows of `input.size(-1)`
+        # elements. This call reshapes to (-1, group_size), so a limit given in
+        # rows of `shape[-1]` elements must be converted to group rows -- without
+        # this the grid is `shape[-1] // group_size` times too small and the tail
+        # of the tensor is left unquantized.
+        if _grid_rows > 0:
+            _grid_rows *= shape[-1] // group_size
         dynamic_per_token_scaled_quant(
             y,
             x.view(-1, group_size),
@@ -479,6 +495,7 @@ def per_group_quant_hip(
             shuffle_scale=transpose_scale,
             num_rows=num_rows,
             num_rows_factor=num_rows_factor,
+            grid_rows=_grid_rows,
         )
     return y, scale
 
@@ -760,6 +777,7 @@ def dynamic_per_token_scaled_quant(
     shuffle_scale: bool = False,
     num_rows: torch.Tensor | None = None,
     num_rows_factor: int = 1,
+    grid_rows: int = 0,
 ) -> None: ...
 
 
@@ -772,6 +790,7 @@ def dynamic_per_group_scaled_quant(
     shuffle_scale: bool = True,
     num_rows: torch.Tensor | None = None,
     num_rows_factor: int = 1,
+    grid_rows: int = 0,
 ) -> None:
     """Dtype-aware per-group dynamic quant.
 
@@ -800,6 +819,7 @@ def dynamic_per_group_scaled_quant_fp4(
     shuffle_scale: bool = True,
     num_rows: torch.Tensor | None = None,
     num_rows_factor: int = 1,
+    grid_rows: int = 0,
 ) -> None:
     """Backward-compat fp4x2-only forwarder; delegates to
     ``dynamic_per_group_scaled_quant``.
