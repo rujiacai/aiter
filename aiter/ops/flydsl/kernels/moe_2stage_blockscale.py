@@ -310,6 +310,20 @@ def compile_moe_gemm1(
         ku_per_kblk = scale_blk_k // 64  # K64 micro-steps inside one scale block
         kblk_per_tile = tile_k // scale_blk_k
 
+    # Can one W block scale serve every accumulator of a wave? A wave owns the
+    # contiguous column slice [base, base + tile_n/4), whose base is
+    # (tile_n/4)-aligned: the expert offset and by*tile_n are both scale_blk_n
+    # multiples and the wave term is a multiple of tile_n/4. Such a slice stays
+    # inside one scale_blk_n block exactly when scale_blk_n divides into
+    # slice-sized pieces. `up` is offset by inter_dim, which has to keep the same
+    # alignment. When this does not hold the loader falls back to per-ni loads.
+    _s1_n_per_wave = max(int(tile_n) // 4, 1)
+    _wsc_uniform_ni = (
+        is_fp8_blk
+        and scale_blk_n % _s1_n_per_wave == 0
+        and int(inter_dim) % scale_blk_n == 0
+    )
+
     _is_gfx950 = "gfx95" in get_hip_arch()
     _has_cvt_off_f32_i4 = hasattr(rocdl, "cvt_off_f32_i4")
     # gfx950 cvt_off_f32_i4 is signed-int4 specific; mxfp4 always uses the bit-op path.
@@ -499,6 +513,28 @@ def compile_moe_gemm1(
     lds_alloc_offset = allocator._align(allocator.ptr, 16)
     allocator.ptr = lds_alloc_offset + lds_alloc_bytes
 
+    # ── Blockwise fp8: stage the A block-scale table in LDS ───────────────────
+    # scale_x is (tokens, K/blk_k) f32, so one row's K blocks are contiguous while
+    # consecutive rows sit num_k_blocks*4 bytes apart. Reading it per K tile made
+    # every iteration re-touch tile_m scattered cachelines, and the W stream (8-16
+    # KB/wave/tile against a 16 KB vL1D) evicted them in between -- measured
+    # 171-320 cycles per load and 12.0% of the stage1 ATT latency budget, more
+    # instructions than the 16B weight loads themselves.
+    #
+    # Staging the whole M-block once costs num_k_blocks*tile_m f32 of LDS and
+    # turns the K loop into ds_reads. The table is transposed to (kb, row) so the
+    # four consecutive rows one lane needs for a K block land in a single 16B
+    # ds_read instead of four 4B ones.
+    _asc_lds_elems = int(num_k_blocks) * int(tile_m) if is_fp8_blk else 0
+    # Keep the extra LDS well under the point where it, rather than the 160
+    # registers/wave, would cap occupancy (65536/8192 = 8 workgroups per CU
+    # against the ~3.2 the register budget allows).
+    _use_asc_lds = is_fp8_blk and 0 < _asc_lds_elems * 4 <= 8192
+    _asc_lds_offset = 0
+    if _use_asc_lds:
+        _asc_lds_offset = allocator._align(allocator.ptr, 16)
+        allocator.ptr = _asc_lds_offset + _asc_lds_elems * 4
+
     # a8w4 ALIGNED gate: computed in the OUTER (compile) scope so it is a closure
     # scalar captured by moe_gemm1 -> folded into FlyDSL's disk cache key
     # (_collect_closure_scalar_vals). Otherwise aligned/fold share a key and the
@@ -685,6 +721,18 @@ def compile_moe_gemm1(
                         shape=(tile_m * tile_n,),
                     ).get()
                     if _use_cshuffle_epilog
+                    else None
+                )
+                # Separate region: it must survive the whole K loop, so it cannot
+                # alias the X ping-pong / CShuffle bytes above.
+                lds_asc = (
+                    SmemPtr(
+                        base_ptr,
+                        _asc_lds_offset,
+                        T.f32,
+                        shape=(_asc_lds_elems,),
+                    ).get()
+                    if _use_asc_lds
                     else None
                 )
 
@@ -954,9 +1002,12 @@ def compile_moe_gemm1(
                 # thread needs 4 distinct activation scales per K block. Decode
                 # the token ids once here; the K loop then only adds the block
                 # index to these precomputed row bases.
+                #
+                # Only for the direct-gather path: the LDS table resolves the token
+                # ids inside the preload instead, on its own (row, kb) mapping.
                 a_blk_scale_base = []
                 a_blk_scale_ok = []
-                if const_expr(is_fp8_blk):
+                if const_expr(is_fp8_blk and not _use_asc_lds):
                     c_num_kb = fx.Index(num_k_blocks)
                     row_base_blk = bx_m + lane_div_16 * fx.Index(4)
                     for mi in range_constexpr(m_repeat):
@@ -983,6 +1034,55 @@ def compile_moe_gemm1(
                         a_blk_scale_base.append(bases_mi)
                         a_blk_scale_ok.append(ok_mi)
 
+                def preload_a_scales_to_lds():
+                    """Stage this M-block's whole A block-scale table into LDS.
+
+                    Thread t takes flat element ``t + i*256`` of a (row, kb) grid,
+                    so consecutive threads walk consecutive K blocks of one row --
+                    the one direction in which scale_x is contiguous, which turns
+                    the per-tile gather into tile_m*ceil(num_k_blocks*4/128)
+                    sequential cacheline fetches for the whole loop.
+
+                    Written transposed to (kb, row); the strided ds_writes cost
+                    bank conflicts once, in exchange for 16B ds_reads in the K loop.
+                    """
+                    c_nkb = fx.Index(num_k_blocks)
+                    c_tm = fx.Index(tile_m)
+                    total = int(num_k_blocks) * int(tile_m)
+                    for i in range_constexpr((total + 255) // 256):
+                        d = tx + arith.index(i * 256)
+                        row = d // c_nkb
+                        kb = d - row * c_nkb
+                        # Padded rows carry token_id == tokens; clamp the address and
+                        # store 0.0 so they accumulate exactly 0, matching what the
+                        # per-tile path did with its select().
+                        fused = buffer_ops.buffer_load(
+                            sorted_rsrc, bx_m + row, vec_width=1, dtype=T.i32
+                        )
+                        t_id = fused & mask24
+                        t_ok = arith.cmpi(arith.CmpIPredicate.ult, t_id, tokens_i32)
+                        t_safe = arith.select(t_ok, t_id, fx.Int32(0))
+                        val = arith.select(
+                            t_ok,
+                            buffer_ops.buffer_load(
+                                sx_rsrc,
+                                arith.index_cast(T.index, t_safe) * c_nkb + kb,
+                                vec_width=1,
+                                dtype=T.f32,
+                            ),
+                            fx.Float32(0.0),
+                        )
+                        _store = vector.from_elements(T.vec(1, T.f32), [val])
+                        if const_expr(total % 256 == 0):
+                            vector.store(_store, lds_asc, [kb * c_tm + row])
+                        else:
+                            _in_range = arith.cmpi(
+                                arith.CmpIPredicate.ult, d, arith.index(total)
+                            )
+                            _if_r = scf.IfOp(_in_range)
+                            with _if_then(_if_r):
+                                vector.store(_store, lds_asc, [kb * c_tm + row])
+
                 def load_a_scales(base_k):
                     """A block scales for one K tile, issued ahead of the B burst.
 
@@ -990,10 +1090,36 @@ def compile_moe_gemm1(
                     the VMEM burst while being the first value the MFMA chain
                     consumes, which forced the wait down to vmcnt(3) and drained
                     the in-flight loads before any MFMA could issue.
+
+                    With the LDS table staged by ``preload_a_scales_to_lds`` this is
+                    one 16B ds_read per (K block, mi): the four values a lane needs
+                    are the four consecutive rows at ``kb * tile_m + mi*16 +
+                    lane_div_16*4``.
                     """
                     if const_expr(not is_fp8_blk):
                         return []
                     kb_base = base_k // fx.Index(scale_blk_k)
+                    if const_expr(_use_asc_lds):
+                        c_tm = fx.Index(tile_m)
+                        row_lds = lane_div_16 * fx.Index(4)
+                        vals = []
+                        for kbi in range_constexpr(kblk_per_tile):
+                            kb_idx = kb_base + fx.Index(kbi)
+                            for mi in range_constexpr(m_repeat):
+                                v4 = vector.load_op(
+                                    T.f32x4,
+                                    lds_asc,
+                                    [kb_idx * c_tm + row_lds + fx.Index(mi * 16)],
+                                )
+                                for ii in range_constexpr(4):
+                                    vals.append(
+                                        vector.extract(
+                                            v4,
+                                            static_position=[ii],
+                                            dynamic_position=[],
+                                        )
+                                    )
+                        return vals
                     vals = []
                     for kbi in range_constexpr(kblk_per_tile):
                         kb_idx = kb_base + fx.Index(kbi)
@@ -1083,29 +1209,49 @@ def compile_moe_gemm1(
                     """
                     if const_expr(is_fp8_blk):
                         # Blockwise fp8: native fp8 B packs + one f32 weight scale per
-                        # (blk_n, blk_k) tile. `k_pos` carries the K64 micro-step so a
-                        # tile spanning several scale blocks picks the right one; the
-                        # tuple shape matches mxfp8 so the loop-state (un)flatten is
-                        # shared.
+                        # (blk_n, blk_k) tile. The tuple shape matches mxfp8 so the
+                        # loop-state (un)flatten is shared.
+                        #
+                        # There is exactly one distinct scale per scale block: every ku
+                        # inside a block maps to the same kb (scale_blk_k is a multiple
+                        # of the 64B micro-step) and, when `_wsc_uniform_ni` holds, so
+                        # does every ni. Loading it per (ku, ni) fetched the same dword
+                        # k_unroll*num_acc_n times -- 16 loads per tile for gate+up
+                        # where 2 suffice, and the ku that does not start a block was
+                        # never even read by the compute loop.
+                        def _wsc(kbi, ni):
+                            return load_block_scale_f32(
+                                buffer_ops,
+                                arith,
+                                scale_rsrc=sw_rsrc,
+                                n_blk=blk_list[ni],
+                                n_intra=intra_list[ni],
+                                k_pos=base_k
+                                + fx.Index(kbi * ku_per_kblk * 64),
+                                num_k_blocks=num_k_blocks,
+                                scale_blk_n=scale_blk_n,
+                                scale_blk_k=scale_blk_k,
+                            )
+
+                        if const_expr(_wsc_uniform_ni):
+                            sc_blk = [
+                                [_wsc(kbi, 0)] * num_acc_n
+                                for kbi in range_constexpr(kblk_per_tile)
+                            ]
+                        else:
+                            sc_blk = [
+                                [_wsc(kbi, ni) for ni in range_constexpr(num_acc_n)]
+                                for kbi in range_constexpr(kblk_per_tile)
+                            ]
                         raw_data = []
                         for ku in range_constexpr(k_unroll):
                             raw_ku = []
+                            _sc_ku = sc_blk[ku // ku_per_kblk]
                             for ni in range_constexpr(num_acc_n):
                                 b0, b1 = load_b_pair(
                                     base_k, ku, ni, blk_list, intra_list
                                 )
-                                sc = load_block_scale_f32(
-                                    buffer_ops,
-                                    arith,
-                                    scale_rsrc=sw_rsrc,
-                                    n_blk=blk_list[ni],
-                                    n_intra=intra_list[ni],
-                                    k_pos=base_k + fx.Index(ku * 64),
-                                    num_k_blocks=num_k_blocks,
-                                    scale_blk_n=scale_blk_n,
-                                    scale_blk_k=scale_blk_k,
-                                )
-                                raw_ku.append((b0, b1, sc))
+                                raw_ku.append((b0, b1, _sc_ku[ni]))
                             raw_data.append(raw_ku)
                         return raw_data
                     else:
@@ -1526,6 +1672,10 @@ def compile_moe_gemm1(
                 x_regs0 = load_x_tile(k0)
                 b_gate_cur = load_b_tile(k0, n_blk_gate, n_intra_gate, n_row_gate)
                 b_up_cur = load_b_tile(k0, n_blk_up, n_intra_up, n_row_up)
+                if const_expr(_use_asc_lds):
+                    # Shares the barrier below with the X store; both are LDS writes
+                    # the whole workgroup reads back afterwards.
+                    preload_a_scales_to_lds()
                 store_x_tile_to_lds(x_regs0, lds_base_cur)
                 gpu.barrier()
 
@@ -2520,6 +2670,10 @@ def compile_moe_gemm2(
         ku_per_kblk = scale_blk_k // 64
         kblk_per_tile = tile_k // scale_blk_k
 
+    # One W block scale per wave -- see the stage1 twin for the alignment argument.
+    # model_dim (the N dim here) is already required to be a scale_blk_n multiple.
+    _wsc_uniform_ni = is_fp8_blk and scale_blk_n % max(int(tile_n) // 4, 1) == 0
+
     _is_gfx950 = "gfx95" in get_hip_arch()
     _has_cvt_off_f32_i4 = hasattr(rocdl, "cvt_off_f32_i4")
     # gfx950 cvt_off_f32_i4 is signed-int4 specific; mxfp4 always uses the bit-op path.
@@ -2695,6 +2849,15 @@ def compile_moe_gemm2(
     lds_alloc_offset = allocator._align(allocator.ptr, 16)
     allocator.ptr = lds_alloc_offset + lds_alloc_bytes
 
+    # Blockwise fp8: stage the A block-scale table in LDS. See the stage1 twin for
+    # why -- same layout, same eviction problem, 7.6% of the stage2 ATT budget here.
+    _asc_lds_elems = int(num_k_blocks) * int(tile_m) if is_fp8_blk else 0
+    _use_asc_lds = is_fp8_blk and 0 < _asc_lds_elems * 4 <= 8192
+    _asc_lds_offset = 0
+    if _use_asc_lds:
+        _asc_lds_offset = allocator._align(allocator.ptr, 16)
+        allocator.ptr = _asc_lds_offset + _asc_lds_elems * 4
+
     # a8w4 ALIGNED gate: outer-scope closure scalar so it is folded into FlyDSL's
     # disk cache key (see stage1 twin) -> aligned/fold never share a binary.
     _blk_fma_depth = _BLK_FMA_DEPTH if is_fp8_blk else 0
@@ -2820,6 +2983,18 @@ def compile_moe_gemm2(
                     shape=(tile_m * tile_n,),
                 ).get()
                 if _use_cshuffle_epilog
+                else None
+            )
+            # Separate region: it must survive the whole K loop, so it cannot alias
+            # the X ping-pong / CShuffle bytes above.
+            lds_asc = (
+                SmemPtr(
+                    base_ptr,
+                    _asc_lds_offset,
+                    T.f32,
+                    shape=(_asc_lds_elems,),
+                ).get()
+                if _use_asc_lds
                 else None
             )
 
@@ -3049,9 +3224,12 @@ def compile_moe_gemm2(
                 # ── Blockwise fp8: A2-scale row bases ────────────────────────
                 # Mirrors stage1, except the A2 scale is indexed per (token, slot):
                 # row (t, s) lives at (t * topk + s) * num_k_blocks.
+                #
+                # Only for the direct-gather path; the LDS table resolves the ids in
+                # its own preload (see stage1 twin).
                 a_blk_scale_base = []
                 a_blk_scale_ok = []
-                if const_expr(is_fp8_blk):
+                if const_expr(is_fp8_blk and not _use_asc_lds):
                     c_num_kb = fx.Index(num_k_blocks)
                     row_base_blk = bx_m + lane_div_16 * fx.Index(4)
                     for mi in range_constexpr(m_repeat):
@@ -3144,6 +3322,53 @@ def compile_moe_gemm2(
                         ),
                     )
 
+                def preload_a_scales_to_lds():
+                    """Stage this M-block's whole A2 block-scale table into LDS.
+
+                    Thread t takes flat element ``t + i*256`` of a (row, kb) grid, so
+                    consecutive threads walk consecutive K blocks of one row -- the
+                    one direction in which the scale tensor is contiguous. Written
+                    transposed to (kb, row) so the K loop reads 16B at a time.
+                    """
+                    c_nkb = fx.Index(num_k_blocks)
+                    c_tm = fx.Index(tile_m)
+                    total = int(num_k_blocks) * int(tile_m)
+                    for i in range_constexpr((total + 255) // 256):
+                        d = tx + arith.index(i * 256)
+                        row = d // c_nkb
+                        kb = d - row * c_nkb
+                        fused = buffer_ops.buffer_load(
+                            sorted_rsrc, bx_m + row, vec_width=1, dtype=T.i32
+                        )
+                        t_id = fused & mask24
+                        s_id = fused >> fx.Int32(24)
+                        ts_ok = arith.cmpi(
+                            arith.CmpIPredicate.ult, t_id, tokens_i32
+                        ) & arith.cmpi(arith.CmpIPredicate.ult, s_id, topk_i32)
+                        t_safe = arith.select(ts_ok, t_id, fx.Int32(0))
+                        s_safe = arith.select(ts_ok, s_id, fx.Int32(0))
+                        ts_row = t_safe * topk_i32 + s_safe
+                        val = arith.select(
+                            ts_ok,
+                            buffer_ops.buffer_load(
+                                sx_rsrc,
+                                arith.index_cast(T.index, ts_row) * c_nkb + kb,
+                                vec_width=1,
+                                dtype=T.f32,
+                            ),
+                            fx.Float32(0.0),
+                        )
+                        _store = vector.from_elements(T.vec(1, T.f32), [val])
+                        if const_expr(total % 256 == 0):
+                            vector.store(_store, lds_asc, [kb * c_tm + row])
+                        else:
+                            _in_range = arith.cmpi(
+                                arith.CmpIPredicate.ult, d, arith.index(total)
+                            )
+                            _if_r = scf.IfOp(_in_range)
+                            with _if_then(_if_r):
+                                vector.store(_store, lds_asc, [kb * c_tm + row])
+
                 def load_a_scales(base_k):
                     """A2 block scales for one K tile, prefetched alongside the B tile.
 
@@ -3152,10 +3377,34 @@ def compile_moe_gemm2(
                     wait down to vmcnt(3) and drained ~18 in-flight loads before any
                     MFMA could issue. Hoisting them into the loop-carried prefetch
                     makes the wait cover only the previous iteration's loads.
+
+                    With the LDS table staged by ``preload_a_scales_to_lds`` this is
+                    one 16B ds_read per (K block, mi).
                     """
                     if const_expr(not is_fp8_blk):
                         return []
                     kb_base = base_k // fx.Index(scale_blk_k)
+                    if const_expr(_use_asc_lds):
+                        c_tm = fx.Index(tile_m)
+                        row_lds = lane_div_16 * fx.Index(4)
+                        vals = []
+                        for kbi in range_constexpr(kblk_per_tile):
+                            kb_idx = kb_base + fx.Index(kbi)
+                            for mi in range_constexpr(m_repeat):
+                                v4 = vector.load_op(
+                                    T.f32x4,
+                                    lds_asc,
+                                    [kb_idx * c_tm + row_lds + fx.Index(mi * 16)],
+                                )
+                                for ii in range_constexpr(4):
+                                    vals.append(
+                                        vector.extract(
+                                            v4,
+                                            static_position=[ii],
+                                            dynamic_position=[],
+                                        )
+                                    )
+                        return vals
                     vals = []
                     for kbi in range_constexpr(kblk_per_tile):
                         kb_idx = kb_base + fx.Index(kbi)
@@ -3187,23 +3436,41 @@ def compile_moe_gemm2(
                         # Blockwise fp8 (stage2): native fp8 B packs + one f32 weight
                         # scale per (blk_n, blk_k) tile. The tuple shape matches mxfp8
                         # so the loop-state (un)flatten is shared.
+                        #
+                        # Only one distinct scale exists per scale block; see the stage1
+                        # twin for why the per-(ku, ni) call was k_unroll*num_acc_n-fold
+                        # redundant.
+                        def _wsc(kbi, ni):
+                            return load_block_scale_f32(
+                                buffer_ops,
+                                arith,
+                                scale_rsrc=sw_rsrc,
+                                n_blk=n_blk_list[ni],
+                                n_intra=n_intra_list[ni],
+                                k_pos=base_k
+                                + fx.Index(kbi * ku_per_kblk * 64),
+                                num_k_blocks=num_k_blocks,
+                                scale_blk_n=scale_blk_n,
+                                scale_blk_k=scale_blk_k,
+                            )
+
+                        if const_expr(_wsc_uniform_ni):
+                            sc_blk = [
+                                [_wsc(kbi, 0)] * num_acc_n
+                                for kbi in range_constexpr(kblk_per_tile)
+                            ]
+                        else:
+                            sc_blk = [
+                                [_wsc(kbi, ni) for ni in range_constexpr(num_acc_n)]
+                                for kbi in range_constexpr(kblk_per_tile)
+                            ]
                         raw_data = []
                         for ku in range_constexpr(k_unroll):
                             raw_ku = []
+                            _sc_ku = sc_blk[ku // ku_per_kblk]
                             for ni in range_constexpr(num_acc_n):
                                 b0, b1 = load_b_pair(base_k, ku, ni)
-                                sc = load_block_scale_f32(
-                                    buffer_ops,
-                                    arith,
-                                    scale_rsrc=sw_rsrc,
-                                    n_blk=n_blk_list[ni],
-                                    n_intra=n_intra_list[ni],
-                                    k_pos=base_k + fx.Index(ku * 64),
-                                    num_k_blocks=num_k_blocks,
-                                    scale_blk_n=scale_blk_n,
-                                    scale_blk_k=scale_blk_k,
-                                )
-                                raw_ku.append((b0, b1, sc))
+                                raw_ku.append((b0, b1, _sc_ku[ni]))
                             raw_data.append(raw_ku)
                         return raw_data
                     else:
@@ -3650,6 +3917,10 @@ def compile_moe_gemm2(
                 k0 = fx.Index(0)
                 x_regs0 = load_x_tile(k0)
                 b_cur = load_b_tile(k0)
+                if const_expr(_use_asc_lds):
+                    # Shares the barrier below with the X store; both are LDS writes
+                    # the whole workgroup reads back afterwards.
+                    preload_a_scales_to_lds()
                 store_x_tile_to_lds(x_regs0, lds_base_cur)
                 gpu.barrier()
 

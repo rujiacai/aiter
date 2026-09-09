@@ -1,6 +1,6 @@
-# FlyDSL blockwise-fp8 MoE：stage2 带宽优化记录
+# FlyDSL blockwise-fp8 MoE：带宽优化记录
 
-日期：2026-09-08
+日期：2026-09-08（§3.1~§3.7，起点是 stage2）／2026-09-09（§3.8~§3.9，scale 加载，两个 stage）
 机器：MI308X（gfx942，80 CU，sclk 1850 / mclk 1300，SPX/NPS1，ROCm 7.14）
 路径：`AITER_FLYDSL_BLKFP8=1` 的 2stage FlyDSL blockwise fp8（`fp8blk`，128×128 权重 scale + 1×128 激活 scale）
 
@@ -14,21 +14,26 @@ hidden 6144 / inter 2048 / 256 全局专家 top-8 / EP16 → 每 rank 16 个本�
 
 | 项 | 结果 |
 | --- | --- |
-| stage2 收益 | bs16 **-20.0%**、bs64 **-25.2%**、bs128 **-20.0%**、bs224 **-20.5%** |
-| stage1 收益 | bs16 **-5.7%**、bs64 **-10.2%**、bs128 **-3.5%**、bs224 **-4.0%**（§3.5 的 x-load 钉序 + §3.6 的 NT） |
-| e2e 收益 | bs16 **-10.8%**、bs64 **-14.5%**、bs128 **-9.3%**、bs224 **-9.9%** |
-| 有效带宽（stage2, bs64） | 2.33 → **2.69 TB/s**（§3.1+§3.2 后的采集点，见 §3.4；§3.6 的 NT 又把 gemm2 压到 66.0 µs，但它同时改变了 L2 命中，不能按固定流量折算） |
+| gemm1 收益 | bs16 **-12.4%**、bs64 **-15.4%**、bs128 **-9.2%**、bs224 **-12.6%** |
+| gemm2 收益 | bs16 **-24.6%**、bs64 **-28.6%**、bs128 **-24.9%**、bs224 **-27.2%** |
+| e2e 收益 | bs16 **-16.3%**、bs64 **-18.6%**、bs128 **-14.2%**、bs224 **-17.3%** |
+| 对手写 ASM 1stage | bs16 **快 29%**、bs64 **快 10%**；bs128 仍慢 8.6%（优化前慢 25.9%） |
+| fabric 读带宽占用 | gemm1 **93.8%**、gemm2 70.5% 的实测上限（2662 GB/s，见 §8 —— 不是早先以为的 4 TB/s） |
 | 生效方式 | 默认生效，无需 env |
-| 正确性 | 5 个 bs × 5 个 layer，`zero_rows=0`、`relL2≈0.024`（参考实现口径见 §6） |
-| 旁证 | 另一个 dump（EP8 / 32 专家）e2e 435.6 → **391.8 µs** |
+| 正确性 | 6 个 bs × 5 个 layer，`zero_rows=0`、`relL2≈0.023~0.024`（参考实现口径见 §6） |
+| 旁证 | 另一个 dump（EP8 / 32 专家）e2e 435.6 → **391.8 µs**（§3.1~§3.5 之后测的，未含后续两轮） |
 
-五处改动：
+七处改动，前五处是第一轮（指令与调度），后两处是第二轮（scale 加载的粒度与冗余）：
 
-1. **stage2 `tile_k` 256 → 128**（配置，`aiter/fused_moe.py`）—— 主要收益
+1. **stage2 `tile_k` 256 → 128**（配置，`aiter/fused_moe.py`）—— 第一轮主要收益
 2. **A2 scale 的 load 提到 B burst 之前**（kernel，`moe_2stage_blockscale.py`）—— 次要收益，且在 `tile_k=256` 下收益更大
-3. **A-tile（x）的 load 用 `sched_barrier` 钉在 burst 头部**（kernel，两个 stage 各一行）—— 见 §3.5，唯一同时改善 stage1 的一项
+3. **A-tile（x）的 load 用 `sched_barrier` 钉在 burst 头部**（kernel，两个 stage 各一行）—— 见 §3.5，第一轮唯一同时改善 stage1 的一项
 4. **stage1 的 W 用 non-temporal 加载，按 token 数开关**（配置 + kernel）—— 见 §3.6，小 bs 上 e2e -6~8%，大 bs 上必须关掉
 5. **共享同一 16B kpack 的两条 B load 合并成一条**（kernel，`mfma_preshuffle_pipeline.py`）—— 见 §3.7，省掉一条只命中 L1 的冗余 `dwordx4`
+6. **A block-scale 整块预载进 LDS**（kernel，两个 stage）—— 见 §3.8，gemm1 -4~6%
+7. **W block-scale 每个 scale 块只发一条 load**（kernel，两个 stage）—— 见 §3.9，gemm2 -4~7%、gemm1 再 -2%
+
+后两处合起来把 load 指令数砍掉 gemm1 **34%** / gemm2 **47%**，其中单 dword 降 72% / 83%。
 
 ---
 
@@ -269,6 +274,101 @@ kernel 侧用 `load_b_pair()` 包一层：`kpack_bytes==16` 且非 int4 时走�
 K32 load，所以 int4 / 8B kpack 的调用点行为不变。这不改变 HBM 流量（第二条本来就是 L1 命中），
 省的是 VMEM 发射槽和 burst 长度 —— 和 §3.1 缩短 burst 是同一个方向。
 
+### 3.8 A block-scale 整块预载进 LDS
+
+第二轮的起点是一个反直觉的观察：ATT 里**单 dword 的 scale load 条数比 16B 的权重 load 还多**，
+而且贵得多。
+
+| bs128 | `dwordx4`（真实权重） | `dword`（scale） |
+| --- | --- | --- |
+| gemm1 | 7680 条 / 27.4% | **7840 条 / 18.0%** |
+| gemm2 | 4096 条 / 24.8% | **4416 条 / 15.5%** |
+
+按资源寄存器拆开，贵的那一组是 **activation scale**（gemm1 里 3 条静态指令就占 12.2%，
+171~320 cyc/次），而 W scale 反而便宜（20~35 cyc/次，合计 3.6%）—— 因为 W scale 的地址在
+wave 内是均匀的，硬件合并成一次 cacheline 请求且常驻。
+
+**A scale 为什么贵**：它的布局是 `(tokens, K/128)`，索引 `token_id * num_k_blocks + kb`。
+MFMA 16x16x32 的 lane 映射让一个 lane 的 4 个累加器 f32 对应 4 个连续 M 行
+（`row = bx_m + mi*16 + lane_div_16*4 + ii`），所以一拍要发 4 条 per-lane load，
+每条 64 个 lane 只取到 4 个不同值（**16 倍 lane 冗余**）。更要命的是行步长 =
+`num_k_blocks * 4B`，stage1 是 **192 字节** > 128，那 16 个 f32 落在 **16 条不同 cacheline**
+上，每条 128B 只有 4B 有用。而同一行的所有 k-block scale 其实是**连续的** —— K 循环跑 48 拍，
+每拍都去碰同样那 16 条线、每次只取 4 字节，两拍之间 wave 要流过 8~16 KB 的 W，把 16 KB 的
+vL1D 冲干净，于是**每拍重新 miss**。
+
+**改法**：K 循环之前一次性把整个 M-block 的表读进 LDS（`preload_a_scales_to_lds()`），
+K 循环里改成 `ds_read`。三个设计点：
+
+- **线程映射**：`d = tx + i*256`，`row = d / num_k_blocks`、`kb = d % num_k_blocks` ——
+  相邻线程走**同一行的相邻 k-block**，正是唯一连续的方向，整张表变成 24 条顺序 cacheline 读。
+- **LDS 按 `(kb, row)` 转置**：一个 lane 需要的 4 个连续行落在同一个 16B 里，
+  `4 条 ds_read_b32` 变成 **1 条 `ds_read_b128`**。代价是预载时 ds_write 有 bank 冲突，
+  但那是一次性的。
+- **预算闸门**：表大小 `num_k_blocks * tile_m * 4B`（stage1 3 KB、stage2 1 KB），
+  超过 8 KB 就自动回退到原来的逐拍 gather，避免大 `tile_m` / 大 `model_dim` 让 LDS
+  取代寄存器成为 occupancy 瓶颈（8 KB 对应 8 WG/CU，而寄存器只允许 ~3.2）。
+
+padding 行照旧写 0，保持「补齐行累加恰好为 0」的不变量，epilogue 不用改。`load_a_scales()`
+的返回值接口没变，所以 `compute_tile` 一行未动；旧的逐拍 gather 路径完整保留。
+
+单独这一项（bs128）：gemm1 169.1 → **162.3**（-4.0%）、gemm2 91.4 → 91.1。
+gemm2 收益小是因为它的 `num_k_blocks=16`，行步长只有 64 字节，**两行就挤在一条 cacheline 里**，
+整张表 1 KB / 8 条线，本来就容易留在 L1。
+
+值得记一笔的副作用：ATT 里单 dword 少了 3740 条、占比 18.0% → 8.4%，但**总 latency 只降 2.7%**，
+因为 X（activation tile）那条 `dwordx2` 的占比从 1.5% 涨到 12.2% —— 以前是 A scale 在吃内存
+延迟、把 X 挡在后面，现在 A scale 走了，X 的 wait 就暴露成新的头号项。典型的「消掉一个 stall、
+露出下一个」，墙钟的真实收益（-4.0%）来自 fabric 上少读的那些分散 cacheline。
+
+### 3.9 W block-scale 每个 scale 块只发一条 load
+
+`load_b_tile()` 的调用点是 `for ku in k_unroll: for ni in num_acc_n:`，gate+up 合计
+**每拍 16 条** load —— 取的全是**同一个 f32**：
+
+- **`ku` 那层**：`scale_blk_k` 是 64B 微步的整数倍，所以一个 scale 块内所有 `ku` 算出同一个 `kb`。
+  而且 compute 只读 `b_*_tile_in[ku_first][ni][2]`，`ku_first` 恒为 0 ——
+  **`ku=1` 那一半加载完从来没被用过**。
+- **`ni` 那层**：`nb = (n_blk*16 + n_intra) >> log2(scale_blk_n)`。一个 wave 拥有连续的
+  `tile_n/4` 列，起点是 `tile_n/4` 对齐的（expert offset 和 `by*tile_n` 都是 `scale_blk_n`
+  的倍数，wave 项是 `tile_n/4` 的倍数），这样的切片不跨 scale 块的充要条件就是
+  **`scale_blk_n % (tile_n/4) == 0`**。stage1 是 128%32、stage2 是 128%64，都成立。
+
+所以每个 scale 块只加载一次、复用到所有 (ku, ni)。条件写成 `_wsc_uniform_ni` 在**外层编译期**
+求值（因此也进 FlyDSL 的 disk cache key），不满足时自动回退到逐 `ni` 加载。
+`(b0, b1, sc)` 的元组形状保留，所以 `_flatten_b_tile` / `_unflatten_b_tile` 和 `compute_tile`
+都不用改 —— 同一个 SSA 值复用到所有槽位。
+
+单独这一项（bs128）：gemm1 162.3 → **159.1**、gemm2 91.1 → **85.8**（-5.9%）。
+gemm2 收益反而更大，因为它 `num_acc_n=4`（stage1 只有 2），冗余倍数是 stage1 的两倍。
+
+### 3.10 第二轮的 profile 对照（bs128）
+
+| | 原始 | +§3.8 | +§3.9 |
+| --- | ---: | ---: | ---: |
+| gemm1 load 总条数 | 16500 | 12740 | **10820**（-34%） |
+| gemm1 其中单 dword | 7840 | 4100 | **2180**（-72%） |
+| gemm2 load 总条数 | 9056 | 7008 | **4788**（-47%） |
+| gemm2 其中单 dword | 4416 | 2400 | **756**（-83%） |
+| gemm2 ATT 总 latency | 1442236 | 1448768 | **1285428**（-11%） |
+
+| 指标 | gemm1 前 → 后 | gemm2 前 → 后 |
+| --- | --- | --- |
+| VGPR / AGPR | 28 / 132 → **4** / 132 | 32 / 128 → **12** / 132 |
+| 总寄存器 | 160 → **136** | 160 → **144** |
+| Wavefront occupancy | 34.1% → **37.0%** | 33.8% → 29.5% |
+| L2-Fabric 读带宽 | 92.4% → **93.8%** | 80.5% → 70.5% |
+| MFMA util | 20.0% → **23.1%** | 19.7% → 19.8% |
+| LDS | 4096 B → 7168 B | 8192 B → 9216 B |
+
+gemm2 的 occupancy 和 fabric 占比都**降了**却更快，这不矛盾 —— fabric 利用率不是目标，
+字节/时间才是：`1875 GB/s × 85.8 µs = 161 MB`，改前是 `2143 × 91.4 = 196 MB`，
+**少读了 35 MB**（gemm1 同理少约 19 MB）。那些分散的 A-scale gather 和冗余 W-scale load
+是**真实的 HBM 流量**，不只是延迟。
+
+另外 gemm1 的 VGPR 掉到只剩 4 个，几乎全部状态都进了 AGPR（132）。总寄存器 136 仍在 128 之上，
+所以还没跨过 4 wave/SIMD 的门槛 —— 想再进一步得从那 132 个 AGPR 下手。
+
 ## 4. 试过但没有收益的（负结果）
 
 | 尝试 | 结果 |
@@ -282,6 +382,16 @@ K32 load，所以 int4 / 8B kpack 的调用点行为不变。这不改变 HBM �
 | A2-scale 放进 loop-carried state | 更慢（77.3 → 88.0），见 §3.2 |
 | stage1 也做 scale 前置 | 0 收益（105.7/151.8/250.6 vs 105.4/151.8/250.0）。stage1 有 gate+up 两个 B tile，scale 占比小得多，MFMA 也够长来掩盖延迟。改动保留仅为与 stage2 对称 |
 | stage2 `use_async_copy`（global→LDS） | 该 kernel family 未实现，`compile_moe_gemm2` 不接这个参数 |
+
+第二轮（bs128 专项）另外几个负结果：
+
+| 尝试 | 结果 |
+| --- | --- |
+| `tile_m` 16 → 32 减权重重读 | traffic 只降 19%（重读本来已被 L2 吃掉大半），但 `m_repeat` 翻倍让累加器翻倍、occupancy 从 32% 掉到 **17%**，fabric 带宽掉 25% → 净亏（gemm1 170 → 185）。配合 `tile_n` 收到 64 想还原累加器数量也没救回来（176） |
+| grid 顺序改成 M 快维度（提 L2 命中率） | 明确负结果：gemm1 **+28%**、gemm2 **+36%**。N 做快维度正是把并发读铺开到所有 HBM channel 的原因，拿它换局部性会让 fabric 带宽崩掉 |
+| XCD swizzle | 不需要：`num_n=48`，`48 mod 4 == 0`，同 n 不同 m 本来就落在同一个 XCD |
+| 收紧 `grid_y`（砍掉 21.4 倍空 WG） | 墙钟无变化（gemm1 169.5~170.2、gemm2 91.2~92.2，扫 24~513 全在噪声内）。**注意**：在 rocprofv3 下测会看到假的 4% 收益，那是 profiler 的 per-dispatch 开销随 WG 数放大 —— 见 §5 第 1 点 |
+| bs128 上重扫全部 tile/wpe 旋钮 | 全部饱和：stage1 `tile_k` 128 最优（256 慢 18 µs）、`wpe` 2/3 打平（4 慢 74 µs）、stage2 `tile_n` 256 最优（128 慢 18 µs）、`tile_m` 16/32 打平 |
 
 另外一个**有收益但没有采纳**的：stage1 `tile_n` 128 → 64 在 bs16/bs64 上让 gemm1
 151.7 → 145.3（-4.2%），但 bs128 起就反转（174.9 → 192.2，+9.9%），bs224 更差
@@ -300,14 +410,28 @@ bs224 → 896），不是真实 token 数（115 / 359），更不是真正决定
 暂不改；要人工覆盖就直接改 `_tile_n1` 那一行（这个 family 还没进 fmoe CSV tuner，
 进了之后应该由 tuned 行来决定）。
 
-## 5. 采集这个负载时的两个坑
+## 5. 采集这个负载时的三个坑
 
-1. **grid 被容量放大 22 倍**：这个 shape `resolve_flydsl_gemm_grid_y` 给出 grid_y=384，
-   而 `num_valid_ids[0]=272` 只需 **17** 个 M-block。空 WG 对**墙钟几乎没有影响**
-   （之前实测 grid_y 94 → 31，gemm1 247.2/249.5 → 246.5/246.5，在噪声内），但会把
-   rocprof/ATT 的 per-wave 指标稀释到没法读（每 wave 只有 88.9 条指令，真实值约 1872）。
-   采集时务必用 `FORCE_GRID_Y` 收紧（`/tmp/replay_vllm_dump.py` 里的 monkeypatch）。
-2. **做 A/B 时给每格设独立的 `FLYDSL_RUNTIME_CACHE_DIR`**。FlyDSL 的 disk cache key 由
+1. **grid 被容量放大 20 倍以上**：`resolve_flydsl_gemm_grid_y` 是按容量行数给的，
+   真实 M-block 数来自 `num_valid_ids`：
+
+   | bs | rows | `num_valid_ids` | 真实 M-block | 启动 grid_y | 放大 |
+   | ---: | ---: | ---: | ---: | ---: | ---: |
+   | 16 | 64 | 176 | 11 | 289 | 26.3x |
+   | 64 | 256 | 272 | 17 | 385 | 22.6x |
+   | 128 | 512 | 384 | 24 | 513 | 21.4x |
+   | 224 | 896 | 576 | 36 | 705 | 19.6x |
+
+   空 WG 对**墙钟没有影响**（bs128 上扫 grid_y 24~513，gemm1 稳定 169.5~170.2、
+   gemm2 91.2~92.2，全在噪声内），但会把 rocprof/ATT 的 per-wave 指标稀释同样的倍数
+   （`Instructions per wavefront` 显示 ~100，真实值约 2100）。
+   采集时务必用 `FORCE_GRID_Y` 收紧到真实块数（`/tmp/replay_vllm_dump.py` 里的 monkeypatch）；
+   已验证它不改变被测对象。
+2. **不要用 rocprofv3 的 kernel trace 去比较 WG 数不同的配置**。在 `--kernel-trace` 下测
+   grid_y 收紧会看到 gemm2 -4% / gemm1 -3~7% 的"收益"，那是假的 —— profiler 的 per-dispatch
+   开销随 WG 数放大（同一配置下 gemm1 绝对值 169 → 192，被抬高 13%）。
+   换成 aiter 自带的 per-kernel device 计时（`AITER_LOG_MORE=1`）差异立刻消失。
+3. **做 A/B 时给每格设独立的 `FLYDSL_RUNTIME_CACHE_DIR`**。FlyDSL 的 disk cache key 由
    `_jit_function_cache_key()` 算出，除了工具链指纹和源码，还会递归收集闭包里的标量值
    （`_collect_closure_scalar_vals`），所以 `tile_m/tile_n/tile_k/b_nt` 这类编译期参数
    **确实**会进 key（实测：同一 cache 目录里切换 `b_nt` 会重编出第二份二进制）。
@@ -334,6 +458,8 @@ AITER_FLYDSL_BLKFP8=1 AITER_LOG_MORE=1 \
 | §4 stage1 `tile_n` | `_tile_n1 = 64 if token <= 8 else 128` | `64` |
 | §4 `waves_per_eu` | `kn1`/`kn2` 末尾的 `+ "_w2"` | `"_w1"` / `"_w3"` |
 | §3.5 x-load 钉序 | `moe_2stage_blockscale.py` 的 `_BLK_XPIN_MASK` | `0`（全挡）；或注掉两处 `sched_barrier` |
+| §3.8 LDS A-scale 表 | `moe_2stage_blockscale.py` 的 `_use_asc_lds`（两处） | `False`（回退到逐拍 gather） |
+| §3.9 W-scale 折叠 | `moe_2stage_blockscale.py` 的 `_wsc_uniform_ni`（两处） | `False`（回退到逐 `ni` 加载；`ku` 那层的折叠无条件保留） |
 
 `relL2 ≈ 0.024` 是参考实现的口径差异，不是 kernel 误差：`op_tests/test_fmoe_vllm_dump.py`
 的 torch 参考全程 fp32，没有模拟「stage1 输出再量化成 fp8」这一步。该值在所有 bs / layer 上
@@ -348,18 +474,20 @@ AITER_FLYDSL_BLKFP8=1 AITER_LOG_MORE=1 \
 
 | bs | rows | recv | gemm1 前 | gemm1 后 | gemm2 前 | gemm2 后 | e2e 前 | e2e 后 |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 16 | 64 | 16 | 104.7 | **98.7** | 60.1 | **48.1** | 182.7 | **163.0** |
-| 64 | 256 | 115 | 152.2 | **136.7** | 88.2 | **66.0** | 258.8 | **221.2** |
-| 128 | 512 | 221 | 175.2 | **169.1** | 114.2 | **91.4** | 312.3 | **283.2** |
-| 224 | 896 | 359 | 250.4 | **240.4** | 163.7 | **130.2** | 442.3 | **398.6** |
+| 16 | 64 | 16 | 104.7 | **91.7** | 60.1 | **45.3** | 182.7 | **153.0** |
+| 32 | 128 | 51 | — | 126.9 | — | 55.3 | — | 200.0 |
+| 64 | 256 | 115 | 152.2 | **128.8** | 88.2 | **63.0** | 258.8 | **210.6** |
+| 128 | 512 | 221 | 175.2 | **159.1** | 114.2 | **85.8** | 312.3 | **268.0** |
+| 192 | 768 | 300 | — | 197.8 | — | 107.1 | — | 332.0 |
+| 224 | 896 | 359 | 250.4 | **218.8** | 163.7 | **119.1** | 442.3 | **366.0** |
 
-小 bs 上「后」列比 §3.3/§3.4 的对照更好，差额来自 §3.6 的 NT（它在 bs128/224 上关闭，
-所以那两行与只有 §3.1~§3.5 时基本相同）。
+两轮的分解（e2e）：第一轮 §3.1~§3.7 到 bs16 163.0 / bs64 221.2 / bs128 283.2 / bs224 398.6，
+第二轮 §3.8~§3.9 再推到上表的 153.0 / 210.6 / 268.0 / 366.0。
 
 与手写 ASM 1stage（`fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_ps_32x256`）的对比：
-bs16 FlyDSL **163.0 vs ASM 215.6（快 24%）**；bs64 **221.2 vs 234.4（快 5.6%**，优化前是慢 10.9%，
-§3.6 之前是慢 3.0%）；bs128 283.2 vs 246.7（慢 14.8%），bs192/224 同样仍落后。
-bs128 的差距分析见 §8。
+bs16 FlyDSL **153.0 vs ASM 215.6（快 29%）**；bs64 **210.6 vs 234.4（快 10.2%**，
+优化前慢 10.9%）；bs128 **268.0 vs 246.7（慢 8.6%**，优化前慢 25.9%），bs192/224 同样仍落后。
+bs128 剩余差距的分析见 §8。
 
 跨层（bs64，优化后）：
 
@@ -383,33 +511,63 @@ bs128 的差距分析见 §8。
 stage1 全 pass；stage2 的 1.7% 容差 warning 是**既有**的（HEAD 版 kernel 给 1.8% / 13778 个元素，
 `logits_diff` 与 `max abs delta` 完全一致）。
 
-## 8. 距离 4 TB/s 还差什么
+## 8. 上限在哪，以及 bs128 剩余的 8.6%
 
-stage2 现在 2.69 TB/s，4 TB/s 对应 51.4 µs（现在 76.3），还有 **25 µs**。
-优化后 ATT 的剩余大头：
+**先纠正一个前提。** 本文早期版本按「实测上限 4 TB/s」折算还差多少，那个数是错的。
+rocprof-compute 给出的 **L2-Fabric 读带宽上限是 2662 GB/s**，而 gemm1 现在跑到
+**2498 GB/s = 93.8%**。也就是说 gemm1 已经**贴着这台机器的 fabric 读上限**，
+它是纯 traffic 决定的：时间 ≈ 字节数 / 2.5 TB/s，唯一的提速方式是少读字节。
+这也解释了为什么 §4 里所有「减少权重重读」的尝试都失败 —— 它们省下的字节都小于
+付出的带宽代价。
 
-| 指令 | latency 占比 | cyc/次 |
+gemm2 是 70.5%，还有余量，但它的字节数已经被第二轮砍掉 35 MB，继续压要靠结构改动。
+
+### bs128 对 ASM 的 8.6% 差距怎么分
+
+| | FlyDSL | ASM |
 | --- | ---: | ---: |
-| `s_barrier` | **11.1%** | 172 |
-| `s_waitcnt vmcnt(2)` | **10.7%** | 597 |
-| `buffer_load_dwordx4`（W2，真实 HBM 读） | 42.4% 家族合计 | 238~595 |
+| gemm1 + gemm2 | 159.1 + 85.8 = 244.9 | 232（单个融合 kernel） |
+| a2 quant kernel | 7.5 | 0 |
+| sorting ×2 | 15.0 | 15.0 |
+| 合计 | 268.0 | 246.7 |
 
-两者同源，都绑在 **A tile 的 gmem → wait → LDS → barrier → ds_read** 这条串行链上：
+差距 21.3 µs 里，**7.5 µs 是 ASM 根本没有的中间量化 kernel**，剩下 ~13 µs 是两个 GEMM
+对一个融合 kernel 的结构性劣势（两次权重流、两次 launch ramp）。
 
-- `tile_k=128` 让 MFMA 每拍的工作量减半，能盖住 VMEM 延迟（~1208 cycles）的窗口也随之变窄，
-  于是 `store_x_tile_to_lds` 前那次等 A 的 wait 从隐藏变成暴露（597 cyc）。
-- 同时 K-tile 数翻倍 → `gpu.barrier()` 次数翻倍（ATT 命中 400 → 720）。
+### 现在的头号瓶颈：barrier / 同步
 
-也就是说 `tile_k=128` 的净收益（-13%）是「burst 变浅」赚的，减去「A 链暴露 + barrier 翻倍」亏的。
-要继续往上走，需要动这条链，两个方向（都是结构性改动，未实施）：
+两轮优化把 scale 加载从瓶颈里去掉之后，gemm1 的 ATT 变成这样：
+
+| 家族 | latency 占比 | 说明 |
+| --- | ---: | --- |
+| `buffer_load` | 44.2% | 真实权重流，贴着 fabric 上限，不可压 |
+| `s_waitcnt` | **24.0%** | 其中 `vmcnt(8)` 520 cyc/次 |
+| **`s_barrier`** | **12.8%** | 176 cyc × 1920 次，单条最大项 |
+| VALU | 8.6% | 第一轮时是 14.2%，scale 乘法的占比已被摊薄 |
+
+gemm2 同理，`s_barrier` 7.6%。两者同源，都绑在
+**A tile 的 gmem → wait → LDS → barrier → ds_read** 这条串行链上：`tile_k=128`（§3.1）
+让 K-tile 数翻倍，`gpu.barrier()` 次数也就翻倍。这是 §3.1 净收益里被抵掉的那部分。
+
+两个方向（都是结构性改动，未实施）：
 
 1. **A tile 加深预取 / 增加 LDS 级数**：现在是 2 级 ping-pong，A 只提前一拍。做成 3 级可以让
-   等 A 的 wait 落在两拍之外。LDS 只用了 8 KB（利用率 3.8%），空间充足。
+   等 A 的 wait 落在两拍之外。LDS 现在用 7~9 KB（含 §3.8 的 scale 表），64 KB 里空间充足。
 2. **A tile 绕过 LDS**：`tile_m=16`、A tile 只有 2 KB。若 gmem load 能直接落到 MFMA 需要的
    lane 布局（每 lane 取自己那行的 K 切片），LDS 和 barrier 一起省掉。代价是 16 个散开的行地址，
    coalescing 会更差。
 
-stage1 的头号问题是另一条：ATT 显示 **`s_waitcnt vmcnt(0)` 全排空，1042 cyc/次，占 19.3%**
-（比 stage2 最坏情况还严重），以及 W-scale 的**单 dword per-lane load**（top-10 里占 3 条、约 10%，
-和 A2-scale 同一类 32 倍冗余，但 W-scale 已经随 B tile 预取，位置没问题，问题在粒度）。
-`waves_per_eu` 已验证默认 2 最优，所以这个全排空得靠改 pipeline，未实施。
+### 其余几条，按性价比排
+
+1. **把 a2 量化融进 stage1 的 epilogue** —— 7.5 µs，风险低。stage1 的 `tile_n=128` 正好等于
+   per_1x128 的量化组大小，所以每个 block 已经完整拥有自己那些行的一个量化组，amax 归约
+   完全在块内、不需要跨块通信。顺带把 a2 的 bf16 往返降成 fp8 单次写。
+   `MOEMetadata` 里已经有 `fuse_quant` 字段。
+2. **压 AGPR 到 128 以下** —— 两个 kernel 的 VGPR 已经只有 4/12，是 132 个 AGPR 把总数顶在
+   136/144，卡在 3.2 wave/SIMD。累加器理论上只需 ~32 个，多出来的很可能是循环携带的 B tile。
+   压到总数 <128 能拿到 4 wave/SIMD（+25% occupancy）。
+3. **`v_pk_mul_f32` 替掉 scale 乘法** —— `v_pk_fma_f32` 已经是打包的，但 `sa[ii] * sw[ni]`
+   那 4 条标量乘没有。第一轮时值 4.8%，现在 VALU 整体已降到 8.6%，收益有限。
+4. **gemm2 的 W scale 也可以试 NT** —— §3.6 的 `b_nt` 只喂给 stage1，stage2 恒为 cached，
+   而实测 stage1 开 NT 会通过 L2 间接让 gemm2 快 7~11%（见 §3.6），说明 stage2 自己用 NT
+   可能也有收益，待验证。
