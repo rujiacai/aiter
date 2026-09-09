@@ -842,6 +842,7 @@ def compile_flydsl_moe_stage1(
             use_cshuffle_epilog=None if k_batch > 1 else False,
             k_batch=k_batch,
             enable_smooth_scale=enable_smooth_scale,
+            b_nt=b_nt,
         )
     else:
         raise ValueError(
@@ -946,6 +947,7 @@ def compile_flydsl_moe_stage2(
             out_dtype=out_dtype,
             accumulate=accumulate,
             waves_per_eu=waves_per_eu or 0,
+            b_nt=b_nt,
         )
     else:
         raise ValueError(

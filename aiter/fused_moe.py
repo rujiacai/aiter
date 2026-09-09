@@ -1514,7 +1514,7 @@ def _flydsl_stage1_wrapper(
         use_async_copy=True,
         k_batch=parsed.get("k_batch", 1),
         waves_per_eu=parsed.get("waves_per_eu", 3),
-        b_nt=parsed.get("b_nt", 2),
+        b_nt=_kwargs.get("b_nt", parsed.get("b_nt", 2)),
         gate_mode=parsed.get("gate_mode", "separated"),
         inter_dim_pad=inter_dim_pad,
         model_dim_pad=model_dim_pad,
@@ -2655,15 +2655,22 @@ def get_2stage_cfgs(
         # Unlike the mixed (scaled-MFMA) pipeline this family also runs on gfx942.
         #
         # Defaults measured on gfx942 with the DSv4 shape (7168/512/385/7): tile_m
-        # above 32 is dominated by per-expert padding, stage1 prefers tile_k=128
-        # while stage2 prefers 256, and waves_per_eu=2 avoids the register-pressure
+        # above 32 is dominated by per-expert padding, both stages prefer
+        # tile_k=128 (see below), and waves_per_eu=2 avoids the register-pressure
         # cliff that the wrapper default of 3 falls off. Replace with tuned CSV rows
         # once the fp8blk family goes through the fmoe tuner.
         _out_str = "bf16"
         _tile_m = 16 if token < 2048 else 32
         # tile_k must cover whole 128-element scale blocks, and the ping-pong tail
         # consumes exactly two tiles, so the tile count also has to be even.
-        _tile_k2 = 256 if (inter_dim % 512 == 0) else 128
+        #
+        # Measured on gfx942, GLM-5.3 EP16 decode (d6144/i2048, 16 local experts,
+        # capacity-shaped MORI buffer): tile_k=128 beats 256 on stage2 by 7-17%
+        # across bs16..224. The wide tile doubles the per-wave VMEM burst
+        # (8 -> 16 dwordx4) and the s_waitcnt drain in front of the MFMA chain
+        # costs more than the extra K reuse buys, so 128 wins even on the shapes
+        # whose inter_dim would leave an even tile count at 256.
+        _tile_k2 = 128
         # Few tokens means few active experts, and stage1's workgroup count is
         # (active experts) x (inter_dim / tile_n) -- at 8 tokens that leaves most
         # of the machine idle, so halve the N tile to double the grid. Past ~8
@@ -2671,6 +2678,7 @@ def get_2stage_cfgs(
         # Measured on gfx942 d6144x256 E256 k8: -20% at 1-2 tokens, -12% at 8,
         # +14% at 16.
         _tile_n1 = 64 if token <= 8 else 128
+        _tile_k1 = 128
         # Split-K for the same reason, one level down: even at tile_n=64 a single
         # token lights up 8 experts x 4 N tiles = 32 workgroups against ~240 slots.
         # Splitting K multiplies the grid; past a couple of tokens the grid is
@@ -2684,13 +2692,22 @@ def get_2stage_cfgs(
         from aiter.ops.flydsl.moe_kernels import flydsl_kernel_name
 
         kn1 = (
-            flydsl_kernel_name(1, "fp8", "fp8blk", _out_str, _tile_m, _tile_n1, 128)
+            flydsl_kernel_name(
+                1, "fp8", "fp8blk", _out_str, _tile_m, _tile_n1, _tile_k1
+            )
             + "_w2"
             + (f"_kb{_k_batch1}" if _k_batch1 > 1 else "")
         )
+        _tile_n2 = 256
+        # Non-temporal W loads pay off only while each expert's weights are read
+        # about once. Past that, tile_m=16 makes the hot expert span several
+        # M-blocks and its W1 gets re-read, so telling the cache to drop the line
+        # throws away real reuse. Measured blocks/expert on gfx942 GLM-5.3 EP16
+        # decode: 1.00x @64 rows, 1.06x @256, 1.50x @512, 2.00x @768, 2.25x @896.
+        _bnt1 = 2 if token <= 256 else 0
         kn2 = (
             flydsl_kernel_name(
-                2, "fp8", "fp8blk", _out_str, _tile_m, 256, _tile_k2, "atomic"
+                2, "fp8", "fp8blk", _out_str, _tile_m, _tile_n2, _tile_k2, "atomic"
             )
             + "_w2"
         )
@@ -2701,6 +2718,7 @@ def get_2stage_cfgs(
                 activation=activation,
                 inter_dim_pad=intermediate_pad,
                 model_dim_pad=hidden_pad,
+                b_nt=_bnt1,
             ),
             functools.partial(
                 _flydsl_stage2_wrapper,

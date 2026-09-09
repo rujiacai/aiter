@@ -56,6 +56,7 @@ from .mfma_preshuffle_pipeline import (
     lds_store_16b_xor16,
     make_preshuffle_b_layout,
     load_b_pack_k32,
+    load_b_pack_k64,
     load_block_scale_f32,
     tile_chunk_coord_i32,
     swizzle_xor16,
@@ -70,6 +71,23 @@ from .tensor_shim import _run_compiled
 # combined A*W scale in with an f32 FMA; reading the MFMA result in the very next
 # instruction stalls for the full MFMA latency. 0 restores the inline behaviour.
 _BLK_FMA_DEPTH = int(os.environ.get("AITER_BLKFP8_FMA_DEPTH", "4"))
+
+# Scheduling-region boundary that pins the A-tile (x) gmem loads at the head of
+# the VMEM burst. Mask bits name the instruction classes still *allowed* to move
+# across, so VALU|SALU|MFMA|DS keep full freedom and only VMEM is held in place.
+#
+# Why it is needed: x's only consumer is store_x_tile_to_lds, so LLVM sinks the
+# load next to it to shorten the live range (worth 2 VGPRs). That leaves it last
+# in a ~16-load burst, and because vmcnt is a single counter whose entries retire
+# in issue order, the only way to wait for the newest load is to drain everything
+# older with it -- throwing away the B prefetch that was just issued. Measured on
+# gfx942 / GLM-5.3 EP16: stage1 s_waitcnt vmcnt(0) @1185 cyc = 17.4% of the ATT
+# latency budget, stage2 vmcnt(2) @839 cyc = 10.5%. Pinning x first turns those
+# into vmcnt(~15) and buys 3-5% e2e across bs16..224.
+#
+# A full barrier (mask 0) is *not* the right tool here: it also blocks the
+# MFMA/LDS interleave and put stage2 back at its unoptimized 86.7 us.
+_BLK_XPIN_MASK = 0x02 | 0x04 | 0x08 | 0x80  # VALU | SALU | MFMA | DS
 
 
 def _make_scale_fma_pipe(apply_fn, depth: int):
@@ -150,6 +168,7 @@ def compile_moe_gemm1(
     scale_blk_n: int = 128,
     scale_blk_k: int = 128,
     enable_smooth_scale: bool = False,
+    b_nt: int = 0,
 ):
     """Compile stage1 kernel (`moe_gemm1`) and return the compiled executable.
 
@@ -488,6 +507,8 @@ def compile_moe_gemm1(
     # Blockwise fp8 folds both scales inside the K loop, so the epilogue uses 1.0.
     _epi_sx_one = is_f16_or_bf16 or is_fp8_blk
     _epi_sw_one = use_groupwise_scale or is_fp8_blk
+    # Captured by the kernel so FlyDSL's disk cache keys cached vs NT W loads.
+    _b_cache_mod = int(b_nt)
 
     if True:
 
@@ -858,6 +879,7 @@ def compile_moe_gemm1(
                             parts.append(x_vec)
                         else:
                             parts.append(x_vec)
+                    rocdl.sched_barrier(_BLK_XPIN_MASK)
                     return parts
 
                 # tx -> wave/lane (GEMM-style decomposition).
@@ -961,24 +983,94 @@ def compile_moe_gemm1(
                         a_blk_scale_base.append(bases_mi)
                         a_blk_scale_ok.append(ok_mi)
 
+                def load_a_scales(base_k):
+                    """A block scales for one K tile, issued ahead of the B burst.
+
+                    Loading these inside ``compute_tile`` left them at the tail of
+                    the VMEM burst while being the first value the MFMA chain
+                    consumes, which forced the wait down to vmcnt(3) and drained
+                    the in-flight loads before any MFMA could issue.
+                    """
+                    if const_expr(not is_fp8_blk):
+                        return []
+                    kb_base = base_k // fx.Index(scale_blk_k)
+                    vals = []
+                    for kbi in range_constexpr(kblk_per_tile):
+                        kb_idx = kb_base + fx.Index(kbi)
+                        for mi in range_constexpr(m_repeat):
+                            for ii in range_constexpr(4):
+                                vals.append(
+                                    arith.select(
+                                        a_blk_scale_ok[mi][ii],
+                                        buffer_ops.buffer_load(
+                                            sx_rsrc,
+                                            a_blk_scale_base[mi][ii] + kb_idx,
+                                            vec_width=1,
+                                            dtype=T.f32,
+                                        ),
+                                        fx.Float32(0.0),
+                                    )
+                                )
+                    return vals
+
                 # --- B Load Logic (K64) - shared layout with preshuffle GEMM ---
-                def load_b_pack(base_k, ki_step, ni, blk_list, intra_list):
-                    return load_b_pack_k32(
-                        buffer_ops,
-                        arith,
-                        vector,
-                        arg_b=arg_w,
-                        b_rsrc=w_rsrc,
-                        layout_b=layout_b,
-                        base_k=base_k,
-                        ki_step=ki_step,
-                        n_blk=blk_list[ni],
-                        n_intra=intra_list[ni],
-                        lane_div_16=lane_div_16,  # 0..3
-                        elem_type=w_elem,
-                        kpack_bytes=kpack_bytes,
-                        elem_bytes=w_elem_bytes,
-                        unpack_int4=is_int4,
+                def load_b_pair(base_k, ku, ni, blk_list, intra_list):
+                    """Two K32 B fragments for one K64 step; 16B kpack is one gmem load."""
+                    if const_expr((not is_int4) and kpack_bytes == 16):
+                        return load_b_pack_k64(
+                            buffer_ops,
+                            arith,
+                            vector,
+                            arg_b=arg_w,
+                            b_rsrc=w_rsrc,
+                            layout_b=layout_b,
+                            base_k=base_k,
+                            ki_even=ku * 2,
+                            n_blk=blk_list[ni],
+                            n_intra=intra_list[ni],
+                            lane_div_16=lane_div_16,
+                            elem_type=w_elem,
+                            kpack_bytes=kpack_bytes,
+                            elem_bytes=w_elem_bytes,
+                            cache_modifier=_b_cache_mod,
+                        )
+                    return (
+                        load_b_pack_k32(
+                            buffer_ops,
+                            arith,
+                            vector,
+                            arg_b=arg_w,
+                            b_rsrc=w_rsrc,
+                            layout_b=layout_b,
+                            base_k=base_k,
+                            ki_step=ku * 2,
+                            n_blk=blk_list[ni],
+                            n_intra=intra_list[ni],
+                            lane_div_16=lane_div_16,
+                            elem_type=w_elem,
+                            kpack_bytes=kpack_bytes,
+                            elem_bytes=w_elem_bytes,
+                            unpack_int4=is_int4,
+                            cache_modifier=_b_cache_mod,
+                        ),
+                        load_b_pack_k32(
+                            buffer_ops,
+                            arith,
+                            vector,
+                            arg_b=arg_w,
+                            b_rsrc=w_rsrc,
+                            layout_b=layout_b,
+                            base_k=base_k,
+                            ki_step=ku * 2 + 1,
+                            n_blk=blk_list[ni],
+                            n_intra=intra_list[ni],
+                            lane_div_16=lane_div_16,
+                            elem_type=w_elem,
+                            kpack_bytes=kpack_bytes,
+                            elem_bytes=w_elem_bytes,
+                            unpack_int4=is_int4,
+                            cache_modifier=_b_cache_mod,
+                        ),
                     )
 
                 def load_b_tile(base_k, blk_list, intra_list, row_list=None):
@@ -999,10 +1091,9 @@ def compile_moe_gemm1(
                         for ku in range_constexpr(k_unroll):
                             raw_ku = []
                             for ni in range_constexpr(num_acc_n):
-                                ki0 = (ku * 2) + 0
-                                ki1 = (ku * 2) + 1
-                                b0 = load_b_pack(base_k, ki0, ni, blk_list, intra_list)
-                                b1 = load_b_pack(base_k, ki1, ni, blk_list, intra_list)
+                                b0, b1 = load_b_pair(
+                                    base_k, ku, ni, blk_list, intra_list
+                                )
                                 sc = load_block_scale_f32(
                                     buffer_ops,
                                     arith,
@@ -1024,10 +1115,9 @@ def compile_moe_gemm1(
                             packs0 = []
                             packs1 = []
                             for ni in range_constexpr(num_acc_n):
-                                ki0 = (ku * 2) + 0
-                                ki1 = (ku * 2) + 1
-                                b0 = load_b_pack(base_k, ki0, ni, blk_list, intra_list)
-                                b1 = load_b_pack(base_k, ki1, ni, blk_list, intra_list)
+                                b0, b1 = load_b_pair(
+                                    base_k, ku, ni, blk_list, intra_list
+                                )
                                 packs0.append(b0)
                                 packs1.append(b1)
                             b_tile.append((packs0, packs1))
@@ -1154,6 +1244,7 @@ def compile_moe_gemm1(
                     prefetch_epilogue: bool = False,
                     a0_prefetch=None,
                     base_k=None,
+                    a_scales=None,
                 ):
                     gate_list = list(acc_gate_in)
                     up_list = list(acc_up_in)
@@ -1275,22 +1366,6 @@ def compile_moe_gemm1(
                             )
                         )
 
-                    def _a_blk_scales(mi, kb_idx):
-                        """4 f32 activation block scales, one per accumulator lane."""
-                        return [
-                            arith.select(
-                                a_blk_scale_ok[mi][ii],
-                                buffer_ops.buffer_load(
-                                    sx_rsrc,
-                                    a_blk_scale_base[mi][ii] + kb_idx,
-                                    vec_width=1,
-                                    dtype=T.f32,
-                                ),
-                                fx.Float32(0.0),
-                            )
-                            for ii in range_constexpr(4)
-                        ]
-
                     if const_expr(is_fp8_blk):
                         # Blockwise fp8: chain every MFMA inside one (blk_n, blk_k) scale
                         # block into a zero-initialised partial, then fold the combined
@@ -1299,9 +1374,9 @@ def compile_moe_gemm1(
                         push_fma, drain_fma = _make_scale_fma_pipe(
                             _acc_scaled_f32_vec, _blk_fma_depth
                         )
-                        kb_base = base_k // fx.Index(scale_blk_k)
+                        if a_scales is None:
+                            a_scales = load_a_scales(base_k)
                         for kbi in range_constexpr(kblk_per_tile):
-                            kb_idx = kb_base + fx.Index(kbi)
                             ku_first = kbi * ku_per_kblk
                             # W scale is constant over M and over the whole K block.
                             sw_gate_blk = [
@@ -1315,7 +1390,10 @@ def compile_moe_gemm1(
                             for mi in range_constexpr(m_repeat):
                                 mi_val = arith.index(mi * 16)
                                 curr_row_a_lds = row_a_lds + mi_val
-                                sa = _a_blk_scales(mi, kb_idx)
+                                sa = a_scales[
+                                    (kbi * m_repeat + mi) * 4 : (kbi * m_repeat + mi) * 4
+                                    + 4
+                                ]
                                 a_packs = []
                                 for kj in range_constexpr(ku_per_kblk):
                                     ku = ku_first + kj
@@ -1577,13 +1655,22 @@ def compile_moe_gemm1(
                     k_iv = k_base_idx + pair_iv * (c_tile_k + c_tile_k)
 
                     # ---- stage 0: prefetch+store ping, compute pong ----
+                    # This tile's A scales go out before the next tile's B burst.
+                    _asc = load_a_scales(k_iv)
                     next_k1 = k_iv + c_tile_k
                     x_regs_ping = load_x_tile(next_k1)
                     _bg_ping = load_b_tile(next_k1, n_blk_gate, n_intra_gate, n_row_gate)
                     _bu_ping = load_b_tile(next_k1, n_blk_up, n_intra_up, n_row_up)
 
                     _ag, _au, _ = compute_tile(
-                        _ag, _au, _bg, _bu, lds_base_pong, a0_prefetch=_a0pf, base_k=k_iv
+                        _ag,
+                        _au,
+                        _bg,
+                        _bu,
+                        lds_base_pong,
+                        a0_prefetch=_a0pf,
+                        base_k=k_iv,
+                        a_scales=_asc,
                     )
                     store_x_tile_to_lds(x_regs_ping, lds_base_ping)
                     hot_loop_scheduler()
@@ -1594,6 +1681,7 @@ def compile_moe_gemm1(
                     )
 
                     # ---- stage 1: prefetch+store pong, compute ping ----
+                    _asc_ping = load_a_scales(next_k1)
                     next_k2 = k_iv + c_tile_k + c_tile_k
                     x_regs_pong = load_x_tile(next_k2)
                     _bg_next = load_b_tile(next_k2, n_blk_gate, n_intra_gate, n_row_gate)
@@ -1607,6 +1695,7 @@ def compile_moe_gemm1(
                         lds_base_ping,
                         a0_prefetch=_a0pf_ping,
                         base_k=next_k1,
+                        a_scales=_asc_ping,
                     )
                     store_x_tile_to_lds(x_regs_pong, lds_base_pong)
                     hot_loop_scheduler()
@@ -2309,6 +2398,7 @@ def compile_moe_gemm2(
     waves_per_eu: int = 0,
     scale_blk_n: int = 128,
     scale_blk_k: int = 128,
+    b_nt: int = 0,
 ):
     """Compile stage2 kernel (`moe_gemm2`) and return the compiled executable.
 
@@ -2612,6 +2702,7 @@ def compile_moe_gemm2(
     # rows), so the epilogue can use a constant 1.0.
     _epi_sx_one = is_f16_or_bf16 or is_fp8_blk
     _epi_sw_one = use_groupwise_scale or is_fp8_blk
+    _b_cache_mod = int(b_nt)
 
     if True:
 
@@ -2905,6 +2996,7 @@ def compile_moe_gemm2(
                             parts.append(vector.bitcast(T.vec(2, T.i32), x_vec))
                         else:
                             parts.append(vector.bitcast(T.vec(1, T.i32), x_vec))
+                    rocdl.sched_barrier(_BLK_XPIN_MASK)
                     return parts
 
                 # tx -> wave/lane (GEMM-style decomposition).
@@ -2993,24 +3085,95 @@ def compile_moe_gemm2(
                         a_blk_scale_ok.append(ok_mi)
 
                 # --- B Load Logic (K64) ---
-                def load_b_pack(base_k, ki_step, ni):
-                    return load_b_pack_k32(
-                        buffer_ops,
-                        arith,
-                        vector,
-                        arg_b=arg_w,
-                        b_rsrc=w_rsrc,
-                        layout_b=layout_b,
-                        base_k=base_k,
-                        ki_step=ki_step,
-                        n_blk=n_blk_list[ni],
-                        n_intra=n_intra_list[ni],
-                        lane_div_16=lane_div_16,  # 0..3
-                        elem_type=w_elem,
-                        kpack_bytes=kpack_bytes,
-                        elem_bytes=w_elem_bytes,
-                        unpack_int4=is_int4,
+                def load_b_pair(base_k, ku, ni):
+                    """Two K32 B fragments for one K64 step; 16B kpack is one gmem load."""
+                    if const_expr((not is_int4) and kpack_bytes == 16):
+                        return load_b_pack_k64(
+                            buffer_ops,
+                            arith,
+                            vector,
+                            arg_b=arg_w,
+                            b_rsrc=w_rsrc,
+                            layout_b=layout_b,
+                            base_k=base_k,
+                            ki_even=ku * 2,
+                            n_blk=n_blk_list[ni],
+                            n_intra=n_intra_list[ni],
+                            lane_div_16=lane_div_16,
+                            elem_type=w_elem,
+                            kpack_bytes=kpack_bytes,
+                            elem_bytes=w_elem_bytes,
+                            cache_modifier=_b_cache_mod,
+                        )
+                    return (
+                        load_b_pack_k32(
+                            buffer_ops,
+                            arith,
+                            vector,
+                            arg_b=arg_w,
+                            b_rsrc=w_rsrc,
+                            layout_b=layout_b,
+                            base_k=base_k,
+                            ki_step=ku * 2,
+                            n_blk=n_blk_list[ni],
+                            n_intra=n_intra_list[ni],
+                            lane_div_16=lane_div_16,
+                            elem_type=w_elem,
+                            kpack_bytes=kpack_bytes,
+                            elem_bytes=w_elem_bytes,
+                            unpack_int4=is_int4,
+                            cache_modifier=_b_cache_mod,
+                        ),
+                        load_b_pack_k32(
+                            buffer_ops,
+                            arith,
+                            vector,
+                            arg_b=arg_w,
+                            b_rsrc=w_rsrc,
+                            layout_b=layout_b,
+                            base_k=base_k,
+                            ki_step=ku * 2 + 1,
+                            n_blk=n_blk_list[ni],
+                            n_intra=n_intra_list[ni],
+                            lane_div_16=lane_div_16,
+                            elem_type=w_elem,
+                            kpack_bytes=kpack_bytes,
+                            elem_bytes=w_elem_bytes,
+                            unpack_int4=is_int4,
+                            cache_modifier=_b_cache_mod,
+                        ),
                     )
+
+                def load_a_scales(base_k):
+                    """A2 block scales for one K tile, prefetched alongside the B tile.
+
+                    Loading these inside ``compute_tile`` put them at the tail of the
+                    VMEM burst while being the first value consumed, which forced the
+                    wait down to vmcnt(3) and drained ~18 in-flight loads before any
+                    MFMA could issue. Hoisting them into the loop-carried prefetch
+                    makes the wait cover only the previous iteration's loads.
+                    """
+                    if const_expr(not is_fp8_blk):
+                        return []
+                    kb_base = base_k // fx.Index(scale_blk_k)
+                    vals = []
+                    for kbi in range_constexpr(kblk_per_tile):
+                        kb_idx = kb_base + fx.Index(kbi)
+                        for mi in range_constexpr(m_repeat):
+                            for ii in range_constexpr(4):
+                                vals.append(
+                                    arith.select(
+                                        a_blk_scale_ok[mi][ii],
+                                        buffer_ops.buffer_load(
+                                            sx_rsrc,
+                                            a_blk_scale_base[mi][ii] + kb_idx,
+                                            vec_width=1,
+                                            dtype=T.f32,
+                                        ),
+                                        fx.Float32(0.0),
+                                    )
+                                )
+                    return vals
 
                 def load_b_tile(base_k):
                     """Prefetch the entire per-thread B tile (gmem -> regs) for a given K base.
@@ -3028,8 +3191,7 @@ def compile_moe_gemm2(
                         for ku in range_constexpr(k_unroll):
                             raw_ku = []
                             for ni in range_constexpr(num_acc_n):
-                                b0 = load_b_pack(base_k, (ku * 2) + 0, ni)
-                                b1 = load_b_pack(base_k, (ku * 2) + 1, ni)
+                                b0, b1 = load_b_pair(base_k, ku, ni)
                                 sc = load_block_scale_f32(
                                     buffer_ops,
                                     arith,
@@ -3051,10 +3213,7 @@ def compile_moe_gemm2(
                             packs0 = []
                             packs1 = []
                             for ni in range_constexpr(num_acc_n):
-                                ki0 = (ku * 2) + 0
-                                ki1 = (ku * 2) + 1
-                                b0 = load_b_pack(base_k, ki0, ni)
-                                b1 = load_b_pack(base_k, ki1, ni)
+                                b0, b1 = load_b_pair(base_k, ku, ni)
                                 packs0.append(b0)
                                 packs1.append(b1)
                             b_tile.append((packs0, packs1))
@@ -3172,6 +3331,7 @@ def compile_moe_gemm2(
                     prefetch_epilogue: bool = False,
                     a0_prefetch=None,
                     base_k=None,
+                    a_scales=None,
                 ):
                     acc_list = list(acc_in)
                     mfma_res_ty = T.i32x4 if is_int8 else T.f32x4
@@ -3303,22 +3463,6 @@ def compile_moe_gemm2(
                             )
                         )
 
-                    def _a_blk_scales(mi, kb_idx):
-                        """4 f32 activation block scales, one per accumulator lane."""
-                        return [
-                            arith.select(
-                                a_blk_scale_ok[mi][ii],
-                                buffer_ops.buffer_load(
-                                    sx_rsrc,
-                                    a_blk_scale_base[mi][ii] + kb_idx,
-                                    vec_width=1,
-                                    dtype=T.f32,
-                                ),
-                                fx.Float32(0.0),
-                            )
-                            for ii in range_constexpr(4)
-                        ]
-
                     if const_expr(is_fp8_blk):
                         # Blockwise fp8: chain every MFMA inside one (blk_n, blk_k) scale
                         # block into a zero-initialised partial, then fold the combined
@@ -3326,9 +3470,9 @@ def compile_moe_gemm2(
                         push_fma, drain_fma = _make_scale_fma_pipe(
                             _acc_scaled_f32_vec, _blk_fma_depth
                         )
-                        kb_base = base_k // fx.Index(scale_blk_k)
+                        if a_scales is None:
+                            a_scales = load_a_scales(base_k)
                         for kbi in range_constexpr(kblk_per_tile):
-                            kb_idx = kb_base + fx.Index(kbi)
                             ku_first = kbi * ku_per_kblk
                             sw_blk = [
                                 b_tile_in[ku_first][ni][2]
@@ -3337,7 +3481,10 @@ def compile_moe_gemm2(
                             for mi in range_constexpr(m_repeat):
                                 mi_val = arith.index(mi * 16)
                                 curr_row_a_lds = row_a_lds + mi_val
-                                sa = _a_blk_scales(mi, kb_idx)
+                                sa = a_scales[
+                                    (kbi * m_repeat + mi) * 4 : (kbi * m_repeat + mi) * 4
+                                    + 4
+                                ]
                                 a_packs = []
                                 for kj in range_constexpr(ku_per_kblk):
                                     ku = ku_first + kj
@@ -3451,6 +3598,9 @@ def compile_moe_gemm2(
 
                 def hot_loop_scheduler():
                     rocdl.sched_barrier(0)
+                    # The sched_* interleave hints below measured as a no-op on the
+                    # stage2 tile shapes (76.3 -> 76.6 us on GLM-5.3 EP16 bs64), so
+                    # they stay disabled; kept for the next tuning round.
                     return
                     # - MFMA group size per "slot": num_acc_n
                     # - Total MFMA per tile: (2*K32 per K64) * k_unroll * m_repeat * num_acc_n
@@ -3599,7 +3749,9 @@ def compile_moe_gemm2(
                             b_tile.append((packs_even, packs_odd))
                     return b_tile
 
-                init_state = list(acc) + _flatten_b_tile(b_cur) + list(a0_prefetch_pong)
+                init_state = (
+                    list(acc) + _flatten_b_tile(b_cur) + list(a0_prefetch_pong)
+                )
 
                 for pair_iv, state in range(0, pair_iters, 1, init=init_state):
                     _ac = list(state[:_n_acc])
@@ -3608,12 +3760,22 @@ def compile_moe_gemm2(
 
                     k_iv = pair_iv * (c_tile_k_s2 + c_tile_k_s2)
 
+                    # Issue this tile's A2 scales *before* the next tile's B burst:
+                    # they are the first value the MFMA chain consumes, so leaving
+                    # them at the tail of the burst forced a vmcnt(3) drain.
+                    _asc = load_a_scales(k_iv)
+
                     next_k1 = k_iv + c_tile_k_s2
                     x_regs_ping = load_x_tile(next_k1)
                     _bp = load_b_tile(next_k1)
 
                     _ac, _ = compute_tile(
-                        _ac, _bc, lds_base_pong, a0_prefetch=_a0, base_k=k_iv
+                        _ac,
+                        _bc,
+                        lds_base_pong,
+                        a0_prefetch=_a0,
+                        base_k=k_iv,
+                        a_scales=_asc,
                     )
                     store_x_tile_to_lds(x_regs_ping, lds_base_ping)
                     hot_loop_scheduler()
@@ -3623,12 +3785,19 @@ def compile_moe_gemm2(
                         row_a_lds, col_offset_base_bytes, lds_base_ping
                     )
 
+                    _ascp = load_a_scales(next_k1)
+
                     next_k2 = k_iv + c_tile_k_s2 + c_tile_k_s2
                     x_regs_pong = load_x_tile(next_k2)
                     _bn = load_b_tile(next_k2)
 
                     _ac, _ = compute_tile(
-                        _ac, _bp, lds_base_ping, a0_prefetch=_a0p, base_k=next_k1
+                        _ac,
+                        _bp,
+                        lds_base_ping,
+                        a0_prefetch=_a0p,
+                        base_k=next_k1,
+                        a_scales=_ascp,
                     )
                     store_x_tile_to_lds(x_regs_pong, lds_base_pong)
                     hot_loop_scheduler()
@@ -3638,7 +3807,9 @@ def compile_moe_gemm2(
                         row_a_lds, col_offset_base_bytes, lds_base_pong
                     )
 
-                    loop_results = yield list(_ac) + _flatten_b_tile(_bn) + list(_a0n)
+                    loop_results = yield (
+                        list(_ac) + _flatten_b_tile(_bn) + list(_a0n)
+                    )
 
                 SmemPtr._view_cache = None
                 if pair_iters > 0:
@@ -3660,6 +3831,7 @@ def compile_moe_gemm2(
                     k_tail0 = k_in - tile_k - tile_k
                     k_tail1 = k_in - tile_k
                     x_regs_ping = load_x_tile(k_tail1)
+                    asc_tail0 = load_a_scales(k_in - tile_k - tile_k)
                     b_ping = load_b_tile(k_tail1)
 
                     acc, _ = compute_tile(
@@ -3668,6 +3840,7 @@ def compile_moe_gemm2(
                         lds_base_pong,
                         a0_prefetch=a0_prefetch_pong,
                         base_k=k_tail0,
+                        a_scales=asc_tail0,
                     )
                     store_x_tile_to_lds(x_regs_ping, lds_base_ping)
                     hot_loop_scheduler()

@@ -452,10 +452,12 @@ def load_b_pack_k32(
     kpack_bytes: int = 16,
     elem_bytes: int = 1,
     unpack_int4: bool = False,
+    cache_modifier: int = 0,
 ) -> ir.Value:
     """Load one B pack for one MFMA(x32) micro-step.
 
     Returns an i64 Value containing 8 bytes consumed by MFMA.
+    cache_modifier: buffer-load aux flags (0=cached, 2=nontemporal/slc).
     """
     if kpack_bytes not in (8, 16):
         raise ValueError(f"kpack_bytes must be 8 or 16, got {kpack_bytes!r}")
@@ -486,6 +488,7 @@ def load_b_pack_k32(
             vec_elems=4,
             elem_bytes=1,
             offset_in_bytes=True,
+            cache_modifier=cache_modifier,
         )
         packed32 = vector.extract(
             vector.bitcast(T.vec(1, T.i32), b4),
@@ -505,6 +508,7 @@ def load_b_pack_k32(
         vec_elems=vec_elems,
         elem_bytes=elem_bytes,
         offset_in_bytes=(elem_bytes == 1),
+        cache_modifier=cache_modifier,
     )
 
     b_i32x4 = vector.bitcast(T.i32x4, b16)
@@ -513,6 +517,67 @@ def load_b_pack_k32(
     d0 = vector.extract(b_i32x4, static_position=[base], dynamic_position=[])
     d1 = vector.extract(b_i32x4, static_position=[base + 1], dynamic_position=[])
     return _pack_i32_pair_to_i64(d0, d1, vector)
+
+
+def load_b_pack_k64(
+    buffer_ops,
+    arith,
+    vector,
+    *,
+    arg_b,
+    b_rsrc,
+    layout_b,
+    base_k: ir.Value,
+    ki_even: int,
+    n_blk: ir.Value,
+    n_intra: ir.Value,
+    lane_div_16: ir.Value,
+    elem_type: ir.Type,
+    kpack_bytes: int = 16,
+    elem_bytes: int = 1,
+    cache_modifier: int = 0,
+):
+    """One 16B kpack load, split into the two K32 i64 fragments (even/odd).
+
+    ``load_b_pack_k32(ki)`` and ``load_b_pack_k32(ki+1)`` share ``idx_pack`` when
+    ``kpack_bytes==16`` (address uses ``ki//2``); calling this once avoids a
+    duplicate dwordx4 that only hits L1.
+    """
+    if kpack_bytes != 16:
+        raise ValueError(f"load_b_pack_k64 requires kpack_bytes=16, got {kpack_bytes!r}")
+    if ki_even % 2 != 0:
+        raise ValueError(f"ki_even must be even, got {ki_even!r}")
+    if elem_bytes not in (1, 2):
+        raise ValueError(f"elem_bytes must be 1 or 2, got {elem_bytes!r}")
+
+    c64 = fx.Index(64)
+    base_k_bytes = base_k * arith.constant(int(elem_bytes), index=True)
+    k0_base = base_k_bytes // c64
+    k0 = k0_base + arith.constant(ki_even // 2, index=True)
+    coord_pack = (n_blk, k0, lane_div_16, n_intra, fx.Index(0))
+    idx_pack = crd2idx(tuple(fx.Int32(c) for c in coord_pack), layout_b)
+
+    vec_elems = kpack_bytes // int(elem_bytes)
+    b16 = _buffer_load_vec(
+        buffer_ops,
+        vector,
+        b_rsrc,
+        idx_pack,
+        elem_type=elem_type,
+        vec_elems=vec_elems,
+        elem_bytes=elem_bytes,
+        offset_in_bytes=(elem_bytes == 1),
+        cache_modifier=cache_modifier,
+    )
+    b_i32x4 = vector.bitcast(T.i32x4, b16)
+    d0 = vector.extract(b_i32x4, static_position=[0], dynamic_position=[])
+    d1 = vector.extract(b_i32x4, static_position=[1], dynamic_position=[])
+    d2 = vector.extract(b_i32x4, static_position=[2], dynamic_position=[])
+    d3 = vector.extract(b_i32x4, static_position=[3], dynamic_position=[])
+    return (
+        _pack_i32_pair_to_i64(d0, d1, vector),
+        _pack_i32_pair_to_i64(d2, d3, vector),
+    )
 
 
 def tile_chunk_coord_i32(
@@ -784,6 +849,7 @@ __all__ = [
     "lds_store_8b_xor16",
     "lds_store_16b_xor16",
     "load_b_pack_k32",
+    "load_b_pack_k64",
     "load_b_raw_mxfp4_dwordx4",
     "load_b_raw_w4a16",
     "load_b_raw_w4a16_groupwise",
