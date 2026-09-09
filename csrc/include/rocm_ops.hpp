@@ -1728,6 +1728,47 @@ namespace py = pybind11;
           py::arg("num_q_blks"),       \
           py::arg("n_dense"));
 
+#define VSA_QK_FP8_PV_FP4_PISA_PYBIND  \
+    m.def("vsa_qk_fp8_pv_fp4_pisa_stats", \
+          &vsa_qk_fp8_pv_fp4_pisa_stats, \
+          "PISA centroid statistics kernel (gfx950).", \
+          py::arg("k"),                \
+          py::arg("v"),                \
+          py::arg("kscale"),           \
+          py::arg("vscale"),           \
+          py::arg("vbs"),              \
+          py::arg("k_center"),         \
+          py::arg("value_center"),     \
+          py::arg("used_ids"),         \
+          py::arg("n_used"),           \
+          py::arg("BH"),               \
+          py::arg("T"));               \
+    m.def("vsa_qk_fp8_pv_fp4_pisa_csr", \
+          &vsa_qk_fp8_pv_fp4_pisa_csr, \
+          "QK=FP8 / PV=FP4 fused PISA CSR exact+approx attention (gfx950).", \
+          py::arg("q"),                \
+          py::arg("k"),                \
+          py::arg("v"),                \
+          py::arg("qscale"),           \
+          py::arg("kscale"),           \
+          py::arg("vscale"),           \
+          py::arg("exact_col_indices"), \
+          py::arg("exact_row_meta"),   \
+          py::arg("approx_col_indices"), \
+          py::arg("approx_row_meta"),  \
+          py::arg("vbs"),              \
+          py::arg("lim"),              \
+          py::arg("k_center"),         \
+          py::arg("value_center"),     \
+          py::arg("out"),              \
+          py::arg("lse"),              \
+          py::arg("counters"),         \
+          py::arg("B"),                \
+          py::arg("T"),                \
+          py::arg("num_q_blks"),       \
+          py::arg("n_dense"),          \
+          py::arg("centroids_ready"));
+
 #define MLA_METADATA_PYBIND                              \
     m.def("get_mla_metadata_v1",                         \
           &get_mla_metadata_v1,                          \
