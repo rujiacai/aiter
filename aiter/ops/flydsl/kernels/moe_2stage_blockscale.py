@@ -1670,6 +1670,14 @@ def compile_moe_gemm1(
                 # Prologue: prefetch tile0, store to LDS(cur), sync.
                 k0 = k_base_idx
                 x_regs0 = load_x_tile(k0)
+                # Tile 1's X goes out here too and is carried into the loop, so its
+                # ds_write gets two tiles of MFMA to hide behind instead of one.
+                # See the loop body: `s_waitcnt` for the X load right before the
+                # ds_write measured 544 cyc/hit = 9.4% of the stage1 ATT budget,
+                # because sched_barrier pins X at the head of the burst and vmcnt is
+                # a single in-order counter -- waiting for the oldest load drags in
+                # the eight B loads issued after it.
+                x_regs_carry = load_x_tile(k0 + arith.index(tile_k))
                 b_gate_cur = load_b_tile(k0, n_blk_gate, n_intra_gate, n_row_gate)
                 b_up_cur = load_b_tile(k0, n_blk_up, n_intra_up, n_row_up)
                 if const_expr(_use_asc_lds):
@@ -1788,12 +1796,14 @@ def compile_moe_gemm1(
                     + _flatten_b_tile(b_gate_cur)
                     + _flatten_b_tile(b_up_cur)
                     + list(a0_prefetch_pong)
+                    + list(x_regs_carry)
                 )
 
                 _n_acc = m_repeat * num_acc_n
                 _p_bg = 2 * _n_acc
                 _p_bu = _p_bg + _vals_per_b_tile
                 _p_a0 = _p_bu + _vals_per_b_tile
+                _p_x = _p_a0 + 2
 
                 for pair_iv, state in range(0, pair_iters, 1, init=init_state):
                     _ag = list(state[:_n_acc])
@@ -1801,6 +1811,8 @@ def compile_moe_gemm1(
                     _bg = _unflatten_b_tile(list(state[_p_bg:_p_bu]))
                     _bu = _unflatten_b_tile(list(state[_p_bu:_p_a0]))
                     _a0pf = (state[_p_a0], state[_p_a0 + 1])
+                    # X for this pair's *first* tile, loaded one iteration ago.
+                    _x_in = list(state[_p_x : _p_x + num_x_loads])
 
                     k_iv = k_base_idx + pair_iv * (c_tile_k + c_tile_k)
 
@@ -1808,7 +1820,9 @@ def compile_moe_gemm1(
                     # This tile's A scales go out before the next tile's B burst.
                     _asc = load_a_scales(k_iv)
                     next_k1 = k_iv + c_tile_k
-                    x_regs_ping = load_x_tile(next_k1)
+                    next_k2 = k_iv + c_tile_k + c_tile_k
+                    next_k3 = next_k2 + c_tile_k
+                    x_regs_pong = load_x_tile(next_k2)
                     _bg_ping = load_b_tile(next_k1, n_blk_gate, n_intra_gate, n_row_gate)
                     _bu_ping = load_b_tile(next_k1, n_blk_up, n_intra_up, n_row_up)
 
@@ -1822,7 +1836,10 @@ def compile_moe_gemm1(
                         base_k=k_iv,
                         a_scales=_asc,
                     )
-                    store_x_tile_to_lds(x_regs_ping, lds_base_ping)
+                    # Stores the tile loaded in the *previous* iteration, so the
+                    # s_waitcnt in front of it covers a load that has had two whole
+                    # compute_tile bodies to land.
+                    store_x_tile_to_lds(_x_in, lds_base_ping)
                     hot_loop_scheduler()
                     gpu.barrier()
 
@@ -1832,8 +1849,7 @@ def compile_moe_gemm1(
 
                     # ---- stage 1: prefetch+store pong, compute ping ----
                     _asc_ping = load_a_scales(next_k1)
-                    next_k2 = k_iv + c_tile_k + c_tile_k
-                    x_regs_pong = load_x_tile(next_k2)
+                    x_regs_carry_new = load_x_tile(next_k3)
                     _bg_next = load_b_tile(next_k2, n_blk_gate, n_intra_gate, n_row_gate)
                     _bu_next = load_b_tile(next_k2, n_blk_up, n_intra_up, n_row_up)
 
@@ -1861,6 +1877,7 @@ def compile_moe_gemm1(
                         + _flatten_b_tile(_bg_next)
                         + _flatten_b_tile(_bu_next)
                         + list(_a0pf_new)
+                        + list(x_regs_carry_new)
                     )
 
                 # After scf.for: extract final state from yielded results.
@@ -1871,9 +1888,16 @@ def compile_moe_gemm1(
                     b_gate_cur = _unflatten_b_tile(list(loop_results[_p_bg:_p_bu]))
                     b_up_cur = _unflatten_b_tile(list(loop_results[_p_bu:_p_a0]))
                     a0_prefetch_pong = (loop_results[_p_a0], loop_results[_p_a0 + 1])
+                    x_regs_carry = list(
+                        loop_results[_p_x : _p_x + num_x_loads]
+                    )
                 k_tail0 = k_base_idx + arith.index(_k_per_batch - 2 * tile_k)
                 k_tail1 = k_base_idx + arith.index(_k_per_batch - tile_k)
-                x_regs_ping = load_x_tile(k_tail1)
+                # The tail's X is already in flight: the loop carries tile
+                # (2*pair_iters + 1) == the last tile, and the prologue seeds tile 1
+                # for the pair_iters == 0 case (which only happens at two tiles
+                # total). Tile counts are always even -- see the tile_k validation.
+                x_regs_ping = x_regs_carry
                 b_gate_ping = load_b_tile(k_tail1, n_blk_gate, n_intra_gate, n_row_gate)
                 b_up_ping = load_b_tile(k_tail1, n_blk_up, n_intra_up, n_row_up)
 
@@ -3916,6 +3940,15 @@ def compile_moe_gemm2(
                 # Prologue.
                 k0 = fx.Index(0)
                 x_regs0 = load_x_tile(k0)
+                # Carry tile 1's X into the loop so its ds_write waits on a load that
+                # has had two compute_tile bodies to land (see the stage1 twin: that
+                # s_waitcnt measured 544 cyc/hit there). Only for an even tile count
+                # -- the odd tail has no X store, and the carry would read one tile
+                # past the end.
+                _x_carry = (int(inter_dim) // int(tile_k)) % 2 == 0
+                x_regs_carry = (
+                    load_x_tile(k0 + arith.index(tile_k)) if _x_carry else None
+                )
                 b_cur = load_b_tile(k0)
                 if const_expr(_use_asc_lds):
                     # Shares the barrier below with the X store; both are LDS writes
@@ -4020,14 +4053,21 @@ def compile_moe_gemm2(
                             b_tile.append((packs_even, packs_odd))
                     return b_tile
 
+                _p_x = _p_a0 + 2
                 init_state = (
-                    list(acc) + _flatten_b_tile(b_cur) + list(a0_prefetch_pong)
+                    list(acc)
+                    + _flatten_b_tile(b_cur)
+                    + list(a0_prefetch_pong)
+                    + (list(x_regs_carry) if _x_carry else [])
                 )
 
                 for pair_iv, state in range(0, pair_iters, 1, init=init_state):
                     _ac = list(state[:_n_acc])
                     _bc = _unflatten_b_tile(list(state[_p_b:_p_a0]))
                     _a0 = (state[_p_a0], state[_p_a0 + 1])
+                    _x_in = (
+                        list(state[_p_x : _p_x + num_x_loads]) if _x_carry else None
+                    )
 
                     k_iv = pair_iv * (c_tile_k_s2 + c_tile_k_s2)
 
@@ -4037,7 +4077,12 @@ def compile_moe_gemm2(
                     _asc = load_a_scales(k_iv)
 
                     next_k1 = k_iv + c_tile_k_s2
-                    x_regs_ping = load_x_tile(next_k1)
+                    next_k2 = k_iv + c_tile_k_s2 + c_tile_k_s2
+                    if const_expr(_x_carry):
+                        x_regs_pong = load_x_tile(next_k2)
+                        x_regs_ping = _x_in
+                    else:
+                        x_regs_ping = load_x_tile(next_k1)
                     _bp = load_b_tile(next_k1)
 
                     _ac, _ = compute_tile(
@@ -4058,8 +4103,10 @@ def compile_moe_gemm2(
 
                     _ascp = load_a_scales(next_k1)
 
-                    next_k2 = k_iv + c_tile_k_s2 + c_tile_k_s2
-                    x_regs_pong = load_x_tile(next_k2)
+                    if const_expr(_x_carry):
+                        x_regs_carry_new = load_x_tile(next_k2 + c_tile_k_s2)
+                    else:
+                        x_regs_pong = load_x_tile(next_k2)
                     _bn = load_b_tile(next_k2)
 
                     _ac, _ = compute_tile(
@@ -4079,7 +4126,10 @@ def compile_moe_gemm2(
                     )
 
                     loop_results = yield (
-                        list(_ac) + _flatten_b_tile(_bn) + list(_a0n)
+                        list(_ac)
+                        + _flatten_b_tile(_bn)
+                        + list(_a0n)
+                        + (list(x_regs_carry_new) if _x_carry else [])
                     )
 
                 SmemPtr._view_cache = None
@@ -4087,6 +4137,10 @@ def compile_moe_gemm2(
                     acc = list(loop_results[:_n_acc])
                     b_cur = _unflatten_b_tile(list(loop_results[_p_b:_p_a0]))
                     a0_prefetch_pong = (loop_results[_p_a0], loop_results[_p_a0 + 1])
+                    if const_expr(_x_carry):
+                        x_regs_carry = list(
+                            loop_results[_p_x : _p_x + num_x_loads]
+                        )
 
                 if const_expr(odd_k_tiles):
                     # Tail: single remaining tile (already in `b_cur` / `lds_base_pong`).
@@ -4101,7 +4155,9 @@ def compile_moe_gemm2(
                 else:
                     k_tail0 = k_in - tile_k - tile_k
                     k_tail1 = k_in - tile_k
-                    x_regs_ping = load_x_tile(k_tail1)
+                    # Already in flight: the loop carries tile (2*pair_iters + 1),
+                    # which for an even tile count is exactly the last tile.
+                    x_regs_ping = x_regs_carry
                     asc_tail0 = load_a_scales(k_in - tile_k - tile_k)
                     b_ping = load_b_tile(k_tail1)
 

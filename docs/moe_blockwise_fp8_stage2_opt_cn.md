@@ -1,6 +1,6 @@
 # FlyDSL blockwise-fp8 MoE：带宽优化记录
 
-日期：2026-09-08（§3.1~§3.7，起点是 stage2）／2026-09-09（§3.8~§3.9，scale 加载，两个 stage）
+日期：2026-09-08（§3.1~§3.7，起点是 stage2）／2026-09-09（§3.8~§3.9，scale 加载，两个 stage）／2026-09-10（§3.10，X 寄存器流水）
 机器：MI308X（gfx942，80 CU，sclk 1850 / mclk 1300，SPX/NPS1，ROCm 7.14）
 路径：`AITER_FLYDSL_BLKFP8=1` 的 2stage FlyDSL blockwise fp8（`fp8blk`，128×128 权重 scale + 1×128 激活 scale）
 
@@ -14,16 +14,17 @@ hidden 6144 / inter 2048 / 256 全局专家 top-8 / EP16 → 每 rank 16 个本�
 
 | 项 | 结果 |
 | --- | --- |
-| gemm1 收益 | bs16 **-12.4%**、bs64 **-15.4%**、bs128 **-9.2%**、bs224 **-12.6%** |
-| gemm2 收益 | bs16 **-24.6%**、bs64 **-28.6%**、bs128 **-24.9%**、bs224 **-27.2%** |
-| e2e 收益 | bs16 **-16.3%**、bs64 **-18.6%**、bs128 **-14.2%**、bs224 **-17.3%** |
-| 对手写 ASM 1stage | bs16 **快 29%**、bs64 **快 10%**；bs128 仍慢 8.6%（优化前慢 25.9%） |
-| fabric 读带宽占用 | gemm1 **93.8%**、gemm2 70.5% 的实测上限（2662 GB/s，见 §8 —— 不是早先以为的 4 TB/s） |
+| gemm1 收益 | bs16 **-14.0%**、bs64 **-17.3%**、bs128 **-11.0%**、bs224 **-12.6%** |
+| gemm2 收益 | bs16 **-28.5%**、bs64 **-32.0%**、bs128 **-27.7%**、bs224 **-29.1%** |
+| e2e 收益 | bs16 **-18.5%**、bs64 **-20.9%**、bs128 **-16.0%**、bs224 **-17.7%** |
+| 对手写 ASM 1stage | bs16 **快 31%**、bs64 **快 13%**；bs128 仍慢 6.3%（优化前慢 25.9%） |
+| fabric 读带宽占用 | gemm1 **93.8%**、gemm2 **89.1%** 的实测上限（2662 GB/s，见 §8 —— 不是早先以为的 4 TB/s） |
 | 生效方式 | 默认生效，无需 env |
 | 正确性 | 6 个 bs × 5 个 layer，`zero_rows=0`、`relL2≈0.023~0.024`（参考实现口径见 §6） |
 | 旁证 | 另一个 dump（EP8 / 32 专家）e2e 435.6 → **391.8 µs**（§3.1~§3.5 之后测的，未含后续两轮） |
 
-七处改动，前五处是第一轮（指令与调度），后两处是第二轮（scale 加载的粒度与冗余）：
+八处改动，前五处是第一轮（指令与调度），后两处是第二轮（scale 加载的粒度与冗余），
+第三轮是 X 寄存器流水：
 
 1. **stage2 `tile_k` 256 → 128**（配置，`aiter/fused_moe.py`）—— 第一轮主要收益
 2. **A2 scale 的 load 提到 B burst 之前**（kernel，`moe_2stage_blockscale.py`）—— 次要收益，且在 `tile_k=256` 下收益更大
@@ -32,8 +33,10 @@ hidden 6144 / inter 2048 / 256 全局专家 top-8 / EP16 → 每 rank 16 个本�
 5. **共享同一 16B kpack 的两条 B load 合并成一条**（kernel，`mfma_preshuffle_pipeline.py`）—— 见 §3.7，省掉一条只命中 L1 的冗余 `dwordx4`
 6. **A block-scale 整块预载进 LDS**（kernel，两个 stage）—— 见 §3.8，gemm1 -4~6%
 7. **W block-scale 每个 scale 块只发一条 load**（kernel，两个 stage）—— 见 §3.9，gemm2 -4~7%、gemm1 再 -2%
+8. **X（activation tile）寄存器流水加深一级**（kernel，两个 stage）—— 见 §3.10，gemm2 fabric 70.5% → **89.1%**
 
-后两处合起来把 load 指令数砍掉 gemm1 **34%** / gemm2 **47%**，其中单 dword 降 72% / 83%。
+§3.8~§3.9 合起来把 load 指令数砍掉 gemm1 **34%** / gemm2 **47%**，其中单 dword 降 72% / 83%。
+§3.10 不改字节数，把 gemm2 之前空转的 fabric 带宽填上。
 
 ---
 
@@ -342,7 +345,84 @@ gemm2 收益小是因为它的 `num_k_blocks=16`，行步长只有 64 字节，*
 单独这一项（bs128）：gemm1 162.3 → **159.1**、gemm2 91.1 → **85.8**（-5.9%）。
 gemm2 收益反而更大，因为它 `num_acc_n=4`（stage1 只有 2），冗余倍数是 stage1 的两倍。
 
-### 3.10 第二轮的 profile 对照（bs128）
+### 3.10 X（activation tile）寄存器流水加深一级
+
+§3.5 用 `sched_barrier` 把 X load 钉在 burst 头部之后，§3.8 把 A-scale gather 搬进 LDS，
+X 那条 `buffer_load_dwordx2` 就从背景噪声变成了**头号 stall**。bs128 stage1 ATT：
+
+| 指令 | 改前 cyc/次 | 占 ATT latency |
+| --- | ---: | ---: |
+| `s_waitcnt vmcnt(8)`（`ds_write` 前） | **520.9** | **9.8%** |
+| `buffer_load_dwordx2`（X tile） | 544（prologue 站点） | 9.4% |
+
+机理和 §3.5 一样：`vmcnt` 是单一 in-order 计数器，`sched_barrier` 把 X 钉在 burst 最前面，
+但原来只提前**一拍** —— `load_x_tile` 紧跟着 `compute_tile`，`store_x_tile_to_lds` 用的
+还是**同一拍**刚载入的寄存器，`s_waitcnt` 只能等它落地，后面的 B 预取全被拖住。
+
+**改法**：把 X 也放进 `scf.for` 的 loop-carried state，让 `ds_write` 写的是**上一拍**
+（或 prologue 里更早一拍）载入的 `x_regs`，中间隔着两个完整的 `compute_tile` body。
+
+时序（每轮 ping-pong 迭代处理 2 个 K-tile）：
+
+```text
+prologue:  load tile0 → store tile0;  load tile1 → 带入循环
+loop:
+  用 state 里携带的 tile(i)   → compute tile(i-1) / tile(i)  （ds_write 写 tile(i)）
+  新 load tile(i+2)           → 写入 state，供下轮 ds_write
+tail:      携带值 = 最后一个 tile，省掉一次 load_x_tile
+```
+
+loop-carried state 在 `a0_prefetch_pong` 之后追加 `x_regs_carry`：
+
+```python
+init_state = (
+    list(acc_gate) + list(acc_up)
+    + _flatten_b_tile(b_gate_cur) + _flatten_b_tile(b_up_cur)
+    + list(a0_prefetch_pong)      # 固定 2 个 slot：(a0, a1) from lds_load_packs_k64
+    + list(x_regs_carry)           # num_x_loads 个 slot（常见 fp8 配置为 1）
+)
+_p_a0 = _p_bu + _vals_per_b_tile
+_p_x = _p_a0 + 2                 # 跳过 a0_prefetch 的 2 个 slot，定位 x_regs 起点
+```
+
+`_p_x = _p_a0 + 2` 里的 **`+2` 不是指 X 占 2 个寄存器**，而是 `lds_load_packs_k64()` 返回的
+`(a0, a1)` 在扁平 state 里**固定占 2 个下标**；X 实际占 `num_x_loads` 个
+（`bytes_per_thread_x // x_load_bytes`，fp8 常见为 1）。
+
+寄存器代价：`x_regs_carry` 只多占 `num_x_loads` 个 VGPR（stage1 实测 VGPR 12 → 16），
+tail 复用循环出口携带值 —— K-tile 数恒为偶数（`tile_k` 校验保证），最后一个 tile 已经在 state 里。
+
+stage2 同样实现，但 gate 在 `(inter_dim // tile_k) % 2 == 0`：奇数 K-tile 时 prologue 的
+「多载一格」会越界且 tail 用不上，编译期直接关掉携带路径。
+
+单独这一项（相对 §3.8~§3.9 之后，device avg µs）：
+
+| bs | gemm1 | gemm2 | e2e |
+| ---: | ---: | ---: | ---: |
+| 16 | 91.7 → **90.0** | 45.3 → **43.0** | 153.0 → **148.9** |
+| 64 | 128.8 → **125.8** | 63.0 → **60.0** | 210.6 → **204.7** |
+| 128 | 159.1 → **156.0** | 85.8 → **82.6** | 268.0 → **262.2** |
+| 224 | 218.8 → 219.6 | 119.1 → **116.1** | 366.0 → **364.2** |
+
+gemm2 收益更大，因为它在 §3.9 之后 fabric 仍只有 70.5%，有空转可填；gemm1 已在 93.8% 顶格，
+收益有限。
+
+ATT + rocprof-compute（bs128 gemm2）：
+
+| 指标 | §3.9 之后 | +§3.10 |
+| --- | ---: | ---: |
+| L2-Fabric 读带宽 | 1876 GB/s = **70.5%** | **2371 GB/s = 89.1%** |
+| HBM 流量（反算） | 224 MB | **224 MB**（不变 ✓） |
+| `s_waitcnt vmcnt(8)`（stage1） | 520 cyc = 9.8% | **消失** |
+
+**字节一分没变，时间少 21%** —— gemm2 之前那 ~30% 的 fabric 缺口，根因就是 A-tile 载入延迟
+让 HBM 空转，而不是缺流量优化。
+
+stage1 上 ATT 也印证「等待不会消失，只会搬家」：`vmcnt(8)` 消掉后 `s_barrier` 从 176 → 286 cyc/次
+（12.8% → 21.4%），kernel 总 latency 仍降 3.1%。wave 在 barrier 上等，是因为整个 WG 被
+HBM 卡住 —— 再加深 LDS 级数或绕过 LDS **对 gemm1 不会有净收益**，等待只会挪到下一个同步点。
+
+### 3.11 第二轮的 profile 对照（bs128，§3.10 之前）
 
 | | 原始 | +§3.8 | +§3.9 |
 | --- | ---: | ---: | ---: |
@@ -377,7 +457,7 @@ gemm2 的 occupancy 和 fabric 占比都**降了**却更快，这不矛盾 —�
 | stage2 `waves_per_eu` 3 | 只在 bs64 赢 2 µs，bs16 更差、bs128/224 持平 → 保留 2；wpe4 崩（96.8） |
 | stage1 `waves_per_eu` 1/3/4 | 默认 2 最优（153.8 vs 163.6 / 159.4 / 189.0） |
 | 启用 `hot_loop_scheduler()` 的 `sched_*` 交错提示 | no-op（76.3 → 76.6，噪声内）。该函数原本就是 `sched_barrier(0); return` 的死代码，已改为显式注明并保留 |
-| `tile_m` 16 → 32 | 灾难性：gemm2 76 → **336 µs** |
+| `tile_m` 16 → 32（无阈值，全 shape 强开） | bs64 上 gemm2 76 → **336 µs**（grid_y 解析错误 + occupancy 崩盘）；见下行阈值化结果 |
 | `AITER_BLKFP8_FMA_DEPTH` 0/2/8/12 | 默认 4 已在最优区间（0 明显差：82.2） |
 | A2-scale 放进 loop-carried state | 更慢（77.3 → 88.0），见 §3.2 |
 | stage1 也做 scale 前置 | 0 收益（105.7/151.8/250.6 vs 105.4/151.8/250.0）。stage1 有 gate+up 两个 B tile，scale 占比小得多，MFMA 也够长来掩盖延迟。改动保留仅为与 stage2 对称 |
@@ -387,11 +467,11 @@ gemm2 的 occupancy 和 fabric 占比都**降了**却更快，这不矛盾 —�
 
 | 尝试 | 结果 |
 | --- | --- |
-| `tile_m` 16 → 32 减权重重读 | traffic 只降 19%（重读本来已被 L2 吃掉大半），但 `m_repeat` 翻倍让累加器翻倍、occupancy 从 32% 掉到 **17%**，fabric 带宽掉 25% → 净亏（gemm1 170 → 185）。配合 `tile_n` 收到 64 想还原累加器数量也没救回来（176） |
+| `tile_m` 16 → 32 减权重重读 | **阈值相关，不能一刀切**。bs128（512 rows，blocks/expert **1.50×**）：traffic -33% 但 `m_repeat` 翻倍、occupancy 32% → **17%**，fabric 带宽掉 25% → 净亏（gemm1 170 → 185）。bs224（896 rows，**2.25×**）：traffic 1.26× → 1.05× min，e2e 366 → **343**（-6%）。翻转点在 blocks/expert ≈ **1.5×**（768 rows），`fused_moe.py` 用 `token <= 512 → tile_m=16 else 32` |
 | grid 顺序改成 M 快维度（提 L2 命中率） | 明确负结果：gemm1 **+28%**、gemm2 **+36%**。N 做快维度正是把并发读铺开到所有 HBM channel 的原因，拿它换局部性会让 fabric 带宽崩掉 |
 | XCD swizzle | 不需要：`num_n=48`，`48 mod 4 == 0`，同 n 不同 m 本来就落在同一个 XCD |
 | 收紧 `grid_y`（砍掉 21.4 倍空 WG） | 墙钟无变化（gemm1 169.5~170.2、gemm2 91.2~92.2，扫 24~513 全在噪声内）。**注意**：在 rocprofv3 下测会看到假的 4% 收益，那是 profiler 的 per-dispatch 开销随 WG 数放大 —— 见 §5 第 1 点 |
-| bs128 上重扫全部 tile/wpe 旋钮 | 全部饱和：stage1 `tile_k` 128 最优（256 慢 18 µs）、`wpe` 2/3 打平（4 慢 74 µs）、stage2 `tile_n` 256 最优（128 慢 18 µs）、`tile_m` 16/32 打平 |
+| bs128 上重扫全部 tile/wpe 旋钮 | 全部饱和：stage1 `tile_k` 128 最优（256 慢 18 µs）、`wpe` 2/3 打平（4 慢 74 µs）、stage2 `tile_n` 256 最优（128 慢 18 µs）。`tile_m` 在 bs128 上 16 赢、bs224 上 32 赢（见上行） |
 
 另外一个**有收益但没有采纳**的：stage1 `tile_n` 128 → 64 在 bs16/bs64 上让 gemm1
 151.7 → 145.3（-4.2%），但 bs128 起就反转（174.9 → 192.2，+9.9%），bs224 更差
@@ -460,6 +540,8 @@ AITER_FLYDSL_BLKFP8=1 AITER_LOG_MORE=1 \
 | §3.5 x-load 钉序 | `moe_2stage_blockscale.py` 的 `_BLK_XPIN_MASK` | `0`（全挡）；或注掉两处 `sched_barrier` |
 | §3.8 LDS A-scale 表 | `moe_2stage_blockscale.py` 的 `_use_asc_lds`（两处） | `False`（回退到逐拍 gather） |
 | §3.9 W-scale 折叠 | `moe_2stage_blockscale.py` 的 `_wsc_uniform_ni`（两处） | `False`（回退到逐 `ni` 加载；`ku` 那层的折叠无条件保留） |
+| §3.10 X 寄存器流水 | `moe_2stage_blockscale.py` 的 `x_regs_carry` / `init_state` 携带逻辑（两处主循环） | 删掉 `+ list(x_regs_carry)` 并恢复 loop 内同步 `load_x_tile` → `store_x_tile_to_lds` |
+| §4 `tile_m` 阈值 | `_tile_m = 16 if token <= 512 else 32` | `16`（全 shape 用小 tile）或 `32`（全 shape 用大 tile） |
 
 `relL2 ≈ 0.024` 是参考实现的口径差异，不是 kernel 误差：`op_tests/test_fmoe_vllm_dump.py`
 的 torch 参考全程 fp32，没有模拟「stage1 输出再量化成 fp8」这一步。该值在所有 bs / layer 上
@@ -474,22 +556,22 @@ AITER_FLYDSL_BLKFP8=1 AITER_LOG_MORE=1 \
 
 | bs | rows | recv | gemm1 前 | gemm1 后 | gemm2 前 | gemm2 后 | e2e 前 | e2e 后 |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 16 | 64 | 16 | 104.7 | **91.7** | 60.1 | **45.3** | 182.7 | **153.0** |
-| 32 | 128 | 51 | — | 126.9 | — | 55.3 | — | 200.0 |
-| 64 | 256 | 115 | 152.2 | **128.8** | 88.2 | **63.0** | 258.8 | **210.6** |
-| 128 | 512 | 221 | 175.2 | **159.1** | 114.2 | **85.8** | 312.3 | **268.0** |
-| 192 | 768 | 300 | — | 197.8 | — | 107.1 | — | 332.0 |
-| 224 | 896 | 359 | 250.4 | **218.8** | 163.7 | **119.1** | 442.3 | **366.0** |
+| 16 | 64 | 16 | 104.7 | **90.0** | 60.1 | **43.0** | 182.7 | **148.9** |
+| 32 | 128 | 51 | — | 124.5 | — | 52.8 | — | 193.2 |
+| 64 | 256 | 115 | 152.2 | **125.8** | 88.2 | **60.0** | 258.8 | **204.7** |
+| 128 | 512 | 221 | 175.2 | **156.0** | 114.2 | **82.6** | 312.3 | **262.2** |
+| 192 | 768 | 300 | — | 193.5 | — | 103.2 | — | 328.2 |
+| 224 | 896 | 359 | 250.4 | **218.8** | 163.7 | **116.1** | 442.3 | **364.2** |
 
-两轮的分解（e2e）：第一轮 §3.1~§3.7 到 bs16 163.0 / bs64 221.2 / bs128 283.2 / bs224 398.6，
-第二轮 §3.8~§3.9 再推到上表的 153.0 / 210.6 / 268.0 / 366.0。
+三轮分解（e2e）：第一轮 §3.1~§3.7 → bs16 163.0 / bs64 221.2 / bs128 283.2 / bs224 398.6；
+第二轮 §3.8~§3.9 → 153.0 / 210.6 / 268.0 / 366.0；第三轮 §3.10 → 上表。
 
 与手写 ASM 1stage（`fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_ps_32x256`）的对比：
-bs16 FlyDSL **153.0 vs ASM 215.6（快 29%）**；bs64 **210.6 vs 234.4（快 10.2%**，
-优化前慢 10.9%）；bs128 **268.0 vs 246.7（慢 8.6%**，优化前慢 25.9%），bs192/224 同样仍落后。
+bs16 FlyDSL **148.9 vs ASM 215.6（快 31%）**；bs64 **204.7 vs 234.4（快 12.7%**，
+优化前慢 10.9%）；bs128 **262.2 vs 246.7（慢 6.3%**，优化前慢 25.9%），bs192/224 同样仍落后。
 bs128 剩余差距的分析见 §8。
 
-跨层（bs64，优化后）：
+跨层（bs64，§3.8~§3.9 之后；§3.10 再快 ~3%，correctness 不变）：
 
 | layer | gemm1 | gemm2 | e2e | zero_rows | relL2 |
 | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -511,7 +593,7 @@ bs128 剩余差距的分析见 §8。
 stage1 全 pass；stage2 的 1.7% 容差 warning 是**既有**的（HEAD 版 kernel 给 1.8% / 13778 个元素，
 `logits_diff` 与 `max abs delta` 完全一致）。
 
-## 8. 上限在哪，以及 bs128 剩余的 8.6%
+## 8. 上限在哪，以及 bs128 剩余的 6.3%
 
 **先纠正一个前提。** 本文早期版本按「实测上限 4 TB/s」折算还差多少，那个数是错的。
 rocprof-compute 给出的 **L2-Fabric 读带宽上限是 2662 GB/s**，而 gemm1 现在跑到
@@ -520,42 +602,44 @@ rocprof-compute 给出的 **L2-Fabric 读带宽上限是 2662 GB/s**，而 gemm1
 这也解释了为什么 §4 里所有「减少权重重读」的尝试都失败 —— 它们省下的字节都小于
 付出的带宽代价。
 
-gemm2 是 70.5%，还有余量，但它的字节数已经被第二轮砍掉 35 MB，继续压要靠结构改动。
+gemm2 在 §3.10 之后也到 **89.1%**，和 gemm1 一样贴着 fabric 上限；继续压要靠少读字节或
+结构性改动（见下文）。
 
-### bs128 对 ASM 的 8.6% 差距怎么分
+### bs128 对 ASM 的 6.3% 差距怎么分
 
 | | FlyDSL | ASM |
 | --- | ---: | ---: |
-| gemm1 + gemm2 | 159.1 + 85.8 = 244.9 | 232（单个融合 kernel） |
+| gemm1 + gemm2 | 156.0 + 82.6 = 238.6 | 232（单个融合 kernel） |
 | a2 quant kernel | 7.5 | 0 |
 | sorting ×2 | 15.0 | 15.0 |
-| 合计 | 268.0 | 246.7 |
+| 合计 | 262.2 | 246.7 |
 
-差距 21.3 µs 里，**7.5 µs 是 ASM 根本没有的中间量化 kernel**，剩下 ~13 µs 是两个 GEMM
+差距 15.5 µs 里，**7.5 µs 是 ASM 根本没有的中间量化 kernel**，剩下 ~8 µs 是两个 GEMM
 对一个融合 kernel 的结构性劣势（两次权重流、两次 launch ramp）。
 
-### 现在的头号瓶颈：barrier / 同步
+### 现在的头号瓶颈：已贴近 fabric 地板
 
-两轮优化把 scale 加载从瓶颈里去掉之后，gemm1 的 ATT 变成这样：
+§3.10 之后两个 GEMM 的硬地板（理论最小流量 / 2662 GB/s）：
 
-| 家族 | latency 占比 | 说明 |
-| --- | ---: | --- |
-| `buffer_load` | 44.2% | 真实权重流，贴着 fabric 上限，不可压 |
-| `s_waitcnt` | **24.0%** | 其中 `vmcnt(8)` 520 cyc/次 |
-| **`s_barrier`** | **12.8%** | 176 cyc × 1920 次，单条最大项 |
-| VALU | 8.6% | 第一轮时是 14.2%，scale 乘法的占比已被摊薄 |
+| | 实际流量 | / 理论最小 | fabric 占用 | 地板时间 | 当前 | 差距 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| gemm1 bs128 | 467 MB | 1.16× | 93.8% | 151.4 µs | 156.0 | **+3.0%** |
+| gemm2 bs128 | 224 MB | 1.11× | 89.1% | 75.6 µs | 82.6 | **+9.3%** |
 
-gemm2 同理，`s_barrier` 7.6%。两者同源，都绑在
-**A tile 的 gmem → wait → LDS → barrier → ds_read** 这条串行链上：`tile_k=128`（§3.1）
-让 K-tile 数翻倍，`gpu.barrier()` 次数也就翻倍。这是 §3.1 净收益里被抵掉的那部分。
+gemm2 那 9.3% 拆开：fabric 带宽还差 ~5%（≈4 µs）+ 流量比理论最小高 11%（≈8 µs，grid 量化
+与 M-block 重读）。bs224 因 L2 吃掉更多重读（命中率 45% vs 29%），fabric 反而只有 79%，
+**大 bs 在流量侧还有空间**，不像 bs128 已经顶格。
 
-两个方向（都是结构性改动，未实施）：
+gemm1 上 §3.10 的 ATT 还说明一件事：`vmcnt(8)` 消掉后等待搬到 `s_barrier`（176 → 286 cyc），
+**等待总量不会因加深 LDS 或绕过 LDS 而消失** —— wave 在 barrier 上等是因为 HBM 已饱和。
+再动 A-tile 路径对 gemm1 不会有净收益。
 
-1. **A tile 加深预取 / 增加 LDS 级数**：现在是 2 级 ping-pong，A 只提前一拍。做成 3 级可以让
-   等 A 的 wait 落在两拍之外。LDS 现在用 7~9 KB（含 §3.8 的 scale 表），64 KB 里空间充足。
-2. **A tile 绕过 LDS**：`tile_m=16`、A tile 只有 2 KB。若 gmem load 能直接落到 MFMA 需要的
-   lane 布局（每 lane 取自己那行的 K 切片），LDS 和 barrier 一起省掉。代价是 16 个散开的行地址，
-   coalescing 会更差。
+仍值得做的结构性方向（未实施）：
+
+1. **`tile_m` 按 blocks/expert 阈值切换**（已落地：`token <= 512 → 16 else 32`）—— bs224 e2e
+   再省 ~6%，bs128 保持 16 避免 occupancy 崩盘。
+2. **A tile 绕过 LDS**（仅 gemm2 或低 fabric 占用的 shape 上有意义）：省 barrier 次数，
+   代价是更差的 coalescing。
 
 ### 其余几条，按性价比排
 

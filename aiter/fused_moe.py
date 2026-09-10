@@ -2660,7 +2660,15 @@ def get_2stage_cfgs(
         # cliff that the wrapper default of 3 falls off. Replace with tuned CSV rows
         # once the fp8blk family goes through the fmoe tuner.
         _out_str = "bf16"
-        _tile_m = 16 if token < 2048 else 32
+        # tile_m=32 halves the M-block count and with it the weight re-reads, but
+        # doubles the accumulators and so halves occupancy. Which side wins depends
+        # on how many M-blocks each expert already spans. Measured on gfx942,
+        # GLM-5.3 EP16 decode: at 512 rows (1.50x blocks/expert) the occupancy loss
+        # dominates and 16 is 6% better e2e; from 768 rows (2.00x) the traffic
+        # saving takes over and 32 is 6-8% better (bs192 329.1 -> 304.1, bs224
+        # 363.5 -> 342.6). block_m follows tile_m, so moe_sorting pads to the same
+        # granularity and both GEMMs stay aligned.
+        _tile_m = 16 if token <= 512 else 32
         # tile_k must cover whole 128-element scale blocks, and the ping-pong tail
         # consumes exactly two tiles, so the tile count also has to be even.
         #
