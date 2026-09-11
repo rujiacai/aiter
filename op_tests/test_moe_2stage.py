@@ -7,6 +7,7 @@ import itertools
 import logging
 import os
 from contextlib import ExitStack, nullcontext
+from math import comb
 
 import pandas as pd
 import torch
@@ -103,6 +104,72 @@ def calc_rel_err(x: torch.Tensor, y: torch.Tensor):
     return (1 - 2 * (x * y).sum() / ((x * x + y * y).sum())).item()
 
 
+def ep_uniform_expect(N, E_global, ep, topk):
+    """Uniform hypergeometric EP stats (see docs/ep_moe_test_construction_cn.md)."""
+    n = E_global // ep
+    p0 = comb(E_global - n, topk) / comb(E_global, topk)
+    p_hit = 1.0 - p0
+    return {
+        "p_hit": p_hit,
+        "recv": N * p_hit,
+        "pairs": N * topk / ep,
+        "eff_k": (topk / ep) / p_hit,
+        "std_recv": (N * p_hit * (1.0 - p_hit)) ** 0.5,
+    }
+
+
+def _build_ep_expert_mask(E_local, ep, ep_id):
+    if not (0 <= ep_id < ep):
+        raise ValueError(f"ep_id={ep_id} out of range [0, {ep})")
+    E_global = E_local * ep
+    expert_mask = torch.zeros((E_global + 1,), dtype=dtypes.i32, device="cuda")
+    lo = ep_id * E_local
+    hi = (ep_id + 1) * E_local
+    expert_mask[lo:hi] = 1
+    expert_mask[-1] = 0  # sentinel / fake expert always masked
+    return expert_mask, E_global
+
+
+def _ep_global_to_local_topk_ids(topk_ids, expert_mask):
+    local_id = expert_mask.cumsum(0, dtype=dtypes.i32) - 1
+    local_id = torch.where(expert_mask == 0, -1, local_id)
+    return local_id[topk_ids.long()]
+
+
+def _count_ep_pairs(topk_ids, recv, expert_mask):
+    valid_ids = topk_ids[:recv]
+    return int(expert_mask[valid_ids.long()].gt(0).sum().item())
+
+
+def _build_ep_dispatch_buffer(input_, score, topk, expert_mask, buffer_rows):
+    """MORI-dispatch-like buffer: compact recv rows to front, pad tail dead."""
+    N = buffer_rows
+    device = input_.device
+    dtype = input_.dtype
+    model_dim = input_.shape[1]
+
+    src_topk_ids = torch.empty((N, topk), dtype=dtypes.i32, device=device)
+    src_topk_weights = torch.empty((N, topk), dtype=dtypes.fp32, device=device)
+    fused_topk(input_, score, topk, True, src_topk_ids, src_topk_weights)
+
+    recv_mask = expert_mask[src_topk_ids.long()].bool().any(dim=1)
+    recv = int(recv_mask.sum().item())
+
+    buf_input = torch.randn((N, model_dim), dtype=dtype, device=device)
+    if recv > 0:
+        buf_input[:recv] = input_[recv_mask]
+
+    buf_topk_ids = torch.zeros((N, topk), dtype=dtypes.i32, device=device)
+    buf_topk_weights = torch.zeros((N, topk), dtype=dtypes.fp32, device=device)
+    if recv > 0:
+        buf_topk_ids[:recv] = src_topk_ids[recv_mask]
+        buf_topk_weights[:recv] = src_topk_weights[recv_mask]
+
+    num_local_tokens = torch.tensor([recv], dtype=dtypes.i32, device=device)
+    pairs = _count_ep_pairs(buf_topk_ids, recv, expert_mask)
+    return buf_input, buf_topk_weights, buf_topk_ids, num_local_tokens, recv, pairs
+
+
 @benchmark()
 def test_fmoe(
     dtype,
@@ -132,9 +199,25 @@ def test_fmoe(
     use_smooth_scale=False,
     iters=DEFAULT_ITERS,
     warmup=DEFAULT_WARMUP,
+    ep=1,
+    ep_id=0,
 ):
     if get_gfx() not in ["gfx950"] and qType in [aiter.QuantType.per_1x32]:
         return
+    is_ep = ep > 1
+    E_local = E
+    expert_mask = None
+    num_local_tokens = None
+    E_global = E
+    if is_ep:
+        if not (0 <= ep_id < ep):
+            raise ValueError(f"ep_id={ep_id} out of range [0, {ep})")
+        if AITER_MOE_NUM_EXPERT_ACTIVATED > 0 or AITER_MOE_EXPERT_BALANCE:
+            raise NotImplementedError(
+                "EP mode (--ep > 1) does not support AITER_MOE_NUM_EXPERT_ACTIVATED "
+                "or AITER_MOE_EXPERT_BALANCE"
+            )
+        expert_mask, E_global = _build_ep_expert_mask(E_local, ep, ep_id)
     # fc2_smooth_scale convention: stage1's activation is scaled per (expert, n)
     # so the down projection sees pre-scaled input. FlyDSL blockwise fp8 only.
     smooth_scale = (
@@ -169,33 +252,58 @@ def test_fmoe(
     exp_bias2 = torch.clamp(torch.randn((E, model_dim), dtype=dtype), -1.0, 1.0)
     if disable_stage2_bias:
         exp_bias2 = None
+    score_E = E_global if is_ep else E
     if AITER_MOE_NUM_EXPERT_ACTIVATED > 0:
         # Highest priority: activate n randomly-chosen experts (NOT the first n);
         # the other E-n experts are masked to -inf. Load is spread evenly across
         # the n active experts by round-robin (balanced), so all n are used.
         n_act = AITER_MOE_NUM_EXPERT_ACTIVATED
-        if n_act < topk or n_act > E or n_act > token * topk:
+        if n_act < topk or n_act > score_E or n_act > token * topk:
             raise ValueError(
                 f"AITER_MOE_NUM_EXPERT_ACTIVATED={n_act} is invalid: must be "
-                f"in [topk={topk}, min(E={E}, token*topk={token * topk})]"
+                f"in [topk={topk}, min(E={score_E}, token*topk={token * topk})]"
             )
-        sel = torch.randperm(E)[:n_act]  # random active expert ids
-        score = torch.full((token, E), float("-inf"), dtype=dtype)
+        sel = torch.randperm(score_E)[:n_act]  # random active expert ids
+        score = torch.full((token, score_E), float("-inf"), dtype=dtype)
         slot = torch.arange(token * topk) % n_act  # round-robin over active set
         rows = torch.arange(token).repeat_interleave(topk)
         score[rows, sel[slot]] = 1.0
     elif AITER_MOE_EXPERT_BALANCE:
-        score = torch.zeros((token, E), dtype=dtype)
+        score = torch.zeros((token, score_E), dtype=dtype)
         start_col = 0
         end_col = topk
         for token_id in range(token):
             score[token_id, start_col:end_col] = 1.0
-            start_col = end_col % E
+            start_col = end_col % score_E
             end_col = start_col + topk
     else:
-        score = torch.randn((token, E), dtype=dtype)
+        score = torch.randn((token, score_E), dtype=dtype)
 
-    topk_weights, topk_ids = fused_topk(input, score, topk, True)
+    if is_ep:
+        input, topk_weights, topk_ids, num_local_tokens, recv, pairs = (
+            _build_ep_dispatch_buffer(input, score, topk, expert_mask, token)
+        )
+        ref_topk_ids = _ep_global_to_local_topk_ids(topk_ids, expert_mask)
+        exp = ep_uniform_expect(token, E_global, ep, topk)
+        logger.info(
+            "EP ep=%d ep_id=%d buffer=%d recv=%d pairs=%d eff_k=%.3f "
+            "(expect recv=%.1f±%.1f pairs=%.1f eff_k=%.3f)",
+            ep,
+            ep_id,
+            token,
+            recv,
+            pairs,
+            pairs / recv if recv else 0.0,
+            exp["recv"],
+            exp["std_recv"],
+            exp["pairs"],
+            exp["eff_k"],
+        )
+    else:
+        topk_weights, topk_ids = fused_topk(input, score, topk, True)
+        ref_topk_ids = topk_ids
+        recv = token
+        pairs = token * topk
 
     if qType == aiter.QuantType.per_Tensor:
         w1_qt, w1_scale = aiter.pertoken_quant(w1.view(E, -1), quant_dtype=WQDType)
@@ -444,7 +552,7 @@ def test_fmoe(
         w1_qt,
         w2_qt,
         topk_weights,
-        topk_ids,
+        ref_topk_ids,
         dtype=stage1_ref_dtype,
         activation=actType,
         quant_type=qType,
@@ -463,7 +571,12 @@ def test_fmoe(
     # torch_moe_stage1 has no smooth_scale arg; apply the fc2_smooth_scale
     # convention here: out1[t, k, :] *= smooth_scale[topk_ids[t, k], :].
     if smooth_scale is not None:
-        out1_ref = (out1_ref * smooth_scale[topk_ids]).to(dtype)
+        if is_ep:
+            valid = ref_topk_ids >= 0
+            scale = smooth_scale[ref_topk_ids.clamp(min=0)]
+            out1_ref = (out1_ref * scale * valid.unsqueeze(-1)).to(dtype)
+        else:
+            out1_ref = (out1_ref * smooth_scale[topk_ids]).to(dtype)
 
     # ######################## stage 2 start ###########
     if qType == aiter.QuantType.per_128x128:
@@ -500,7 +613,7 @@ def test_fmoe(
         w1_qt,  # E, inter_dim*2, model_dim
         w2_qt,  # E, model_dim, inter_dim
         topk_weights,
-        topk_ids,
+        ref_topk_ids,
         dtype=dtype,
         quant_type=qType,
         w2_scale=w2_scale,
@@ -525,7 +638,21 @@ def test_fmoe(
         "linear_beta": linear_beta,
         "gate_mode": gateMode,
         "smooth_scale": smooth_scale,
+        "expert_mask": expert_mask,
+        "num_local_tokens": num_local_tokens,
     }
+
+    def _ep_result(ret):
+        if is_ep:
+            ret.update(
+                ep=ep,
+                ep_id=ep_id,
+                recv=recv,
+                pairs=pairs,
+                E_global=E_global,
+                eff_k=pairs / recv if recv else 0.0,
+            )
+        return ret
 
     if kernel_bench:
         # Kernel-bench: time the stage1 / stage2 kernels in isolation. One eager
@@ -584,12 +711,16 @@ def test_fmoe(
         # The eager call above already produced a correct output, so the accuracy
         # number costs nothing extra and keeps perf sweeps from silently reporting
         # timings for a wrong kernel.
-        return {
-            "us": us2,
-            "us_stage1": us1,
-            "us_stage2": us2_stage,
-            "cos_sim": float(calc_cos_sim(out2_ref, out2_ck)),
-        }
+        return _ep_result(
+            {
+                "us": us2,
+                "us_stage1": us1,
+                "us_stage2": us2_stage,
+                "cos_sim": float(
+                    calc_cos_sim(out2_ref[:recv], out2_ck[:recv])
+                ),
+            }
+        )
 
     out2_ck, us2 = run_perftest(
         fused_moe,
@@ -611,14 +742,20 @@ def test_fmoe(
         logger.error(
             "output contains NaN! (possible aiter #3117 stage2 K-pad regression)"
         )
+    out2_ref_cmp = out2_ref[:recv]
+    out2_ck_cmp = out2_ck[:recv]
+    tflops_macs = pairs * model_dim * inter_dim
     err = checkAllclose(
-        out2_ref,
-        out2_ck,
-        msg=f"ck_moe_2stages:{us2:>8.2f} us, {token*model_dim*inter_dim*3*topk*2/us2/1000/1000:>8.2f} tflops......(quant:{AQDType})",
+        out2_ref_cmp,
+        out2_ck_cmp,
+        msg=(
+            f"ck_moe_2stages:{us2:>8.2f} us, "
+            f"{tflops_macs * 3 * 2 / us2 / 1e6:>8.2f} tflops......(quant:{AQDType})"
+        ),
     )
 
-    cos_sim = calc_cos_sim(out2_ref, out2_ck)
-    rel_err = calc_rel_err(out2_ref, out2_ck)
+    cos_sim = calc_cos_sim(out2_ref_cmp, out2_ck_cmp)
+    rel_err = calc_rel_err(out2_ref_cmp, out2_ck_cmp)
     if rel_err > REL_ERR_WARN:
         logger.warning(
             f"rel_err: {rel_err} is too large (cos_sim={cos_sim}), "
@@ -636,7 +773,7 @@ def test_fmoe(
             f"accuracy check failed (non-strict): err={err}, rel_err={rel_err}"
         )
 
-    return {"us": us2, "cos_sim": float(cos_sim)}
+    return _ep_result({"us": us2, "cos_sim": float(cos_sim)})
 
 
 l_quant = [
@@ -746,8 +883,22 @@ parser.add_argument(
     "--expert",
     type=int,
     default=257,
-    help="""Number of experts.
-    e.g.: -e 8""",
+    help="""Number of experts (local per rank when --ep > 1).
+    e.g.: -e 16 --ep 16  # GLM-5.3: 16 local x 16 EP = 256 global""",
+)
+parser.add_argument(
+    "--ep",
+    type=int,
+    default=1,
+    help="""Expert-parallel size. Default 1 = no EP. When > 1, build global routing
+    + expert_mask like test_moe_ep / vLLM dump: -e is local experts, -t is buffer
+    rows (e.g. 512), recv/pairs follow uniform EP theory (~209 recv, ~256 pairs).""",
+)
+parser.add_argument(
+    "--ep-id",
+    type=int,
+    default=0,
+    help="EP rank id in [0, ep). Default 0.",
 )
 
 parser.add_argument(
@@ -1184,6 +1335,8 @@ def _iter_legacy_cases():
             swiglu_limit=_effective_swiglu_limit(
                 quant_type, aq_dtype, wq_dtype, args.swiglu_limit
             ),
+            ep=args.ep,
+            ep_id=args.ep_id,
             **over,
         )
 
@@ -1334,6 +1487,8 @@ def _iter_situv2_default_cases():
                 "swiglu_limit": None,
                 "beta": args.beta,
                 "linear_beta": args.linear_beta,
+                "ep": args.ep,
+                "ep_id": args.ep_id,
             }, extras
 
 
@@ -1516,6 +1671,7 @@ aiter.logger.info("moe_2stage summary (markdown):\n%s", df_md)
 # backends/shapes lands in one file. The markdown table above keeps every column.
 _CSV_COLS = [
     "token", "model_dim", "inter_dim", "E", "topk",
+    "ep", "recv", "pairs", "eff_k",
     # Recorded because they change what is being measured: a row without them is
     # an unclamped, unscaled run, and the variant name alone does not say so.
     "swiglu_limit", "use_smooth_scale",
@@ -1526,11 +1682,27 @@ _CSV_COLS = [
 _TFLOPS_COLS = [("us", "tflops", 6), ("us_stage1", "tflops_s1", 4), ("us_stage2", "tflops_s2", 2)]
 if args.csv and len(df):
     out_df = df.reindex(columns=[c for c in _CSV_COLS if c in df.columns])
-    macs = out_df["token"] * out_df["topk"] * out_df["model_dim"] * out_df["inter_dim"]
+    if "pairs" in out_df.columns:
+        macs = out_df["pairs"] * out_df["model_dim"] * out_df["inter_dim"]
+    else:
+        macs = (
+            out_df["token"] * out_df["topk"] * out_df["model_dim"] * out_df["inter_dim"]
+        )
     order = [
         c
-        for c in ("token", "model_dim", "inter_dim", "E", "topk",
-                  "swiglu_limit", "use_smooth_scale")
+        for c in (
+            "token",
+            "model_dim",
+            "inter_dim",
+            "E",
+            "topk",
+            "ep",
+            "recv",
+            "pairs",
+            "eff_k",
+            "swiglu_limit",
+            "use_smooth_scale",
+        )
         if c in out_df.columns
     ]  # fmt: skip
     for us_col, tf_col, factor in _TFLOPS_COLS:
