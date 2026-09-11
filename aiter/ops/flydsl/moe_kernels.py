@@ -672,7 +672,7 @@ def get_flydsl_stage2_kernels_fp8_blk(out_dtype: str) -> dict[str, dict]:
     for tm in (16, 32, 64, 128):
         for tn in (128, 256):
             for tk in (128, 256):
-                for mode in ("atomic",):
+                for mode in ("atomic", "reduce"):
                     for w in (0, 1, 2, 3, 4):
                         base_name = flydsl_kernel_name(
                             2, a_dtype, b_dtype, out_dtype, tm, tn, tk, mode
@@ -1220,6 +1220,104 @@ def _run_compiled(exe, args):
 
 _S2_LEGACY_FP8_SCALE_BLK = 8
 _S2_LEGACY_FP8_PITCH_ALIGN = 0
+
+
+def build_reverse_sorted(
+    sorted_token_ids: torch.Tensor,
+    token_num: int,
+    topk: int,
+    num_valid_ids: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Map (token, slot) -> sorted row index for sorted-partial stage2 reduce."""
+    dev = sorted_token_ids.device
+    if num_valid_ids is not None:
+        n = int(num_valid_ids.reshape(-1)[0].item())
+    else:
+        n = int(sorted_token_ids.numel())
+    n = max(0, min(n, int(sorted_token_ids.numel())))
+    if n == 0:
+        return torch.full((token_num * topk,), -1, dtype=torch.int32, device=dev)
+    valid = sorted_token_ids[:n].to(torch.int64)
+    t = valid & 0xFFFFFF
+    s = valid >> 24
+    ts = t * topk + s
+    rows = torch.arange(n, device=dev, dtype=torch.int32)
+    mask = (t < token_num) & (s < topk)
+    reverse = torch.full((token_num * topk,), -1, dtype=torch.int32, device=dev)
+    if mask.any():
+        reverse.scatter_(0, ts[mask].to(torch.int64), rows[mask])
+    return reverse
+
+
+def _run_moe_reduction_sorted(
+    target,
+    out,
+    reverse_sorted,
+    token_num,
+    topk,
+    model_dim,
+    expert_mask=None,
+    topk_ids=None,
+    stream=None,
+    topk_weights=None,
+):
+    """Gather-reduce from sorted-row partial buffer via reverse_sorted lookup."""
+    use_mask = expert_mask is not None
+    if use_mask and topk_ids is None:
+        raise ValueError(
+            "topk_ids is required when expert_mask is provided for reduce mode"
+        )
+    if out.dtype == torch.float16:
+        dtype_str = "f16"
+    elif out.dtype == torch.bfloat16:
+        dtype_str = "bf16"
+    elif out.dtype == torch.float32:
+        dtype_str = "f32"
+    else:
+        raise NotImplementedError(
+            f"Sorted moe reduction not supported for dtype {out.dtype}"
+        )
+
+    from .kernels.moe_reduce import compile_moe_reduction_sorted
+
+    if use_mask:
+        em = expert_mask.to(torch.int32).contiguous()
+        tk = topk_ids.to(torch.int32).contiguous()
+    else:
+        em = torch.empty(0, device=out.device, dtype=torch.int32)
+        tk = torch.empty(0, device=out.device, dtype=torch.int32)
+    use_weight = topk_weights is not None
+    tw = (
+        topk_weights.to(torch.float32).contiguous()
+        if use_weight
+        else torch.empty(0, device=out.device, dtype=torch.float32)
+    )
+    if stream is None:
+        stream = torch.cuda.current_stream()
+    num_experts = int(expert_mask.numel()) if use_mask else 0
+    max_sorted_rows = int(target.numel() // model_dim)
+    reduce_exe = compile_moe_reduction_sorted(
+        topk=topk,
+        model_dim=model_dim,
+        max_sorted_rows=max_sorted_rows,
+        dtype_str=dtype_str,
+        use_mask=use_mask,
+        num_experts=num_experts,
+        use_weight=use_weight,
+    )
+    _run_compiled(
+        reduce_exe,
+        (
+            ptr_arg(target),
+            ptr_arg(out),
+            ptr_arg(reverse_sorted),
+            ptr_arg(em),
+            ptr_arg(tk),
+            ptr_arg(tw),
+            token_num,
+            stream,
+        ),
+    )
 
 
 def _run_moe_reduction(
@@ -2381,6 +2479,11 @@ def _flydsl_moe_stage2_impl(
         mode = "reduce"
 
     accumulate = mode != "reduce" and not return_per_slot
+    _sorted_partial = (
+        not accumulate
+        and b_dtype in ("fp8blk",)
+        and os.environ.get("AITER_FLYDSL_STAGE2_SORTED_PARTIAL", "1") == "1"
+    )
 
     if a_dtype == "fp4":
         inter_dim = inter_dim * 2
@@ -2464,6 +2567,13 @@ def _flydsl_moe_stage2_impl(
     if not accumulate:
         if return_per_slot:
             target = out.view(-1)
+        elif _sorted_partial:
+            sorted_rows = int(sorted_token_ids.shape[0])
+            target = torch.empty(
+                (sorted_rows * model_dim,),
+                device=out.device,
+                dtype=out.dtype,
+            )
         else:
             # fp8 route-out stores uint8 rows: N value bytes + N/8 e8m0 scale bytes.
             from aiter.ops.flydsl.kernels.mxfp4_gemm_common import fp8out_row_bytes
@@ -2553,18 +2663,33 @@ def _flydsl_moe_stage2_impl(
                 "topk_ids is required when expert_mask is provided for reduce mode"
             )
     if not accumulate and not return_per_slot:
-        _run_moe_reduction(
-            target,
-            out,
-            token_num,
-            topk,
-            model_dim,
-            expert_mask,
-            topk_ids,
-            is_fp8=_s2_fp8_inter,
-            fp8_scale_blk=_S2_LEGACY_FP8_SCALE_BLK,
-            fp8_pitch_align=_S2_LEGACY_FP8_PITCH_ALIGN,
-        )
+        if _sorted_partial:
+            reverse_sorted = build_reverse_sorted(
+                sorted_token_ids, token_num, topk, num_valid_ids
+            )
+            _run_moe_reduction_sorted(
+                target,
+                out,
+                reverse_sorted,
+                token_num,
+                topk,
+                model_dim,
+                expert_mask,
+                topk_ids,
+            )
+        else:
+            _run_moe_reduction(
+                target,
+                out,
+                token_num,
+                topk,
+                model_dim,
+                expert_mask,
+                topk_ids,
+                is_fp8=_s2_fp8_inter,
+                fp8_scale_blk=_S2_LEGACY_FP8_SCALE_BLK,
+                fp8_pitch_align=_S2_LEGACY_FP8_PITCH_ALIGN,
+            )
     return out
 
 

@@ -258,3 +258,176 @@ def compile_moe_reduction(
         )
 
     return launch
+
+
+@flyc.kernel
+def moe_reduction_sorted_kernel(
+    X: fx.Pointer,
+    Y: fx.Pointer,
+    reverse_sorted: fx.Pointer,
+    expert_mask: fx.Pointer,
+    topk_ids: fx.Pointer,
+    topk_weights: fx.Pointer,
+    i32_m_tokens: fx.Int32,
+    topk: fx.Constexpr[int],
+    model_dim: fx.Constexpr[int],
+    max_sorted_rows: fx.Constexpr[int],
+    dtype_str: fx.Constexpr[str],
+    use_mask: fx.Constexpr[bool],
+    num_experts: fx.Constexpr[int],
+    use_weight: fx.Constexpr[bool],
+):
+    """Gather-reduce sorted-row partials: Y[t,d] = sum_k X[rev[t,k], d]."""
+    is_fp8 = False
+    if const_expr(is_fp8):
+        raise RuntimeError("sorted partial reduce does not support fp8 route-out")
+    in_elem = (
+        fx.Float32
+        if dtype_str == "f32"
+        else (fx.Float16 if dtype_str == "f16" else fx.BFloat16)
+    )
+    in_bytes = 4 if dtype_str == "f32" else 2
+    row_stride, out_numeric = model_dim, in_elem
+    V = 128 // (8 * in_bytes)
+    load_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), in_elem)
+    out_bytes = out_numeric.width // 8
+    is_16b = out_numeric.width < 32
+    TILE = BLOCK * V
+    store_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), out_numeric)
+
+    token, tile, tid = gpu.block_id("x"), gpu.block_id("y"), gpu.thread_id("x")
+    tok64 = fx.Int64(token)
+    vec_f32 = T.vec(V, T.f32)
+    vec_out = T.vec(V, out_numeric.ir_type)
+
+    def _view(elem, ptr_i64, ncols, nbytes):
+        pt = fx.PointerType.get(
+            elem.ir_type,
+            address_space=fx.AddressSpace.Global,
+            alignment=elem.width // 8,
+        )
+        view = fx.make_view(
+            fx.inttoptr(pt, ptr_i64), fx.make_layout((1, ncols), (ncols, 1))
+        )
+        return fx.rocdl.make_buffer_tensor(view, num_records_bytes=fx.Int64(nbytes))
+
+    x_row_bytes = model_dim * in_bytes
+    x_nbytes = max_sorted_rows * x_row_bytes
+    xbase = fx.Int64(ptrtoint(X))
+    xbuf = _view(in_elem, xbase, model_dim, x_nbytes)
+    ybuf = _view(
+        out_numeric,
+        fx.Int64(ptrtoint(Y)) + tok64 * fx.Int64(model_dim * out_bytes),
+        model_dim,
+        model_dim * out_bytes,
+    )
+    rs_i32pt = fx.PointerType.get(
+        T.i32, address_space=fx.AddressSpace.Global, alignment=4
+    )
+    rs_ptr = fx.inttoptr(
+        rs_i32pt, fx.Int64(ptrtoint(reverse_sorted)) + tok64 * fx.Int64(topk * 4)
+    )
+    if const_expr(use_mask):
+        i32pt = fx.PointerType.get(
+            T.i32, address_space=fx.AddressSpace.Global, alignment=4
+        )
+        tk_ptr = fx.inttoptr(
+            i32pt, fx.Int64(ptrtoint(topk_ids)) + tok64 * fx.Int64(topk * 4)
+        )
+        em_ptr = fx.inttoptr(i32pt, fx.Int64(ptrtoint(expert_mask)))
+    if const_expr(use_weight):
+        f32pt = fx.PointerType.get(
+            T.f32, address_space=fx.AddressSpace.Global, alignment=4
+        )
+        tw_ptr = fx.inttoptr(
+            f32pt, fx.Int64(ptrtoint(topk_weights)) + tok64 * fx.Int64(topk * 4)
+        )
+
+    tile_mn, tv_layout = fx.make_layout_tv(
+        fx.make_layout((1, BLOCK), (1, 1)), fx.make_layout((1, V), (1, 1))
+    )
+    thr_load = fx.make_tiled_copy(load_atom, tv_layout, tile_mn).get_slice(tid)
+    thr_store = fx.make_tiled_copy(store_atom, tv_layout, tile_mn).get_slice(tid)
+
+    def _reduce_tile():
+        p_src = thr_load.partition_S(
+            fx.slice(fx.zipped_divide(xbuf, tile_mn), (None, (0, tile)))
+        )
+        p_dst = thr_store.partition_D(
+            fx.slice(fx.zipped_divide(ybuf, tile_mn), (None, (0, tile)))
+        )
+        acc = fx.Vector.filled(V, 0.0, fx.Float32)
+        for k in range_constexpr(topk):
+            sr = fx.Int32(rs_ptr[k])
+            sr_ok = sr >= fx.Int32(0)
+            if const_expr(use_mask):
+                sr_ok = sr_ok & (em_ptr[tk_ptr[k]] != fx.Int32(0))
+            frag = fx.make_fragment_like(p_src)
+            fx.copy(load_atom, p_src, frag, soffset=sr * fx.Int32(model_dim))
+            vk = fx.Vector(fx.memref_load_vec(frag))
+            vk = vk.extf(vec_f32) if is_16b else vk
+            if const_expr(use_weight):
+                vk = fx.Vector.from_elements(
+                    [vk[i] * tw_ptr[k] for i in range_constexpr(V)], fx.Float32
+                )
+            vk = sr_ok.select(vk, fx.Vector.filled(V, 0.0, fx.Float32))
+            acc = acc + vk
+        ofrag = fx.make_fragment_like(p_dst)
+        fx.memref_store_vec(acc.truncf(vec_out) if is_16b else acc, ofrag)
+        fx.copy(store_atom, ofrag, p_dst)
+
+    if const_expr(model_dim % TILE != 0):
+        if fx.Int32(tile) * fx.Int32(TILE) + fx.Int32(tid) * fx.Int32(V) < fx.Int32(
+            model_dim
+        ):
+            _reduce_tile()
+    else:
+        _reduce_tile()
+
+
+@functools.lru_cache(maxsize=1024)
+def compile_moe_reduction_sorted(
+    *,
+    topk: int,
+    model_dim: int,
+    max_sorted_rows: int,
+    dtype_str: str = "f16",
+    use_mask: bool = False,
+    num_experts: int = 0,
+    use_weight: bool = False,
+):
+    """Compile gather-reduce from sorted-row partials via reverse_sorted lookup."""
+    V = 128 // (32 if dtype_str == "f32" else 16)
+    gy = (model_dim + BLOCK * V - 1) // (BLOCK * V)
+
+    @flyc.jit
+    def launch(
+        X: fx.Pointer,
+        Y: fx.Pointer,
+        reverse_sorted: fx.Pointer,
+        expert_mask: fx.Pointer,
+        topk_ids: fx.Pointer,
+        topk_weights: fx.Pointer,
+        i32_m_tokens: fx.Int32,
+        stream: fx.Stream,
+    ):
+        moe_reduction_sorted_kernel(
+            X,
+            Y,
+            reverse_sorted,
+            expert_mask,
+            topk_ids,
+            topk_weights,
+            i32_m_tokens,
+            topk,
+            model_dim,
+            max_sorted_rows,
+            dtype_str,
+            use_mask,
+            num_experts,
+            use_weight,
+        ).launch(
+            grid=(fx.Int64(i32_m_tokens), gy, 1), block=(BLOCK, 1, 1), stream=stream
+        )
+
+    return launch

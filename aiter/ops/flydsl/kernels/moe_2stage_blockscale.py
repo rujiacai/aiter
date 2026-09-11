@@ -2638,6 +2638,11 @@ def compile_moe_gemm2(
         raise ValueError(
             "compile_moe_gemm2(accumulate=False) only supports out_dtype in {'f16','bf16'}"
         )
+    _sorted_partial = (
+        (not bool(accumulate))
+        and is_fp8_blk
+        and os.environ.get("AITER_FLYDSL_STAGE2_SORTED_PARTIAL", "1") == "1"
+    )
     is_int4 = in_dtype == "int4"
     # w_is_int4: True for any variant where weights are packed int4.
     w_is_int4 = is_int4 or is_int4_bf16 or is_mxfp4_fp8
@@ -3037,9 +3042,17 @@ def compile_moe_gemm2(
             out_elem_bytes = 4 if out_is_f32 else 2
             out_nbytes_idx = tokens_in * n_in * fx.Index(out_elem_bytes)
             if const_expr(not bool(accumulate)):
-                out_nbytes_idx = (
-                    tokens_in * fx.Index(topk) * n_in * fx.Index(out_elem_bytes)
-                )
+                if const_expr(_sorted_partial):
+                    out_nbytes_idx = (
+                        size_expert_ids_in
+                        * fx.Index(tile_m)
+                        * n_in
+                        * fx.Index(out_elem_bytes)
+                    )
+                else:
+                    out_nbytes_idx = (
+                        tokens_in * fx.Index(topk) * n_in * fx.Index(out_elem_bytes)
+                    )
             out_rsrc = _ptr_buffer_resource(arg_out, out_nbytes_idx)
             # scale_x: fp16/bf16 path ignores (implicit scale=1.0); int4_bf16 also uses 1.0.
             if const_expr(is_f16_or_bf16):
@@ -4397,6 +4410,10 @@ def compile_moe_gemm2(
                             vector.store(v1, lds_out, [lds_idx], alignment=2)
 
                     def precompute_row(*, row_local, row):
+                        if const_expr(_sorted_partial):
+                            # Padding rows write garbage into unused slots; gather
+                            # reduce never reads them (reverse_sorted omits them).
+                            return arith.index_cast(T.i32, row)
                         # Precompute row context for cshuffle stores.
                         # Return (fused_i32, row_valid_i1) so the epilogue can skip the entire row
                         # for invalid tail rows (CK-style), avoiding per-store branching.
@@ -4415,13 +4432,17 @@ def compile_moe_gemm2(
                         return (fused2, row_valid)
 
                     def store_pair(*, row_local, row, row_ctx, col_pair0, col_g0, frag):
-                        fused = row_ctx
-                        t = fused & mask24_i32
-                        s = fused >> 24
-                        idx0 = t * model_i32
-                        if const_expr(not bool(accumulate)):
-                            ts = t * topk_i32_v + s
-                            idx0 = ts * model_i32
+                        if const_expr(_sorted_partial):
+                            row_i32 = row_ctx
+                            idx0 = row_i32 * model_i32
+                        else:
+                            fused = row_ctx
+                            t = fused & mask24_i32
+                            s = fused >> 24
+                            idx0 = t * model_i32
+                            if const_expr(not bool(accumulate)):
+                                ts = t * topk_i32_v + s
+                                idx0 = ts * model_i32
                         col_i32 = arith.index_cast(T.i32, col_g0)
                         idx_elem = idx0 + col_i32
                         idx_elem_even = idx_elem & mask_even_i32
