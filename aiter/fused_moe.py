@@ -2668,7 +2668,9 @@ def get_2stage_cfgs(
         # saving takes over and 32 is 6-8% better (bs192 329.1 -> 304.1, bs224
         # 363.5 -> 342.6). block_m follows tile_m, so moe_sorting pads to the same
         # granularity and both GEMMs stay aligned.
-        _tile_m = 16 if token <= 512 else 32
+        # 512 rows moved to the wide tile once tile_m=32 was paired with the
+        # narrow N tiles below; on its own it was 6% worse there (see _tile_n1).
+        _tile_m = 16 if token < 512 else 32
         # tile_k must cover whole 128-element scale blocks, and the ping-pong tail
         # consumes exactly two tiles, so the tile count also has to be even.
         #
@@ -2685,7 +2687,13 @@ def get_2stage_cfgs(
         # tokens the grid is large enough and the wider tile reads better.
         # Measured on gfx942 d6144x256 E256 k8: -20% at 1-2 tokens, -12% at 8,
         # +14% at 16.
-        _tile_n1 = 64 if token <= 8 else 128
+        #
+        # The other reason to halve it: tile_m=32 doubles the accumulators, and
+        # at tile_n1=128 that puts stage1 at 60+132=192 registers, i.e. 2
+        # waves/SIMD. num_acc_n is tile_n/4/16, so the narrow tile halves the
+        # loop-carried B tile and brings it to 128+0=128 -- 4 waves/SIMD, with
+        # no scratch. Measured at 512 rows: 170.6 us wide vs 151.7 narrow.
+        _tile_n1 = 64 if (token <= 8 or _tile_m == 32) else 128
         _tile_k1 = 128
         # Split-K for the same reason, one level down: even at tile_n=64 a single
         # token lights up 8 experts x 4 N tiles = 32 workgroups against ~240 slots.
@@ -2699,14 +2707,21 @@ def get_2stage_cfgs(
         _k_batch1 = 4 if token <= 2 else 1
         from aiter.ops.flydsl.moe_kernels import flydsl_kernel_name
 
+        # 3 is worth ~0.5 us on both stages once the narrow N tiles already fit
+        # 4 waves/SIMD; at tile_m=16 it is a wash and 2 is what was tuned.
+        _wpe = 3 if _tile_m == 32 else 2
         kn1 = (
             flydsl_kernel_name(
                 1, "fp8", "fp8blk", _out_str, _tile_m, _tile_n1, _tile_k1
             )
-            + "_w2"
+            + f"_w{_wpe}"
             + (f"_kb{_k_batch1}" if _k_batch1 > 1 else "")
         )
-        _tile_n2 = 256
+        # Same register argument as _tile_n1, one stage down: tile_m=32 puts
+        # stage2 at 56+128=184 (2 waves/SIMD) and tile_n2=128 brings it to
+        # 120+0=120 (4 waves/SIMD). Note this inverts the tile_m=16 result,
+        # where 256 wins by ~18 us -- the pairing only holds with the wide M.
+        _tile_n2 = 128 if _tile_m == 32 else 256
         # Non-temporal W loads pay off only while each expert's weights are read
         # about once. Past that, tile_m=16 makes the hot expert span several
         # M-blocks and its W1 gets re-read, so telling the cache to drop the line
@@ -2717,7 +2732,7 @@ def get_2stage_cfgs(
             flydsl_kernel_name(
                 2, "fp8", "fp8blk", _out_str, _tile_m, _tile_n2, _tile_k2, "atomic"
             )
-            + "_w2"
+            + f"_w{_wpe}"
         )
         return MOEMetadata(
             functools.partial(
