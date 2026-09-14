@@ -430,7 +430,31 @@ def compile_moe_gemm1(
             else 0
         )
 
-    total_threads = 256
+    # Waves per workgroup. The N tile is split evenly across them, so this sets
+    # num_acc_n = (tile_n / num_waves) / 16 -- the multiplier on the
+    # loop-carried B tile, and therefore the register budget.
+    #
+    # Only the wide N tile at tile_m=32 wants 8 waves: that is the pairing where
+    # num_acc_n drops back to 1 and stage1 lands on 128 registers (4 waves/SIMD)
+    # instead of 192 (2 waves/SIMD). tile_m=16 shapes stay at 4 -- their X tile
+    # is only tile_m*tile_k = 2048 bytes, which 512 threads would split below
+    # the 8-byte LDS store granularity.
+    _s1_waves_env = os.environ.get("AITER_BLKFP8_S1_WAVES")
+    _s1_waves = (
+        int(_s1_waves_env)
+        if _s1_waves_env
+        else (8 if (int(tile_n) >= 128 and int(tile_m) >= 32) else 4)
+    )
+    # The wave count only works if it splits tile_n into whole 16-column
+    # MFMA blocks. compile_moe_gemm1 is shared with the mxfp8/int4/fp16
+    # callers, whose tile_n need not cooperate, so an impossible request
+    # falls back to the 4-wave default rather than failing the compile.
+    _x_bytes_per_thread = (int(tile_m) * int(tile_k) * int(elem_bytes)) // (
+        _s1_waves * 64
+    )
+    if (int(tile_n) // _s1_waves) % 16 != 0 or _x_bytes_per_thread < 8:
+        _s1_waves = 4
+    total_threads = _s1_waves * 64
     bytes_x_per_tile = int(tile_m) * int(tile_k) * int(elem_bytes)
     if bytes_x_per_tile % total_threads != 0:
         raise ValueError(
@@ -548,7 +572,9 @@ def compile_moe_gemm1(
 
     if True:
 
-        @flyc.kernel
+        # The AMDGPU default max_flat_workgroup_size is 256, so anything wider
+        # than 4 waves has to be declared here or the launch is rejected.
+        @flyc.kernel(known_block_size=[total_threads, 1, 1])
         def moe_gemm1(
             arg_out: fx.Pointer,
             arg_x: fx.Pointer,
@@ -691,7 +717,7 @@ def compile_moe_gemm1(
             # Common constants/atoms (hoisted): keep IR small like GEMM.
             # XOR16 swizzle parameter (in bytes; constant, power-of-two in our configs).
             k_blocks16 = arith.index(tile_k_bytes // 16)
-            layout_tx_wave_lane = fx.make_layout((4, 64), stride=(64, 1))
+            layout_tx_wave_lane = fx.make_layout((_s1_waves, 64), stride=(64, 1))
             layout_lane16 = fx.make_layout((4, 16), stride=(16, 1))
 
             # Everything below is gated by `blk_valid` to avoid doing buffer-resource setup and
@@ -952,12 +978,16 @@ def compile_moe_gemm1(
 
                 # Dynamic N tiling within block (same as existing kernels)
                 by_n = by * fx.Index(tile_n)
-                num_waves = 4
+                num_waves = _s1_waves
                 n_per_wave = tile_n // num_waves
+                # num_acc_n floors on purpose: callers outside the fp8blk
+                # config reach this with tile_n that is not a multiple of
+                # 16*num_waves and have always relied on the truncation. The
+                # wave count was already clamped to keep the split whole.
                 num_acc_n = n_per_wave // 16
                 c_n_per_wave = fx.Index(n_per_wave)
-                wave_mod_4 = wave_id % fx.Index(4)
-                n_tile_base = wave_mod_4 * c_n_per_wave
+                wave_mod_n = wave_id % fx.Index(num_waves)
+                n_tile_base = wave_mod_n * c_n_per_wave
 
                 # Precompute n_blk/n_intra for gate and up rows (GEMM-style: idx2crd/get)
                 n_intra_gate = []
@@ -1037,7 +1067,7 @@ def compile_moe_gemm1(
                 def preload_a_scales_to_lds():
                     """Stage this M-block's whole A block-scale table into LDS.
 
-                    Thread t takes flat element ``t + i*256`` of a (row, kb) grid,
+                    Thread t takes flat element ``t + i*total_threads`` of a (row, kb) grid,
                     so consecutive threads walk consecutive K blocks of one row --
                     the one direction in which scale_x is contiguous, which turns
                     the per-tile gather into tile_m*ceil(num_k_blocks*4/128)
@@ -1049,8 +1079,8 @@ def compile_moe_gemm1(
                     c_nkb = fx.Index(num_k_blocks)
                     c_tm = fx.Index(tile_m)
                     total = int(num_k_blocks) * int(tile_m)
-                    for i in range_constexpr((total + 255) // 256):
-                        d = tx + arith.index(i * 256)
+                    for i in range_constexpr((total + total_threads - 1) // total_threads):
+                        d = tx + arith.index(i * total_threads)
                         row = d // c_nkb
                         kb = d - row * c_nkb
                         # Padded rows carry token_id == tokens; clamp the address and
@@ -1073,7 +1103,7 @@ def compile_moe_gemm1(
                             fx.Float32(0.0),
                         )
                         _store = vector.from_elements(T.vec(1, T.f32), [val])
-                        if const_expr(total % 256 == 0):
+                        if const_expr(total % total_threads == 0):
                             vector.store(_store, lds_asc, [kb * c_tm + row])
                         else:
                             _in_range = arith.cmpi(
@@ -2545,7 +2575,7 @@ def compile_moe_gemm1(
                     )
         _k1.launch(
             grid=(gx, gy, k_batch),
-            block=(256, 1, 1),
+            block=(total_threads, 1, 1),
             stream=stream,
         )
 

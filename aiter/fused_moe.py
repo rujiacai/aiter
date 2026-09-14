@@ -2694,6 +2694,22 @@ def get_2stage_cfgs(
         # loop-carried B tile and brings it to 128+0=128 -- 4 waves/SIMD, with
         # no scratch. Measured at 512 rows: 170.6 us wide vs 151.7 narrow.
         _tile_n1 = 64 if (token <= 8 or _tile_m == 32) else 128
+        # From the 1024 bucket up, the wide N tile wins back its cost: the
+        # stage1 kernel takes 8 waves there (see _s1_waves), num_acc_n drops
+        # back to 1, so the register budget matches the narrow tile while the
+        # workgroup count halves and each one's weight reuse doubles.
+        #
+        # `token` is get_padded_M(M), so 768 and 896 rows share this bucket and
+        # cannot be tuned apart. Measured at layer 3, mean over layers
+        # 3/20/40/60/77 in brackets:
+        #
+        #   512 rows (bucket 512)   +2.3% -- excluded, narrow tile stays
+        #   768 rows (bucket 1024)  295.7 -> 288.0  -2.6%  (-1.8%)
+        #   896 rows (bucket 1024)  318.0 -> 321.0  +0.9%  (-0.1%)
+        #
+        # Net positive over the bucket, at the price of ~1% on 896 rows.
+        if token >= 1024:
+            _tile_n1 = 128
         _tile_k1 = 128
         # Split-K for the same reason, one level down: even at tile_n=64 a single
         # token lights up 8 experts x 4 N tiles = 32 workgroups against ~240 slots.
