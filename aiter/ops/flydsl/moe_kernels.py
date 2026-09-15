@@ -151,6 +151,11 @@ def resolve_flydsl_gemm_grid_y(
     return max(1, min(grid_y, cap_grid_y))
 
 
+def _blkfp8_s2_persist() -> bool:
+    """Whether blockwise-fp8 stage2 uses the CU-sized persistent pool."""
+    return os.environ.get("AITER_BLKFP8_S2_PERSIST", "0") != "0"
+
+
 def requires_flydsl_stage2_reduce(
     token_num: int, model_dim: int, element_size: int
 ) -> bool:
@@ -948,6 +953,8 @@ def compile_flydsl_moe_stage2(
             accumulate=accumulate,
             waves_per_eu=waves_per_eu or 0,
             b_nt=b_nt,
+            persist_m=persist_m,
+            cu_num_mul=cu_num_mul,
         )
     else:
         raise ValueError(
@@ -2545,8 +2552,12 @@ def _flydsl_moe_stage2_impl(
         _persist_m = -1 if m_blocks > 256 else 1
 
     if a_dtype == "fp8":
-        # FP8 uses non-persistent scheduling, so cap grid.y via persist_m.
-        _persist_m = resolve_flydsl_grid_y_persist_m(m_blocks)
+        if b_dtype == "fp8blk" and _blkfp8_s2_persist():
+            # CU-sized thread-group pool; grid.y stops tracking buffer capacity.
+            _persist_m = 0
+        else:
+            # FP8 uses non-persistent scheduling, so cap grid.y via persist_m.
+            _persist_m = resolve_flydsl_grid_y_persist_m(m_blocks)
 
     if bias is not None and bias.dtype != torch.float32:
         bias = bias.to(torch.float32)

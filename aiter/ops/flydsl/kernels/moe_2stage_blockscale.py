@@ -2603,6 +2603,8 @@ def compile_moe_gemm2(
     scale_blk_n: int = 128,
     scale_blk_k: int = 128,
     b_nt: int = 0,
+    persist_m: int = 1,
+    cu_num_mul: int = 1,
 ):
     """Compile stage2 kernel (`moe_gemm2`) and return the compiled executable.
 
@@ -2865,6 +2867,19 @@ def compile_moe_gemm2(
         return ty() if callable(ty) else ty
 
     epilog_tag = "cshuffle"
+    # Persistent scheduling: grid.y becomes a CU-sized thread-group pool
+    # instead of the capacity-shaped M-block count, and each group walks a
+    # contiguous run of M tiles read from num_valid_ids on-device. The launch
+    # config is then a constant, which is what makes it safe under CUDA graph
+    # capture -- there the real M is not knowable on the host.
+    _persistent = int(persist_m) <= 0
+    if _persistent:
+        from aiter.jit.utils.chip_info import get_cu_num
+
+        _cu_num = get_cu_num() * max(int(cu_num_mul), 1)
+    else:
+        _cu_num = 0
+    _pm_tag = f"_persistcu{_cu_num}" if _persistent else ""
     # IMPORTANT: include tiling in the module name to avoid accidentally reusing a compiled
     # binary for a different (tile_m, tile_n, tile_k) configuration.
     # See stage1 note: include ABI tag to prevent binary reuse across signature changes.
@@ -2876,7 +2891,7 @@ def compile_moe_gemm2(
         _gs_tag = f"_blk{scale_blk_n}x{scale_blk_k}"
     scale_tag = "_sbf16" if _scale_is_bf16 else ""
     (
-        f"mfma_moe2_{in_dtype}_{out_s}_{epilog_tag}"
+        f"mfma_moe2_{in_dtype}_{out_s}_{epilog_tag}{_pm_tag}"
         f"_t{tile_m}x{tile_n}x{tile_k}"
         f"{_gs_tag}{scale_tag}"
         f"_abi2"  # mask sentinel token ids on loads/stores to avoid illegal address faults
@@ -3017,7 +3032,11 @@ def compile_moe_gemm2(
             # - blockIdx.x -> N dimension (tile along model_dim)
             # - blockIdx.y -> expert-block id / M dimension (tile along sorted M)
             by = gpu.block_id("x")  # tile along model_dim
-            bx = gpu.block_id("y")  # tile along sorted M
+            # Non-persistent: grid.y *is* the M tile index. Persistent: it is
+            # this group's slot in the CU-sized pool, and bx comes from the loop.
+            _bxy = gpu.block_id("y")
+            if const_expr(not _persistent):
+                bx = _bxy
 
             # XOR16 swizzle parameter (in bytes; constant, power-of-two in our configs).
             k_blocks16 = arith.index(tile_k_bytes // 16)
@@ -3107,14 +3126,38 @@ def compile_moe_gemm2(
             # expert ids: [blocks] i32 -> bytes = size_expert_ids_in*4
             eid_nbytes_idx = size_expert_ids_in * fx.Index(4)
             expert_rsrc = _ptr_buffer_resource(arg_expert_ids, eid_nbytes_idx)
-            bx_m = bx * fx.Index(tile_m)
-
             # Early-exit guard (as in 2ce65fb): some routing paths can produce extra/garbage
             # expert blocks beyond `num_valid_ids`. Skip those blocks entirely to avoid OOB.
+            # Loaded before the persistent loop: it is also what bounds the loop.
             numids_rsrc = _ptr_buffer_resource(arg_num_valid_ids, fx.Index(4))
             num_valid_i32 = buffer_ops.buffer_load(
                 numids_rsrc, fx.Index(0), vec_width=1, dtype=T.i32
             )
+
+            if const_expr(_persistent):
+                # Deal the real M tiles over the pool, first `_rem` groups taking
+                # one extra. Runs are contiguous rather than strided so that tiles
+                # within a group tend to share an expert (and so its weight base).
+                # arith.constant, not fx.Index: these reach scf.ForOp and
+                # arith.select directly, which require MLIR Values.
+                _c0p = arith.constant(0, index=True)
+                _c1p = arith.constant(1, index=True)
+                _ctm_p = arith.constant(tile_m, index=True)
+                _ccu_p = arith.constant(_cu_num, index=True)
+                _nv_idx = arith.index_cast(T.index, num_valid_i32)
+                _total_tiles = (_nv_idx + _ctm_p - _c1p) // _ctm_p
+                _base_tiles = _total_tiles // _ccu_p
+                _rem_tiles = _total_tiles - (_base_tiles * _ccu_p)
+                _has_extra = arith.cmpi(arith.CmpIPredicate.ult, _bxy, _rem_tiles)
+                _per_blk = _base_tiles + arith.select(_has_extra, _c1p, _c0p)
+                _start_tail = arith.select(_has_extra, _bxy, _rem_tiles)
+                _start_tile = _bxy * _base_tiles + _start_tail
+                _for_persist = scf.ForOp(_c0p, _per_blk, _c1p, [])
+                _for_ip = ir.InsertionPoint(_for_persist.body)
+                _for_ip.__enter__()
+                bx = _start_tile + _for_persist.induction_variable
+
+            bx_m = bx * fx.Index(tile_m)
             bx_m_i32 = arith.index_cast(T.i32, bx_m)
             blk_valid = arith.cmpi(arith.CmpIPredicate.ult, bx_m_i32, num_valid_i32)
 
@@ -4535,9 +4578,20 @@ def compile_moe_gemm2(
                         store_pair=store_pair,
                     )
 
-            _if_blk = scf.IfOp(blk_valid)
-            with _if_then(_if_blk):
+            if const_expr(_persistent):
+                # No blk_valid guard: the trip count comes from num_valid_ids, so
+                # every bx here is in range. The IfOp would only add a region for
+                # the body's live ranges to cross.
                 _moe_gemm2_then_body()
+                # The X ping-pong and the CShuffle staging alias the same LDS,
+                # so the next tile's writes must not race this tile's reads.
+                gpu.barrier()
+                scf.YieldOp([])
+                _for_ip.__exit__(None, None, None)
+            else:
+                _if_blk = scf.IfOp(blk_valid)
+                with _if_then(_if_blk):
+                    _moe_gemm2_then_body()
 
     # ── Host launcher (flyc.jit + .launch) ────────────────────────────────
     @flyc.jit
@@ -4565,7 +4619,12 @@ def compile_moe_gemm2(
         n_in = arith.index_cast(T.index, i32_n_in)
         size_expert_ids_in = arith.index_cast(T.index, i32_size_expert_ids_in)
         gx = n_in // fx.Index(tile_n)
-        gy = size_expert_ids_in
+        # Constant under persistent scheduling -- see the note at `_persistent`.
+        gy = (
+            arith.constant(_cu_num, index=True)
+            if const_expr(_persistent)
+            else size_expert_ids_in
+        )
 
         _k2 = moe_gemm2(
             arg_out,
