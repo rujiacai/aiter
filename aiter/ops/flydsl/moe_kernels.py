@@ -132,12 +132,15 @@ def resolve_flydsl_gemm_grid_y(
     cap_grid_y = (cap_rows + tile_m - 1) // tile_m
 
     if max_m is None:
-        # Bound the padded rows first, then convert to tile_m blocks once:
-        # ``sorted_expert_ids`` and the dense estimate both count
-        # ``sort_block_m``-sized blocks, while grid.y counts ``tile_m``-sized
-        # ones, and tuned configs do use sort_block_m != tile_m (``_sbm32``).
-        dense_rows = min(int(token_num) * int(topk) * sort_block_m, cap_rows)
-        rows = min(dense_rows, int(sorted_expert_ids.shape[0]) * sort_block_m)
+        # One sorted row per (token, expert) pair, plus at most sbm-1 padding
+        # rows per local expert -- the same bound the max_m branch uses below.
+        # Do NOT multiply the pair count by sort_block_m: that over-counts by
+        # sbm and makes both terms clamp to capacity, i.e. no bound at all.
+        rows = min(
+            int(token_num) * int(topk) + max(int(num_experts), 1) * (sort_block_m - 1),
+            int(sorted_expert_ids.shape[0]) * sort_block_m,
+            cap_rows,
+        )
         return max(1, min((rows + tile_m - 1) // tile_m, cap_grid_y))
 
     max_m = max(int(max_m), 0)
