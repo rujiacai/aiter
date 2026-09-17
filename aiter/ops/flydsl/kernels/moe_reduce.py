@@ -312,9 +312,7 @@ def moe_reduction_sorted_kernel(
         return fx.rocdl.make_buffer_tensor(view, num_records_bytes=fx.Int64(nbytes))
 
     x_row_bytes = model_dim * in_bytes
-    x_nbytes = max_sorted_rows * x_row_bytes
     xbase = fx.Int64(ptrtoint(X))
-    xbuf = _view(in_elem, xbase, model_dim, x_nbytes)
     ybuf = _view(
         out_numeric,
         fx.Int64(ptrtoint(Y)) + tok64 * fx.Int64(model_dim * out_bytes),
@@ -350,9 +348,6 @@ def moe_reduction_sorted_kernel(
     thr_store = fx.make_tiled_copy(store_atom, tv_layout, tile_mn).get_slice(tid)
 
     def _reduce_tile():
-        p_src = thr_load.partition_S(
-            fx.slice(fx.zipped_divide(xbuf, tile_mn), (None, (0, tile)))
-        )
         p_dst = thr_store.partition_D(
             fx.slice(fx.zipped_divide(ybuf, tile_mn), (None, (0, tile)))
         )
@@ -362,8 +357,26 @@ def moe_reduction_sorted_kernel(
             sr_ok = sr >= fx.Int32(0)
             if const_expr(use_mask):
                 sr_ok = sr_ok & (em_ptr[tk_ptr[k]] != fx.Int32(0))
+            # Re-base onto the row in 64-bit, the same way ybuf does, instead of
+            # reaching it with a 32-bit soffset from one descriptor spanning the
+            # whole partial buffer. That buffer is max_sorted_rows*model_dim
+            # elements -- 4.4 GiB for a 262k-token chunk at model_dim=6144 -- so
+            # `sr * model_dim` overflows i32 past sorted row 2**31/model_dim, and
+            # the byte count does not fit the 32-bit num_records field either.
+            # An invalid slot is zeroed by the sr_ok mask below, so folding it to
+            # row 0 keeps the load in bounds without changing the result.
+            sr_safe = sr_ok.select(sr, fx.Int32(0))
+            xbuf = _view(
+                in_elem,
+                xbase + fx.Int64(sr_safe) * fx.Int64(x_row_bytes),
+                model_dim,
+                x_row_bytes,
+            )
+            p_src = thr_load.partition_S(
+                fx.slice(fx.zipped_divide(xbuf, tile_mn), (None, (0, tile)))
+            )
             frag = fx.make_fragment_like(p_src)
-            fx.copy(load_atom, p_src, frag, soffset=sr * fx.Int32(model_dim))
+            fx.copy(load_atom, p_src, frag)
             vk = fx.Vector(fx.memref_load_vec(frag))
             vk = vk.extf(vec_f32) if is_16b else vk
             if const_expr(use_weight):

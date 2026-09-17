@@ -2833,6 +2833,15 @@ def compile_moe_gemm2(
             raise ValueError(
                 f"out_dtype='bf16' requires bf16 global atomics ({bf16_global_atomics_arch_description()}), got arch={gpu_arch!r}"
             )
+    # The global-atomic epilogue folds the half2 alignment mask into the column
+    # term alone, which is only equivalent to masking the flat element index when
+    # a row start is itself even. Every shape we build has model_dim % 128 == 0,
+    # so this only guards against a future caller.
+    if _needs_global_atomic_bf16 and accumulate and model_dim % 2 != 0:
+        raise ValueError(
+            "out_dtype='bf16' with accumulate=True needs an even model_dim for the "
+            f"half2 global atomics, got model_dim={model_dim}"
+        )
 
     if out_is_f32:
         # Match origin/dev_a16w4: f32 output uses scalar atomics and does NOT use the CShuffle epilogue.
@@ -4283,6 +4292,17 @@ def compile_moe_gemm2(
                 mask_even_i32 = fx.Int32(
                     0xFFFFFFFE
                 )  # align element index to even for half2 atomics
+                # Two epilogues address `out` by hand in 64-bit (see store_pair):
+                #   - reduce mode (accumulate=False), whose partial buffer is
+                #     sorted_rows*model_dim elements, and
+                #   - gfx942 bf16 atomics, which have no buffer_atomic_pk_add_bf16.
+                # f16 / gfx950+ atomics keep the cheaper i32 buffer voffset: there
+                # `out` is [tokens, model_dim] and the host already routes anything
+                # past 4 GiB to reduce mode (requires_flydsl_stage2_reduce).
+                _wide_out_addr = (not bool(accumulate)) or _needs_global_atomic_bf16
+                if const_expr(_wide_out_addr):
+                    model_idx_v = fx.Index(model_dim)
+                    out_elem_bytes_idx = fx.Index(2)
 
                 e_vec = _e_vec
 
@@ -4413,10 +4433,11 @@ def compile_moe_gemm2(
                             "FLYDSL_MOE_STAGE2_CSHUFFLE=1 but lds_out is not allocated/aliased."
                         )
 
-                    # For bf16 global atomics (gfx942 only), precompute the output base address.
-                    # gfx950+ has buffer_atomic_pk_add_bf16, so bf16 uses buffer atomics there.
+                    # Base address for the epilogues that address `out` by hand in
+                    # 64-bit, i.e. reduce mode and gfx942 bf16 atomics. f16 and
+                    # gfx950+ bf16 atomics go through out_rsrc instead.
                     out_base_idx = None
-                    if const_expr(_needs_global_atomic_bf16):
+                    if const_expr(_wide_out_addr):
                         out_base_idx = arith.index_cast(T.index, fx.ptrtoint(arg_out))
 
                     def write_row_to_lds(
@@ -4504,55 +4525,84 @@ def compile_moe_gemm2(
                         row_valid = row_valid0 & t_ok & s_ok
                         return (fused2, row_valid)
 
+                    def out_ptr_wide(row_wide, col_i32):
+                        """64-bit address of the (row_wide, col) slot in `out`.
+
+                        model_dim is even (enforced in compile_moe_gemm2), so
+                        folding the half2 alignment mask into the column term
+                        alone is the same as masking the flat element index.
+                        """
+                        col_even_wide = arith.index_cast(
+                            T.index, col_i32 & mask_even_i32
+                        )
+                        byte_off_idx = (
+                            row_wide * model_idx_v + col_even_wide
+                        ) * out_elem_bytes_idx
+                        out_ptr = buffer_ops.create_llvm_ptr(
+                            out_base_idx + byte_off_idx, address_space=1
+                        )
+                        return (
+                            out_ptr._value
+                            if const_expr(hasattr(out_ptr, "_value"))
+                            else out_ptr
+                        )
+
                     def store_pair(*, row_local, row, row_ctx, col_pair0, col_g0, frag):
                         if const_expr(_sorted_partial):
                             row_i32 = row_ctx
                             idx0 = row_i32 * model_i32
+                            if const_expr(_wide_out_addr):
+                                row_wide = arith.index_cast(T.index, row_i32)
                         else:
                             fused = row_ctx
                             t = fused & mask24_i32
                             s = fused >> 24
                             idx0 = t * model_i32
+                            if const_expr(_wide_out_addr):
+                                row_wide = arith.index_cast(T.index, t)
                             if const_expr(not bool(accumulate)):
                                 ts = t * topk_i32_v + s
                                 idx0 = ts * model_i32
+                                if const_expr(_wide_out_addr):
+                                    row_wide = arith.index_cast(T.index, ts)
                         col_i32 = arith.index_cast(T.i32, col_g0)
                         idx_elem = idx0 + col_i32
                         idx_elem_even = idx_elem & mask_even_i32
-                        if const_expr(_needs_global_atomic_bf16):
-                            # gfx942: no buffer_atomic_pk_add_bf16, use global atomicrmw fadd
-                            if const_expr(bool(accumulate)):
-                                byte_off = idx_elem_even * c2_i32
-                                byte_off_idx = arith.index_cast(T.index, byte_off)
-                                ptr_addr_idx = out_base_idx + byte_off_idx
-                                out_ptr = buffer_ops.create_llvm_ptr(
-                                    ptr_addr_idx, address_space=1
-                                )
-                                out_ptr_v = (
-                                    out_ptr._value
-                                    if const_expr(hasattr(out_ptr, "_value"))
-                                    else out_ptr
-                                )
-                                frag_v = (
-                                    frag._value if hasattr(frag, "_value") else frag
-                                )
-                                llvm.AtomicRMWOp(
-                                    llvm.AtomicBinOp.fadd,
-                                    out_ptr_v,
-                                    frag_v,
-                                    llvm.AtomicOrdering.monotonic,
-                                    syncscope="agent",
-                                    alignment=4,
-                                )
-                            else:
-                                buffer_ops.buffer_store(frag, out_rsrc, idx_elem_even)
+                        frag_v = frag._value if hasattr(frag, "_value") else frag
+                        if const_expr(not bool(accumulate)):
+                            # Reduce mode writes one row per (token, slot), so a plain
+                            # store is enough -- the topk sum is a separate kernel.
+                            #
+                            # It cannot go through a buffer resource though: the target
+                            # is sorted_rows*model_dim elements (360512 x 6144 bf16 =
+                            # 4.4 GiB on a long prefill chunk), which overflows both the
+                            # i32 element offset buffer_store takes and the 32-bit
+                            # num_records field of the descriptor. The latter is the
+                            # nastier one -- it truncates, and the hardware bound check
+                            # then drops every store past the truncated size silently.
+                            llvm.StoreOp(
+                                frag_v,
+                                out_ptr_wide(row_wide, col_i32),
+                                alignment=e_vec * 2,
+                            )
+                        elif const_expr(_needs_global_atomic_bf16):
+                            # gfx942: no buffer_atomic_pk_add_bf16, use global atomicrmw
+                            # fadd. `out` is [tokens, model_dim] = tokens*model_dim*2
+                            # bytes and passes 2 GiB on a long prefill chunk (262144 x
+                            # 6144 bf16 = 3 GiB). An i32 byte offset wraps negative past
+                            # INT32_MAX and the sign-extension into the 64-bit address
+                            # would then put the atomic ~2 GiB *below* arg_out.
+                            llvm.AtomicRMWOp(
+                                llvm.AtomicBinOp.fadd,
+                                out_ptr_wide(row_wide, col_i32),
+                                frag_v,
+                                llvm.AtomicOrdering.monotonic,
+                                syncscope="agent",
+                                alignment=4,
+                            )
                         else:
-                            # f16, or bf16 on gfx950+ (has buffer_atomic_pk_add_bf16)
-                            byte_off = idx_elem_even * c2_i32
-                            if const_expr(bool(accumulate)):
-                                atomic_add_f16x2(frag, byte_off)
-                            else:
-                                buffer_ops.buffer_store(frag, out_rsrc, idx_elem_even)
+                            # f16, or bf16 on gfx950+ (has buffer_atomic_pk_add_bf16).
+                            atomic_add_f16x2(frag, idx_elem_even * c2_i32)
 
                     c_shuffle_epilog(
                         arith=arith,
