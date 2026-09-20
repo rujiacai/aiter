@@ -242,6 +242,9 @@ def _precompile_to_cache(
     # swiglu_limit is only used to fill the kernel argument here.
     swiglu_limit: float | None = None,
     enable_smooth_scale: bool = False,
+    # Also blockwise-fp8 only, and also baked in: past 4 GiB stage1 has to reach
+    # `out` through a raw 64-bit pointer instead of a buffer descriptor.
+    wide_out_addr: bool = False,
     # Stage2-only kernel tuning knobs (registered by the production-variant
     # entries in `get_flydsl_stage2_kernels`). Forwarded into
     # `compile_flydsl_moe_stage2` for stage 2 AOT compilation.
@@ -671,7 +674,15 @@ def _precompile_to_cache(
                 # smooth_scale is a compile-time constant for the blockwise family
                 # (the clamp is not -- it rides in as a kernel argument), so the
                 # AOT artifact only matches a runtime asking for the same setting.
-                **({"enable_smooth_scale": enable_smooth_scale} if is_blockscale else {}),
+                # wide_out_addr is baked in the same way.
+                **(
+                    {
+                        "enable_smooth_scale": enable_smooth_scale,
+                        "wide_out_addr": wide_out_addr,
+                    }
+                    if is_blockscale
+                    else {}
+                ),
             )
             _run_compiled(exe, args)
 

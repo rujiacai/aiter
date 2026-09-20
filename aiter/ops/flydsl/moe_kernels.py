@@ -166,6 +166,20 @@ def requires_flydsl_stage2_reduce(
     return int(token_num) * int(model_dim) * int(element_size) > 0xFFFFFFFF
 
 
+def requires_flydsl_stage1_wide_out(numel: int, element_size: int) -> bool:
+    """Whether stage1 has to address `out` in 64-bit instead of via a descriptor.
+
+    Two independent 32-bit fields cap the buffer path: the i32 element offset
+    ``buffer_store`` takes, and NUM_RECORDS in the buffer resource. Both wrap
+    silently, and the hardware bound check then drops every store past the
+    truncated size -- the kernel returns zeros and never faults. The
+    ``[tokens, topk, inter_dim]`` intermediate reaches that at 131072 rows for
+    topk 8 / inter 2048 / bf16, i.e. one GLM-5.3 EP8 prefill step.
+    """
+    numel = int(numel)
+    return numel > 0x7FFFFFFF or numel * int(element_size) > 0xFFFFFFFF
+
+
 def resolve_flydsl_stage2_tile_k(inter_dim: int, tile_k: int) -> int:
     """Return a ``tile_k`` that divides ``inter_dim``, preferring the caller value.
 
@@ -764,6 +778,9 @@ def compile_flydsl_moe_stage1(
     # Blockwise-fp8 only: fold a per-(expert, inter_dim) f32 factor into the stage1
     # activation (the fc2_smooth_scale / smoothquant convention).
     enable_smooth_scale: bool = False,
+    # Blockwise-fp8 only: reach `out` through a raw 64-bit pointer once it grows
+    # past what one buffer descriptor can address (requires_flydsl_stage1_wide_out).
+    wide_out_addr: bool = False,
 ):
     """Compile stage1 kernel (cached via underlying lru_cache)."""
     # a16w-mix (bf16 A x {fp4 mxfp4, int4} W): build the ported gemm1
@@ -851,6 +868,7 @@ def compile_flydsl_moe_stage1(
             k_batch=k_batch,
             enable_smooth_scale=enable_smooth_scale,
             b_nt=b_nt,
+            wide_out_addr=wide_out_addr,
         )
     else:
         raise ValueError(
@@ -2092,6 +2110,14 @@ def _flydsl_moe_stage1_impl(
         # clamp -- clamp(u)*s != clamp(u*s).
         compile_kwargs["enable_smooth_scale"] = (
             smooth_scale is not None and not _is_splitk
+        )
+        # Split-K already addresses `out` in 64-bit (it atomically accumulates),
+        # so only the plain epilogues need switching, and only once the shape
+        # asks for it -- decode keeps the cheaper buffer path byte-identical.
+        compile_kwargs["wide_out_addr"] = not _is_splitk and (
+            requires_flydsl_stage1_wide_out(
+                _kernel_out.numel(), _kernel_out.element_size()
+            )
         )
     elif smooth_scale is not None:
         raise NotImplementedError(

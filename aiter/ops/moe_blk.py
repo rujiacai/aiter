@@ -111,6 +111,34 @@ def tiles_for(token: int, model_dim: int, inter_dim: int, expert: int, topk: int
     return hit if hit else _heuristic_tiles(token, inter_dim)
 
 
+# A buffer resource holds NUM_RECORDS in 32 bits, so one descriptor cannot span
+# 4 GiB, and the element offset buffer_store takes is i32 on top of that. Stage1
+# reaches its whole [tokens, topk, inter_dim] output through one descriptor, so
+# past that both fields wrap and the hardware drops every store: zeros, no
+# fault. The kernel has a 64-bit-addressing variant (wide_out_addr) for exactly
+# this, and it is a separate binary because the choice is made at compile time.
+_BUFFER_NUM_RECORDS_LIMIT = 1 << 32
+
+
+def stage1_wide_out(numel: int, element_size: int) -> bool:
+    """Whether a stage1 output of this size has to be addressed in 64-bit."""
+    numel = int(numel)
+    return numel > 0x7FFFFFFF or numel * int(element_size) > 0xFFFFFFFF
+
+
+def stage1_wide_out_rows(topk: int, inter_dim: int, element_size: int = 2) -> int:
+    """Smallest token count whose stage1 output needs the 64-bit variant.
+
+    hsa/flydsl_export.py exports the wide variant for the tiles this row count
+    resolves to, so the exported set and the runtime request cannot disagree.
+    """
+    per_row = int(topk) * int(inter_dim)
+    return min(
+        0x7FFFFFFF // per_row,
+        0xFFFFFFFF // (per_row * int(element_size)),
+    ) + 1
+
+
 def co_name(
     stage: int,
     model_dim: int,
@@ -123,13 +151,15 @@ def co_name(
     waves_per_eu: int,
     out_dtype: str = "bf16",
     smooth_scale: bool = False,
+    wide_out: bool = False,
 ) -> str:
     smooth = "_smooth" if smooth_scale else ""
+    wide = "_wide" if wide_out else ""
     return (
         f"moe_blk_stage{stage}_{out_dtype}"
         f"_d{model_dim}x{inter_dim}_e{expert}k{topk}"
         f"_t{tile_m}x{tile_n}x{tile_k}"
-        f"_w{waves_per_eu}{smooth}.co"
+        f"_w{waves_per_eu}{smooth}{wide}.co"
     )
 
 
@@ -178,6 +208,7 @@ def moe_blk_stage1_fwd(
         co_name(
             1, model_dim, inter_dim, E, topk, tile_m, tile_n, tile_k,
             waves_per_eu, out_dtype, smooth_scale is not None,
+            stage1_wide_out(out.numel(), out.element_size()),
         ),  # fmt: skip
     )
     return out

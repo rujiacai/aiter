@@ -169,6 +169,7 @@ def compile_moe_gemm1(
     scale_blk_k: int = 128,
     enable_smooth_scale: bool = False,
     b_nt: int = 0,
+    wide_out_addr: bool = False,
 ):
     """Compile stage1 kernel (`moe_gemm1`) and return the compiled executable.
 
@@ -198,6 +199,16 @@ def compile_moe_gemm1(
       ``fc2_smooth_scale`` convention already used by torch_moe / the asm kernels
       (smoothquant pre-scaling of the down-projection input). Compile-time so the
       pointer and the extra multiply disappear entirely when unused.
+    wide_out_addr: address ``out`` through a raw 64-bit pointer instead of the
+      buffer descriptor. Two independent 32-bit fields cap the descriptor path at
+      4 GiB of output: NUM_RECORDS in the resource, and the i32 element offset
+      ``buffer_store`` takes. Both wrap silently -- the hardware bound check then
+      drops every store past the truncated size, so the kernel returns zeros
+      without faulting. ``[tokens, topk, inter_dim]`` reaches 4 GiB at 131072
+      rows for topk 8 / inter 2048 / bf16, which is one GLM-5.3 EP8 prefill step,
+      so prefill needs this on. It costs an extra address register pair per store
+      and loses the hardware bound check (the epilogue already predicates on the
+      sentinel token id), hence compile-time: decode keeps the buffer path.
     """
 
     gpu_arch = get_hip_arch()
@@ -2030,6 +2041,18 @@ def compile_moe_gemm1(
                 # Uses EVec=4 (buffer store "x4" of fp16 elements).
                 use_cshuffle_epilog_flag = _use_cshuffle_epilog
 
+                # Base address for the epilogues that address `out` by hand in
+                # 64-bit: split-K always does (it atomically accumulates), and
+                # wide_out_addr makes the plain epilogues do it once `out` grows
+                # past what a buffer descriptor can reach.
+                out_base_idx = None
+                if const_expr(_is_splitk or wide_out_addr):
+                    out_base_idx = arith.index_cast(T.index, fx.ptrtoint(arg_out))
+                # Bytes between consecutive (token, slot) rows of the plain
+                # `[tokens, topk, inter_dim]` output. Split-K keeps its own stride
+                # below: its rows hold gate and up side by side.
+                _out_row_stride_bytes = inter_dim * out_elem_bytes
+
                 # ─── Split-K epilogue: two-pass gate/up with atomic fadd ───
                 # bf16 split-K uses bf16 atomics; other dtypes use f32 atomics.
                 if const_expr(_is_splitk):
@@ -2045,7 +2068,6 @@ def compile_moe_gemm1(
                         _splitk_use_bf16 and not _has_buffer_atomic_bf16_s1
                     )
 
-                    out_base_idx = arith.index_cast(T.index, fx.ptrtoint(arg_out))
                     _split_k_out_row_stride = (
                         inter_dim * 2 * out_elem_bytes
                     )  # bytes per row
@@ -2382,6 +2404,14 @@ def compile_moe_gemm1(
                         )
                         t2 = fused2 & mask24_i32
                         s2 = fused2 >> 24
+                        if const_expr(wide_out_addr):
+                            # Absolute byte address of the row, built in 64-bit.
+                            ts_idx = arith.index_cast(
+                                T.index, t2
+                            ) * arith.index(topk) + arith.index_cast(T.index, s2)
+                            return out_base_idx + ts_idx * arith.index(
+                                _out_row_stride_bytes
+                            )
                         return (t2 * topk_i32_v + s2) * inter_i32_local
 
                     def store_pair(*, row_local, row, row_ctx, col_pair0, col_g0, frag):
@@ -2394,11 +2424,27 @@ def compile_moe_gemm1(
                         t_valid = arith.cmpi(arith.CmpIPredicate.ult, t2, tokens_i32_v)
                         _if_valid = scf.IfOp(t_valid)
                         with _if_then(_if_valid):
-                            idx0 = row_ctx
-                            col_i32 = arith.index_cast(T.i32, col_g0)
-                            idx_out = idx0 + col_i32
-                            # Vectorized fp16 store (EVec=4).
-                            buffer_ops.buffer_store(frag, out_rsrc, idx_out)
+                            if const_expr(wide_out_addr):
+                                # `row_ctx` is already the row's byte address.
+                                out_ptr = buffer_ops.create_llvm_ptr(
+                                    row_ctx + col_g0 * arith.index(out_elem_bytes),
+                                    address_space=1,
+                                )
+                                llvm.StoreOp(
+                                    frag._value if hasattr(frag, "_value") else frag,
+                                    (
+                                        out_ptr._value
+                                        if hasattr(out_ptr, "_value")
+                                        else out_ptr
+                                    ),
+                                    alignment=4 * out_elem_bytes,
+                                )
+                            else:
+                                idx0 = row_ctx
+                                col_i32 = arith.index_cast(T.i32, col_g0)
+                                idx_out = idx0 + col_i32
+                                # Vectorized fp16 store (EVec=4).
+                                buffer_ops.buffer_store(frag, out_rsrc, idx_out)
 
                     mfma_epilog(
                         use_cshuffle=True,
@@ -2470,6 +2516,14 @@ def compile_moe_gemm1(
 
                     # out linear index base = ((t*topk + s)*inter_dim) (invariant across ni)
                     idx0 = (t2 * topk_i32_v + s2) * inter_i32_local
+                    if const_expr(wide_out_addr):
+                        # Same base, as an absolute byte address in 64-bit.
+                        ts_idx = arith.index_cast(T.index, t2) * arith.index(
+                            topk
+                        ) + arith.index_cast(T.index, s2)
+                        row_byte_base = out_base_idx + ts_idx * arith.index(
+                            _out_row_stride_bytes
+                        )
 
                     # Sorted weight aligned with `row` (matches aiter moe_sorting output).
                     if const_expr(doweight_stage1):
@@ -2507,8 +2561,25 @@ def compile_moe_gemm1(
                             if const_expr(doweight_stage1):
                                 y = y * tw
                             y = arith.trunc_f(out_mlir(), y)
-                            idx_out0 = idx0 + col_i32
-                            buffer_ops.buffer_store(y, out_rsrc, idx_out0)
+                            if const_expr(wide_out_addr):
+                                out_ptr = buffer_ops.create_llvm_ptr(
+                                    row_byte_base
+                                    + arith.index_cast(T.index, col_i32)
+                                    * arith.index(out_elem_bytes),
+                                    address_space=1,
+                                )
+                                llvm.StoreOp(
+                                    y._value if hasattr(y, "_value") else y,
+                                    (
+                                        out_ptr._value
+                                        if hasattr(out_ptr, "_value")
+                                        else out_ptr
+                                    ),
+                                    alignment=out_elem_bytes,
+                                )
+                            else:
+                                idx_out0 = idx0 + col_i32
+                                buffer_ops.buffer_store(y, out_rsrc, idx_out0)
 
                 mfma_epilog(
                     use_cshuffle=False,

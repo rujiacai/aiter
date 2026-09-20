@@ -58,6 +58,7 @@ DEFAULT_TOKEN_BUCKETS = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 2048]
 MANIFEST_FIELDS = [
     "stage", "model_dim", "inter_dim", "expert", "topk",
     "tile_m", "tile_n", "tile_k", "waves_per_eu", "out_dtype", "smooth_scale",
+    "wide_out",
     "arch", "co_name", "kernel_name",
     "kernarg_size", "lds_bytes", "workgroup_size", "vgpr_count", "sgpr_count",
 ]  # fmt: skip
@@ -149,6 +150,7 @@ def compile_config(stage: int, cfg: dict, seen: set[pathlib.Path]) -> dict:
             waves_per_eu=cfg["waves_per_eu"],
             swiglu_limit=cfg.get("swiglu_limit"),
             enable_smooth_scale=bool(cfg["smooth_scale"]),
+            wide_out_addr=bool(cfg["wide_out"]),
         )
 
     new = [p for p in pathlib.Path(_TMP_CACHE).rglob("*.pkl") if p not in seen]
@@ -175,6 +177,7 @@ def co_filename(stage: int, cfg: dict) -> str:
         cfg["waves_per_eu"],
         cfg["out_dtype"],
         bool(cfg["smooth_scale"]),
+        bool(cfg["wide_out"]),
     )
 
 
@@ -185,29 +188,42 @@ def build_specs(args) -> list[tuple[int, dict]]:
     token so the exported set is exactly what can be requested. Distinct tokens
     that resolve to the same tile collapse into one binary.
     """
-    from aiter.ops.moe_blk import tiles_for
+    from aiter.ops.moe_blk import stage1_wide_out_rows, tiles_for
 
     shapes = args.shape or DEFAULT_SHAPES
     seen, specs = set(), []
+
+    def add(stage, md, idim, e, k, tile, smooth, wide):
+        tm, tn, tk, w = tile
+        cfg = {
+            "model_dim": md, "inter_dim": idim, "expert": e, "topk": k,
+            "tile_m": tm, "tile_n": tn, "tile_k": tk,
+            "waves_per_eu": args.waves if args.waves is not None else w,
+            "out_dtype": args.out_dtype, "smooth_scale": int(smooth),
+            "wide_out": int(wide),
+        }  # fmt: skip
+        key = (stage, *cfg.values())
+        if key in seen:
+            return
+        seen.add(key)
+        specs.append((stage, cfg))
+
     for (md, idim, e, k), token in itertools.product(shapes, args.token_bucket):
-        for stage, (tm, tn, tk, w) in enumerate(
-            tiles_for(token, md, idim, e, k), start=1
-        ):
+        for stage, tile in enumerate(tiles_for(token, md, idim, e, k), start=1):
             for smooth in args.smooth:
                 # stage2 has no activation, so smooth_scale is stage1-only.
                 if stage == 2 and smooth:
                     continue
-                cfg = {
-                    "model_dim": md, "inter_dim": idim, "expert": e, "topk": k,
-                    "tile_m": tm, "tile_n": tn, "tile_k": tk,
-                    "waves_per_eu": args.waves if args.waves is not None else w,
-                    "out_dtype": args.out_dtype, "smooth_scale": int(smooth),
-                }  # fmt: skip
-                key = (stage, *cfg.values())
-                if key in seen:
-                    continue
-                seen.add(key)
-                specs.append((stage, cfg))
+                add(stage, md, idim, e, k, tile, smooth, wide=False)
+
+    # Prefill overflows the 32-bit fields stage1 addresses `out` through, and the
+    # 64-bit variant that handles it is a separate binary. Export it only for the
+    # tiles that region resolves to -- one row count per shape is enough, since
+    # everything above the threshold shares a tile.
+    for md, idim, e, k in shapes:
+        tile = tiles_for(stage1_wide_out_rows(k, idim), md, idim, e, k)[0]
+        for smooth in args.smooth:
+            add(1, md, idim, e, k, tile, smooth, wide=True)
     return specs
 
 
