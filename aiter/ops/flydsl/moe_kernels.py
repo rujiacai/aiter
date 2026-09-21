@@ -180,6 +180,23 @@ def requires_flydsl_stage1_wide_out(numel: int, element_size: int) -> bool:
     return numel > 0x7FFFFFFF or numel * int(element_size) > 0xFFFFFFFF
 
 
+def requires_flydsl_stage2_wide_a(numel: int, element_size: int) -> bool:
+    """Whether stage2 has to read A2 in 64-bit instead of via a descriptor.
+
+    Same 32-bit NUM_RECORDS ceiling as stage1, one doubling further out: A2
+    holds the same ``tokens * topk * inter_dim`` element count but as fp8, so it
+    reaches 4 GiB at 262144 rows for topk 8 / inter 2048 where stage1's bf16
+    output already did at 131072. That is GLM-5.3 EP16 prefill (16384 tokens x
+    DP16), which is why EP8 never showed it. An out-of-range buffer load returns
+    zero instead of faulting, so stage2 silently computes on an all-zero A2.
+
+    Only the byte size matters here, unlike stage1: these loads index A2 in
+    dwords, so the offset itself has four times the headroom the element index
+    on the stage1 store had.
+    """
+    return int(numel) * int(element_size) > 0xFFFFFFFF
+
+
 def resolve_flydsl_stage2_tile_k(inter_dim: int, tile_k: int) -> int:
     """Return a ``tile_k`` that divides ``inter_dim``, preferring the caller value.
 
@@ -899,6 +916,9 @@ def compile_flydsl_moe_stage2(
     inter_dim_pad: int = 0,
     xcd_swizzle: int = 0,
     enable_bias: bool = False,
+    # Blockwise-fp8 only: read A2 through a raw 64-bit pointer once it grows past
+    # what one buffer descriptor can reach (requires_flydsl_stage2_wide_a).
+    wide_a_addr: bool = False,
 ):
     """Compile stage2 kernel (cached via underlying lru_cache)."""
     # a16w-mix (bf16 A x {fp4 mxfp4, int4} W) down-proj: build the ported gemm2
@@ -976,6 +996,7 @@ def compile_flydsl_moe_stage2(
             b_nt=b_nt,
             persist_m=persist_m,
             cu_num_mul=cu_num_mul,
+            wide_a_addr=wide_a_addr,
         )
     else:
         raise ValueError(
@@ -2670,6 +2691,14 @@ def _flydsl_moe_stage2_impl(
             m_blocks,
         )
 
+    _s2_extra = {}
+    if b_dtype in ("fp8blk", "fp8row"):
+        # Same expression the kernel builds its A2 descriptor from, so host and
+        # kernel cannot disagree about when it stops fitting in one.
+        _s2_extra["wide_a_addr"] = requires_flydsl_stage2_wide_a(
+            token_num * topk * _k_in, inter_states.element_size()
+        )
+
     exe = _compile_kernel(
         model_dim=model_dim,
         inter_dim=inter_dim,
@@ -2693,6 +2722,7 @@ def _flydsl_moe_stage2_impl(
         inter_dim_pad=inter_dim_pad,
         xcd_swizzle=xcd_swizzle,
         enable_bias=(bias is not None),
+        **_s2_extra,
     )
     _run_compiled(exe, args)
 

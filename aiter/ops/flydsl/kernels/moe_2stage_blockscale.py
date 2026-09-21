@@ -2676,6 +2676,7 @@ def compile_moe_gemm2(
     b_nt: int = 0,
     persist_m: int = 1,
     cu_num_mul: int = 1,
+    wide_a_addr: bool = False,
 ):
     """Compile stage2 kernel (`moe_gemm2`) and return the compiled executable.
 
@@ -2691,6 +2692,16 @@ def compile_moe_gemm2(
       - "int4": W4A8 path: A2 is int8, W is packed int4 unpacked to int8 in-kernel
       - "int4_bf16": W4A16 path: A2 is bf16, W is packed int4 unpacked to bf16 in-kernel
     scale_is_bf16: When True, groupwise scales are bf16 (halves scale bandwidth).
+    wide_a_addr: read A2 through a raw 64-bit pointer instead of the buffer
+      descriptor. The descriptor spans all of A2, and NUM_RECORDS is 32-bit, so
+      at 4 GiB it wraps and the hardware reports every load out of range --
+      which returns zeros rather than faulting, so stage2 quietly computes on an
+      all-zero activation. ``[tokens, topk, inter_dim]`` fp8 reaches that at
+      262144 rows for topk 8 / inter 2048, i.e. GLM-5.3 EP16 prefill (16384
+      tokens x DP16). Note stage1 hits its own 4 GiB one doubling earlier, at
+      131072 rows, because it writes the same element count as bf16 (see
+      wide_out_addr in compile_moe_gemm1). Compile-time so decode keeps the
+      buffer path, which is both cheaper and hardware-bounds-checked.
 
     Stage2 output supports:
       - out_dtype="f16": fp16 half2 atomics (fast, can overflow to +/-inf for bf16 workloads)
@@ -3164,6 +3175,12 @@ def compile_moe_gemm2(
             # X(A2): [tokens*topk, inter_dim] bytes = tokens*topk*k*elem_bytes
             x_nbytes_idx = (tokens_in * c_topk) * k_in * arith.index(int(elem_bytes))
             x_rsrc = _ptr_buffer_resource(arg_x, x_nbytes_idx)
+            # Once A2 reaches 4 GiB the descriptor above stops describing it --
+            # NUM_RECORDS is 32-bit and wraps -- so the loads take a raw pointer
+            # instead. The row term of their offset is already 64-bit.
+            x_base_idx = None
+            if const_expr(wide_a_addr):
+                x_base_idx = arith.index_cast(T.index, fx.ptrtoint(arg_x))
 
             w_rsrc = _ptr_buffer_resource(arg_w, w_nbytes)
 
@@ -3300,6 +3317,29 @@ def compile_moe_gemm2(
 
                 vec4_x = T.vec(4, x_elem)
 
+                def load_x_wide(addr_idx):
+                    """Load A2 through a raw 64-bit pointer.
+
+                    Takes an absolute byte address, not the dword index the
+                    buffer path uses: scaling that sum by 4 would put the
+                    multiply in 32-bit arithmetic, which wraps at exactly the
+                    4 GiB this path exists to get past. The caller keeps the x4
+                    on the row base, which is already 64-bit.
+                    """
+                    _x_ptr = buffer_ops.create_llvm_ptr(addr_idx, address_space=1)
+                    _x_ptr_v = _x_ptr._value if hasattr(_x_ptr, "_value") else _x_ptr
+                    # Load as dwords: an fp8 vector is not an LLVM-compatible
+                    # vector type, and the callers bitcast to i32 anyway.
+                    if const_expr(x_load_bytes == 16):
+                        return llvm.LoadOp(
+                            T.vec(4, T.i32), _x_ptr_v, alignment=16
+                        ).result
+                    if const_expr(x_load_bytes == 8):
+                        return llvm.LoadOp(
+                            T.vec(2, T.i32), _x_ptr_v, alignment=8
+                        ).result
+                    return llvm.LoadOp(T.vec(1, T.i32), _x_ptr_v, alignment=4).result
+
                 def load_x(idx_i32):
                     if const_expr(x_load_bytes == 16):
                         idx_elem = (
@@ -3324,8 +3364,10 @@ def compile_moe_gemm2(
 
                 # decode routed token once (per thread's M-slice) and build a base offset.
                 x_row_base_div4 = []
+                x_row_base_addr = []
                 x_col_local_i32 = []
                 x_row_local = []
+                c_k_row_bytes = k_in * arith.index(int(elem_bytes))
                 for i in range_constexpr(num_x_loads):
                     row_local, col_local_i32 = x_tile_chunk_coord_i32(i)
                     x_row_local.append(row_local)
@@ -3348,13 +3390,27 @@ def compile_moe_gemm2(
                     row_ts_idx = arith.index_cast(T.index, row_ts_i32)
                     # Base row offset in dword units: row_ts_idx * (k_in/4)
                     x_row_base_div4.append(row_ts_idx * c_k_div4)
+                    if const_expr(wide_a_addr):
+                        # Absolute byte address of the row. Keeping the element
+                        # scaling here, on a 64-bit value, is what keeps the
+                        # address from wrapping past 4 GiB.
+                        x_row_base_addr.append(x_base_idx + row_ts_idx * c_k_row_bytes)
 
                 def load_x_tile(base_k):
                     base_k_div4 = (base_k * arith.index(int(elem_bytes))) // fx.Index(4)
                     parts = []
                     for i in range_constexpr(num_x_loads):
-                        idx_i32 = x_row_base_div4[i] + base_k_div4 + x_col_local_i32[i]
-                        x_vec = load_x(idx_i32)
+                        if const_expr(wide_a_addr):
+                            # Only the in-row term rides the dword->byte x4, and
+                            # it is bounded by k_in, so 32-bit covers it.
+                            x_vec = load_x_wide(
+                                x_row_base_addr[i]
+                                + (base_k_div4 + x_col_local_i32[i]) * fx.Index(4)
+                            )
+                        else:
+                            x_vec = load_x(
+                                x_row_base_div4[i] + base_k_div4 + x_col_local_i32[i]
+                            )
                         if const_expr(x_load_bytes == 16):
                             parts.append(vector.bitcast(T.i32x4, x_vec))
                         elif const_expr(x_load_bytes == 8):
