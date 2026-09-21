@@ -160,10 +160,26 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
         std::is_same_v<DTYPE_O, opus::fp4_t> ? inverted_scale : 1.0f / inverted_scale;
 
     using DTYPE_STORE = std::conditional_t<std::is_same_v<DTYPE_O, opus::fp4_t>, uint8_t, DTYPE_O>;
-    auto* out_ptr     = reinterpret_cast<DTYPE_STORE*>(out);
-    auto buffer_o = opus::make_gmem<DTYPE_STORE>(out_ptr, oob_size);
+    // Point the descriptor at this thread's own slice rather than the whole
+    // tensor. Two 32-bit fields make the tensor-wide form wrong once the output
+    // reaches 4 GiB: NUM_RECORDS in the buffer resource, and store_vector's
+    // `int row_offset`. GLM-5.3 EP16 prefill quantizes 2M rows of 2048 into
+    // exactly 2**32 fp8 bytes and tripped both -- the descriptor wrapped to zero
+    // length, every store was discarded, and stage2 got an all-zero A2 with no
+    // fault to show for it. Rebasing in 64-bit keeps the offset at 0 and the
+    // tail guard exact.
+    static constexpr int64_t store_span_bytes =
+        static_cast<int64_t>(vec_size_o) * sizeof(DTYPE_STORE);
+    const int64_t store_byte_off =
+        row_offset * static_cast<int64_t>(sizeof(DTYPE_STORE));
+    const int64_t store_left = oob_size - store_byte_off;
+    const int64_t slice_bytes =
+        store_left <= 0 ? 0
+                        : (store_left < store_span_bytes ? store_left : store_span_bytes);
+    auto* out_ptr = reinterpret_cast<DTYPE_STORE*>(out) + row_offset;
+    auto buffer_o = opus::make_gmem<DTYPE_STORE>(out_ptr, slice_bytes);
 
-    store_vector<DTYPE_STORE, DTYPE_I, thread_data_size, RT, false, WARP_SIZE, 1, DTYPE_O>(buffer_o, thread_data, row_offset, inverted_scale);
+    store_vector<DTYPE_STORE, DTYPE_I, thread_data_size, RT, false, WARP_SIZE, 1, DTYPE_O>(buffer_o, thread_data, 0, inverted_scale);
 }
 
 __global__ void initializeScale(float *d_data, int size, float value)
