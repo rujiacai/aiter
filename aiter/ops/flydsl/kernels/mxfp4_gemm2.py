@@ -38,6 +38,8 @@ from .mxfp4_gemm_common import (
 )
 
 NUM_CU = 256
+# nonatomic_lds staging row: 64 bf16 (128 B) + 16 B pad against LDS bank conflicts.
+_LDS_EPI_ROW_BYTES = 144
 
 
 def aq_bytes_for(max_m, k):
@@ -110,15 +112,16 @@ def compile_gemm2_a4w4_port(
     ), f"D_INTER_REAL={_K_REAL} must be a multiple of 128 and in (0, {_K}]"
     _K_HALF = k_half_for(_K)
     _K_TILES_TOTAL = k_tiles_total_for(_K, BK)
-    _persistent = epilog in ("nonatomic", "nonatomic_mxfp4")
+    _persistent = epilog in ("nonatomic", "nonatomic_mxfp4", "nonatomic_lds")
     _slot_bytes = saq_slot_bytes(BM, KH_TILE)
     _aStages = kStages if _K_TILES_TOTAL <= kStages else 3
     _acc_rows = min(BM, 64) if epilog == "nonatomic_cshuffle" else BM
-    _lds_bytes = (
-        lds_acc_bytes_for(_acc_rows, BN) + _aStages * _slot_bytes
-        if epilog != "nonatomic"
-        else _aStages * _slot_bytes
-    )
+    if epilog == "nonatomic":
+        _lds_bytes = _aStages * _slot_bytes
+    elif epilog == "nonatomic_lds":
+        _lds_bytes = _aStages * _slot_bytes + 4 * BM * _LDS_EPI_ROW_BYTES
+    else:
+        _lds_bytes = lds_acc_bytes_for(_acc_rows, BN) + _aStages * _slot_bytes
     _num_n_blocks = num_n_blocks_for(N_OUT, BN)
     _n_load_waves, _rows_per_wave, _kSubBlocks = tiling(BM)
     _epi_tag = {
@@ -126,6 +129,7 @@ def compile_gemm2_a4w4_port(
         "nonatomic": "nonatomic",
         "nonatomic_mxfp4": "nonatomic_mxfp4",
         "nonatomic_cshuffle": "nonatomic_cshuffle",
+        "nonatomic_lds": "nonatomic_lds",
     }[epilog]
     _rtag = "" if _K_REAL == _K else f"r{_K_REAL}"
     _tag = f"ne{NE}_h{N_OUT}_i{_K}{_rtag}_bm{BM}{'_nt' if use_nt else ''}_{_epi_tag}"
@@ -500,6 +504,16 @@ def _gemm2_body(
         return a
 
     mfma_res_ty = T.f32x4
+    # nonatomic_lds swaps the MFMA operands: accm then holds C^T blocks, so each
+    # lane owns 4 consecutive output columns of one row (8 contiguous bytes).
+    _swap_ab = epilog == "nonatomic_lds"
+
+    def _mfma(res_ty, args):
+        if const_expr(_swap_ab):
+            a_, b_, c_, cbsz, blgp, osa, sa_, osb, sb_ = args
+            args = [b_, a_, c_, blgp, cbsz, osb, sb_, osa, sa_]
+        return rocdl.mfma_scale_f32_16x16x128_f8f6f4(res_ty, args)
+
     zero4 = Vec.filled(4, 0.0, fx.Float32)
     accm = [[None, None, None, None] for _ in range(_kMChunks)]
 
@@ -516,31 +530,31 @@ def _gemm2_body(
                 i0 = sub * 2
                 i1 = sub * 2 + 1
                 if const_expr(init):
-                    accm[i0][J] = rocdl.mfma_scale_f32_16x16x128_f8f6f4(
+                    accm[i0][J] = _mfma(
                         mfma_res_ty, [a[i0][0], b_J0, zero4, 4, 4, 0, sa, 0 + in_b, sb]
                     )
                     if const_expr(_kMChunks > 1):
-                        accm[i1][J] = rocdl.mfma_scale_f32_16x16x128_f8f6f4(
+                        accm[i1][J] = _mfma(
                             mfma_res_ty,
                             [a[i1][0], b_J0, zero4, 4, 4, 1, sa, 0 + in_b, sb],
                         )
                 else:
-                    accm[i0][J] = rocdl.mfma_scale_f32_16x16x128_f8f6f4(
+                    accm[i0][J] = _mfma(
                         mfma_res_ty,
                         [a[i0][0], b_J0, accm[i0][J], 4, 4, 0, sa, 0 + in_b, sb],
                     )
                     if const_expr(_kMChunks > 1):
-                        accm[i1][J] = rocdl.mfma_scale_f32_16x16x128_f8f6f4(
+                        accm[i1][J] = _mfma(
                             mfma_res_ty,
                             [a[i1][0], b_J0, accm[i1][J], 4, 4, 1, sa, 0 + in_b, sb],
                         )
                 if const_expr(not _skip_h1):
-                    accm[i0][J] = rocdl.mfma_scale_f32_16x16x128_f8f6f4(
+                    accm[i0][J] = _mfma(
                         mfma_res_ty,
                         [a[i0][1], b_J1, accm[i0][J], 4, 4, 2, sa, 2 + in_b, sb],
                     )
                     if const_expr(_kMChunks > 1):
-                        accm[i1][J] = rocdl.mfma_scale_f32_16x16x128_f8f6f4(
+                        accm[i1][J] = _mfma(
                             mfma_res_ty,
                             [a[i1][1], b_J1, accm[i1][J], 4, 4, 3, sa, 2 + in_b, sb],
                         )
@@ -587,6 +601,20 @@ def _gemm2_body(
         out_base = _global_base_ptr1(arg_out)
         _flat_bf16_epilog(
             accm, out_base, m_row, n_block_idx, wave, lane, N_OUT, BN, _kMChunks
+        )
+    elif epilog == "nonatomic_lds":
+        _lds_flat_bf16_epilog(
+            accm,
+            arg_out,
+            m_row,
+            n_block_idx,
+            wave,
+            lane,
+            N_OUT,
+            BN,
+            BM,
+            _kMChunks,
+            lds_acc_base_i32,
         )
     elif epilog == "nonatomic_cshuffle":
         _cshuffle_flat_bf16_epilog(
@@ -652,6 +680,47 @@ def _flat_bf16_epilog(
                 const_off = ((i * 16 + v) * N_OUT + J * 16) * 2
                 bf = Vec.from_elements([vec[v]], fx.Float32).to(fx.BFloat16)
                 llvm.StoreOp(_raw(bf), _gep1(out_base, byte_base + fx.Int64(const_off)))
+
+
+def _lds_flat_bf16_epilog(
+    accm, arg_out, m_row, n_block_idx, wave, lane, N_OUT, BN, BM, kMChunks, stage_i32
+):
+    """Epilogue for the swapped-operand layout (lane l: row l%16, columns
+    4*(l//16)..+3 of each 16x16 block). Each wave stages its BM x 64 bf16 slice
+    in a private LDS tile and stores it back row-contiguous, 16 B per lane, so
+    every global store writes 8 full 128 B rows. Writing 32 B pieces of 4-16
+    rows per instruction instead leaves the kernel bound by partial-line
+    write traffic between L1 and L2."""
+    lane_div_16 = lane // fx.Int32(16)
+    lane_mod_16 = lane % fx.Int32(16)
+    base_ptr = _lds_ptr3(
+        stage_i32 + wave * fx.Int32(BM * _LDS_EPI_ROW_BYTES), fx.Int32(0)
+    )
+    w_off = lane_mod_16 * fx.Int32(_LDS_EPI_ROW_BYTES) + lane_div_16 * fx.Int32(8)
+    for i in range_constexpr(kMChunks):
+        for J in range_constexpr(4):
+            pk = Vec(accm[i][J]).to(fx.BFloat16)
+            byte_off = w_off + fx.Int32(i * 16 * _LDS_EPI_ROW_BYTES + J * 32)
+            llvm.StoreOp(_raw(pk), _gep3(base_ptr, byte_off), alignment=8)
+    # A wave only reads back what it wrote itself, and LDS executes one wave's
+    # operations in order, so no barrier is needed.
+    rocdl.sched_barrier(0)
+    r_row = lane // fx.Int32(8)
+    r_chunk = lane % fx.Int32(8)
+    r_off = r_row * fx.Int32(_LDS_EPI_ROW_BYTES) + r_chunk * fx.Int32(16)
+    col = n_block_idx * fx.Int32(BN) + wave * fx.Int32(BN // 4) + r_chunk * fx.Int32(8)
+    out_base = _global_base_ptr1(arg_out)
+    byte_base = (fx.Int64(m_row + r_row) * fx.Int64(N_OUT) + fx.Int64(col)) * fx.Int64(
+        2
+    )
+    for k in range_constexpr(BM // 8):
+        v = llvm.load(
+            T.vec(4, T.i32),
+            _gep3(base_ptr, r_off + fx.Int32(k * 8 * _LDS_EPI_ROW_BYTES)),
+        )
+        llvm.StoreOp(
+            v, _gep1(out_base, byte_base + fx.Int64(k * 8 * N_OUT * 2)), alignment=16
+        )
 
 
 def _cshuffle_flat_bf16_epilog(

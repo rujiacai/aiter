@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <type_traits>
+
 #include "common/arithmetic.hpp"
 
 namespace aiter::mxfp4_moe::moe_sort_scales {
@@ -35,45 +37,60 @@ __global__ void sort_scales_kernel_impl(
     const int actual_sorted  = cumsum_tensor[0];
     const int actual_n_chunks = (actual_sorted + BM - 1) / BM;
 
-    const int total_work = n_chunks * DWORDS_PER_CHUNK;
+    // One thread per (chunk, mi, k_lane, n_lane) walks all C_K1 k-units: the
+    // two sorted rows' token ids are loaded once instead of once per output
+    // dword, and each k-unit reads its K_PACK*4 scale bytes of a row in one
+    // load. Consecutive lanes still write consecutive output dwords.
+    static_assert(A_SCALE_COLS % (K_PACK * 4) == 0, "k-unit must tile a scale row");
+    using KUnit = std::conditional_t<K_PACK == 2, uint64_t, uint32_t>;
+    constexpr int KU_STRIDE = K_LANE * N_LANE;  // output dwords between k-units
+    const int total_work = n_chunks * C_M1 * KU_STRIDE;
     constexpr int total_threads = N_CTAS * THREADS_PER_CTA;
     const int global_tid = blockIdx.x * THREADS_PER_CTA + threadIdx.x;
+    uint32_t* out_dw = reinterpret_cast<uint32_t*>(a_scale_sorted_shuffled);
 
     for (int work_id = global_tid; work_id < total_work; work_id += total_threads) {
         int r = work_id;
         const int n_lane = r % N_LANE;  r /= N_LANE;
         const int k_lane = r % K_LANE;  r /= K_LANE;
-        const int ku     = r % C_K1;    r /= C_K1;
         const int mi     = r % C_M1;    r /= C_M1;
         const int chunk  = r;
+        uint32_t* dst = out_dw + ((long long)(chunk * C_M1 + mi) * C_K1) * KU_STRIDE
+                        + k_lane * N_LANE + n_lane;
 
-        uint8_t bytes[4] = {0, 0, 0, 0};
-        if (chunk < actual_n_chunks) {
-            int tok_ids[MN_PACK];
-            #pragma unroll
-            for (int im_a = 0; im_a < MN_PACK; im_a++) {
-                const int sorted_row = chunk * BM + (mi * MN_PACK + im_a) * 16 + n_lane;
-                int tid = 0;
-                if (sorted_row < actual_sorted) {
-                    const int sti_val = sorted_token_ids[sorted_row] & MASK_TOKEN_ID;
-                    tid = (sti_val < M) ? sti_val : 0;
-                }
-                tok_ids[im_a] = tid;
-            }
-            #pragma unroll
-            for (int ikxdl = 0; ikxdl < K_PACK; ikxdl++) {
-                #pragma unroll
-                for (int im_a = 0; im_a < MN_PACK; im_a++) {
-                    const int k_idx = ku * K_PACK * 4 + ikxdl * 4 + k_lane;
-                    bytes[ikxdl * MN_PACK + im_a] =
-                        a_scale[(long long)tok_ids[im_a] * A_SCALE_COLS + k_idx];
-                }
-            }
+        if (chunk >= actual_n_chunks) {
+            #pragma unroll 4
+            for (int ku = 0; ku < C_K1; ku++)
+                dst[ku * KU_STRIDE] = 0;
+            continue;
         }
 
-        const long long out_offset = (long long)work_id * 4;
-        *reinterpret_cast<uint32_t*>(&a_scale_sorted_shuffled[out_offset]) =
-            *reinterpret_cast<const uint32_t*>(bytes);
+        const KUnit* rows[MN_PACK];
+        #pragma unroll
+        for (int im_a = 0; im_a < MN_PACK; im_a++) {
+            const int sorted_row = chunk * BM + (mi * MN_PACK + im_a) * 16 + n_lane;
+            int tid = 0;
+            if (sorted_row < actual_sorted) {
+                const int sti_val = sorted_token_ids[sorted_row] & MASK_TOKEN_ID;
+                tid = (sti_val < M) ? sti_val : 0;
+            }
+            rows[im_a] = reinterpret_cast<const KUnit*>(a_scale + (long long)tid * A_SCALE_COLS);
+        }
+
+        #pragma unroll 4
+        for (int ku = 0; ku < C_K1; ku++) {
+            uint32_t packed = 0;
+            #pragma unroll
+            for (int im_a = 0; im_a < MN_PACK; im_a++) {
+                const KUnit unit = rows[im_a][ku];
+                #pragma unroll
+                for (int ikxdl = 0; ikxdl < K_PACK; ikxdl++) {
+                    const uint32_t b = (unit >> (8 * (ikxdl * 4 + k_lane))) & 0xFFu;
+                    packed |= b << (8 * (ikxdl * MN_PACK + im_a));
+                }
+            }
+            dst[ku * KU_STRIDE] = packed;
+        }
     }
 }
 

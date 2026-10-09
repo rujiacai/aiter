@@ -20,14 +20,17 @@ _SUPPORTED = {
     (32, False, "nonatomic_cshuffle"),
     (64, False, "nonatomic_cshuffle"),
     (128, False, "nonatomic_cshuffle"),
+    (128, False, "nonatomic_lds"),
 }
 
 
-def _epilog_of(atomic, mxfp4out, cshuffle=False):
+def _epilog_of(atomic, mxfp4out, cshuffle=False, ldsepi=False):
     if mxfp4out:
         return "nonatomic_mxfp4"
     if cshuffle:
         return "nonatomic_cshuffle"
+    if ldsepi and not atomic:
+        return "nonatomic_lds"
     return "atomic" if atomic else "nonatomic"
 
 
@@ -76,6 +79,7 @@ def _assert_supported(
     atomic,
     mxfp4out,
     cshuffle=False,
+    ldsepi=False,
     BN=256,
     BK=256,
 ):
@@ -91,7 +95,7 @@ def _assert_supported(
             f"flydsl mxfp4 gemm2 requires D_HIDDEN (=N_OUT=model_dim) % {BN} == 0, "
             f"got H={D_HIDDEN}"
         )
-    epilog = _epilog_of(atomic, mxfp4out, cshuffle)
+    epilog = _epilog_of(atomic, mxfp4out, cshuffle, ldsepi)
     if (BM, use_nt, epilog) not in _SUPPORTED:
         raise NotImplementedError(
             f"flydsl mxfp4 gemm2 unsupported variant "
@@ -122,6 +126,7 @@ def flydsl_mxfp4_gemm2(
     topk,
     flat_out_scale=None,
     cshuffle=False,
+    ldsepi=False,
     D_INTER_REAL=None,
     BN=256,
     BK=256,
@@ -138,10 +143,11 @@ def flydsl_mxfp4_gemm2(
         atomic=atomic,
         mxfp4out=mxfp4out,
         cshuffle=cshuffle,
+        ldsepi=ldsepi,
         BN=BN,
         BK=BK,
     )
-    epilog = _epilog_of(atomic, mxfp4out, cshuffle)
+    epilog = _epilog_of(atomic, mxfp4out, cshuffle, ldsepi)
     launch = _get_compiled_mxfp4_gemm2_port(
         BM, use_nt, NE, D_HIDDEN, epilog, D_INTER, D_INTER_REAL, BN, BK, xcd_swizzle
     )

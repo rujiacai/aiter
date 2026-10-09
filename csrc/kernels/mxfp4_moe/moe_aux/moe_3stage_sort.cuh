@@ -38,59 +38,32 @@ __global__ void sort_count_kernel_impl(
         block_offsets[e * N_SORT_CTAS + cta] = local_count[e];
 }
 
-template <int NE, int N_SORT_CTAS, int MB, int THREADS_PER_CTA>
+// One CTA per expert: exclusive scan of that expert's per-CTA counts. The
+// offsets stay relative to the expert's start, which sort_place_pad derives
+// itself, so no single-CTA pass has to walk NE * N_SORT_CTAS entries.
+template <int NE, int N_SORT_CTAS, int THREADS_PER_CTA>
 __global__ void sort_cumsum_kernel_impl(
-    int M,
     int32_t *__restrict__ block_offsets,
-    int32_t *__restrict__ real_counts,
-    int32_t *__restrict__ cumsum_tensor,
-    int32_t *__restrict__ sorted_expert_ids) {
+    int32_t *__restrict__ real_counts) {
 
-    static_assert(NE > 0, "NE must be positive");
-    static_assert(THREADS_PER_CTA >= 64, "need at least one wave for the scan");
+    static_assert(N_SORT_CTAS <= THREADS_PER_CTA, "one thread per sort CTA");
+    __shared__ int buf[N_SORT_CTAS];
 
-    __shared__ int total_count[NE];
-    __shared__ int padded_count[NE];
-    __shared__ int expert_starts[NE + 1];
-
-    const int tid = threadIdx.x;
-
-    for (int e = tid; e < NE; e += THREADS_PER_CTA) {
-        int sum = 0;
-        #pragma unroll
-        for (int c = 0; c < N_SORT_CTAS; ++c)
-            sum += block_offsets[e * N_SORT_CTAS + c];
-        total_count[e]     = sum;
-        padded_count[e]    = round_up(sum, MB);
-        real_counts[e]     = sum;
-    }
+    const int e = blockIdx.x;
+    const int t = threadIdx.x;
+    int32_t *row = block_offsets + e * N_SORT_CTAS;
+    const int v = t < N_SORT_CTAS ? row[t] : 0;
+    if (t < N_SORT_CTAS) buf[t] = v;
     __syncthreads();
-
-    if (tid == 0) {
-        int acc = 0;
-        for (int e = 0; e < NE; ++e) { expert_starts[e] = acc; acc += padded_count[e]; }
-        expert_starts[NE] = acc;
-        cumsum_tensor[0] = acc;
-        cumsum_tensor[1] = M;  // num_valid_ids[1] = valid tokens (non-EP == M)
+    #pragma unroll
+    for (int off = 1; off < N_SORT_CTAS; off <<= 1) {
+        const int x = (t >= off && t < N_SORT_CTAS) ? buf[t - off] : 0;
+        __syncthreads();
+        if (t < N_SORT_CTAS) buf[t] += x;
+        __syncthreads();
     }
-    __syncthreads();
-
-    for (int e = tid; e < NE; e += THREADS_PER_CTA) {
-        int acc = expert_starts[e];
-        #pragma unroll
-        for (int c = 0; c < N_SORT_CTAS; ++c) {
-            int cnt = block_offsets[e * N_SORT_CTAS + c];
-            block_offsets[e * N_SORT_CTAS + c] = acc;
-            acc += cnt;
-        }
-    }
-
-    for (int e = tid; e < NE; e += THREADS_PER_CTA) {
-        int b0 = expert_starts[e]     / MB;
-        int b1 = expert_starts[e + 1] / MB;
-        for (int b = b0; b < b1; ++b)
-            sorted_expert_ids[b] = e;
-    }
+    if (t < N_SORT_CTAS) row[t] = buf[t] - v;
+    if (t == N_SORT_CTAS - 1) real_counts[e] = buf[t];
 }
 
 template <int NE, int TOPK, int N_SORT_CTAS, int MB, int THREADS_PER_CTA>
@@ -100,25 +73,44 @@ __global__ void sort_place_pad_kernel_impl(
     const float   *__restrict__ topk_weight,
     const int32_t *__restrict__ block_offsets,
     const int32_t *__restrict__ real_counts,
-    const int32_t *__restrict__ cumsum_tensor,
+    int32_t *__restrict__ cumsum_tensor,
+    int32_t *__restrict__ sorted_expert_ids,
     int32_t *__restrict__ sorted_token_ids,
     int32_t *__restrict__ reverse_sorted,
     float   *__restrict__ sorted_weights,
     int32_t *__restrict__ m_indices) {
 
+    static_assert(NE <= THREADS_PER_CTA, "expert scan uses one thread per expert");
     __shared__ int local_offsets[NE];
     __shared__ int row_starts[NE + 1];
+    __shared__ int scan[NE];
 
     const int tid = threadIdx.x;
     const int cta = blockIdx.x;
     const int total_pairs = M * TOPK;
 
-    for (int e = tid; e < NE; e += THREADS_PER_CTA) {
-        local_offsets[e] = block_offsets[e * N_SORT_CTAS + cta];
-        row_starts[e]    = block_offsets[e * N_SORT_CTAS];
-    }
-    if (tid == 0) row_starts[NE] = cumsum_tensor[0];
+    // Every CTA scans the NE padded expert sizes itself (cheap, NE <= 1024).
+    const int padded = tid < NE ? round_up(real_counts[tid], MB) : 0;
+    if (tid < NE) scan[tid] = padded;
     __syncthreads();
+    #pragma unroll
+    for (int off = 1; off < NE; off <<= 1) {
+        const int x = (tid >= off && tid < NE) ? scan[tid - off] : 0;
+        __syncthreads();
+        if (tid < NE) scan[tid] += x;
+        __syncthreads();
+    }
+    if (tid < NE) {
+        const int start = scan[tid] - padded;
+        row_starts[tid]    = start;
+        local_offsets[tid] = start + block_offsets[tid * N_SORT_CTAS + cta];
+    }
+    if (tid == NE - 1) row_starts[NE] = scan[tid];
+    __syncthreads();
+    if (cta == 0 && tid == 0) {
+        cumsum_tensor[0] = row_starts[NE];
+        cumsum_tensor[1] = M;  // num_valid_ids[1] = valid tokens (non-EP == M)
+    }
 
     const int per_cta = ceil_div(total_pairs, N_SORT_CTAS);
     const int start   = cta * per_cta;
@@ -135,8 +127,6 @@ __global__ void sort_place_pad_kernel_impl(
         reverse_sorted[i]    = sp;
     }
 
-    __syncthreads();
-
     const int experts_per_cta = ceil_div(NE, N_SORT_CTAS);
     const int e_lo = cta * experts_per_cta;
     const int e_hi = min(e_lo + experts_per_cta, NE);
@@ -152,6 +142,8 @@ __global__ void sort_place_pad_kernel_impl(
             m_indices[j]        = pad_val;
             sorted_weights[j]   = 0.0f;
         }
+        for (int b = row_starts[e] / MB + tid; b < padded_end / MB; b += THREADS_PER_CTA)
+            sorted_expert_ids[b] = e;
     }
 }
 
@@ -169,14 +161,14 @@ inline void launch(
         <<<N_SORT_CTAS, THREADS_PER_CTA, 0, stream>>>(
             M, topk_ids, block_offsets);
 
-    sort_cumsum_kernel_impl<NE, N_SORT_CTAS, MB, THREADS_PER_CTA>
-        <<<1, THREADS_PER_CTA, 0, stream>>>(
-            M, block_offsets, real_counts, cumsum_tensor, sorted_expert_ids);
+    constexpr int kScanThreads = (N_SORT_CTAS + 63) / 64 * 64;
+    sort_cumsum_kernel_impl<NE, N_SORT_CTAS, kScanThreads>
+        <<<NE, kScanThreads, 0, stream>>>(block_offsets, real_counts);
 
     sort_place_pad_kernel_impl<NE, TOPK, N_SORT_CTAS, MB, THREADS_PER_CTA>
         <<<N_SORT_CTAS, THREADS_PER_CTA, 0, stream>>>(
             M, topk_ids, topk_weight, block_offsets,
-            real_counts, cumsum_tensor,
+            real_counts, cumsum_tensor, sorted_expert_ids,
             sorted_token_ids, reverse_sorted, sorted_weights, m_indices);
 }
 

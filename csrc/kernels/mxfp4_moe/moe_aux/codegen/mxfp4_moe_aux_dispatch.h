@@ -17,7 +17,7 @@ constexpr int kThreadsScatterReduce   = 128;
 constexpr int kColsPerThread          = 8;
 constexpr int kColsPerThreadQ         = 8;    // mxfp4-input reduce: 8 fp4 = one u32 load
 constexpr int kThreadsScatterReduceQ  = 128;  // mxfp4-input reduce CTA size
-constexpr int kSplitSortCtas          = 16;
+constexpr int kSplitSortCtas          = 128;  // keep in sync with fused_moe.py sort3stage_ws
 constexpr int kInlineQuantZeroInitCtas = 128;
 constexpr int kBK                     = 256;  // sort_scales K-tile
 

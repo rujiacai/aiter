@@ -74,6 +74,7 @@ def _job_key(job: dict) -> tuple:
             job["topk"],
             job["xcd_swizzle"],
             job.get("activation", "silu"),
+            job.get("occ2", False),
         )
     return (
         2,
@@ -142,6 +143,7 @@ def parse_csv(csv_path: str):
                         "NE": expert,
                         "topk": topk,
                         "xcd_swizzle": p1["xcd_swizzle"],
+                        "occ2": p1["occ2"],
                     }
                 )
             if v2_g2 is not None:
@@ -207,7 +209,7 @@ def parse_csv(csv_path: str):
                             "NE": expert,
                             "N_OUT": model_dim,
                             "epilog": _epilog_of(
-                                p2["atomic"], mxfp4out, p2["cshuffle"]
+                                p2["atomic"], mxfp4out, p2["cshuffle"], p2["ldsepi"]
                             ),
                             "D_INTER": d_inter,
                             "D_INTER_REAL": d_inter_real,
@@ -258,6 +260,7 @@ def _compile_stage1(job):
         act=job.get("activation", "silu"),
         situ_beta=DEFAULT_SITUV2_BETA,
         situ_linear_beta=DEFAULT_SITUV2_LINEAR_BETA,
+        occ2=job.get("occ2", False),
         stream=0,
     )
 
@@ -290,6 +293,7 @@ def _compile_stage2(job):
         topk=job["topk"],
         flat_out_scale=_dummy() if mxfp4out else None,
         cshuffle=epilog == "nonatomic_cshuffle",
+        ldsepi=epilog == "nonatomic_lds",
         D_INTER_REAL=job["D_INTER_REAL"],
         xcd_swizzle=job["xcd_swizzle"],
         stream=0,

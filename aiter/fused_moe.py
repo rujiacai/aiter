@@ -150,12 +150,12 @@ def _adaptive_moe_sort(
 
     # threestage-sort scratch (prologue==1). Previously allocated via
     # torch::empty inside the kernel; now passed in so the C++ TU is torch-free.
-    # Size = NE*kSplitSortCtas + NE int32; kSplitSortCtas=16 mirrors
+    # Size = NE*kSplitSortCtas + NE int32; kSplitSortCtas=128 mirrors
     # csrc/kernels/mxfp4_moe/moe_aux/codegen/mxfp4_moe_aux_dispatch.h.
     sort3stage_ws = (
         torch.empty(0, dtype=dtypes.i32, device=device)
         if BM == 16 or skip_quant
-        else torch.empty(num_experts * 17, dtype=dtypes.i32, device=device)
+        else torch.empty(num_experts * (128 + 1), dtype=dtypes.i32, device=device)
     )
 
     aiter.mxfp4_moe_sort(
@@ -1944,7 +1944,8 @@ def _mxfp4_a4w4_stage1(
 
     from aiter.ops.flydsl.mxfp4_gemm1_kernels import flydsl_mxfp4_gemm1
 
-    _xcd1 = _parse_mxfp4_g1_kname(kernelName1).get("xcd_swizzle", 0)
+    _p1 = _parse_mxfp4_g1_kname(kernelName1)
+    _xcd1 = _p1.get("xcd_swizzle", 0)
     flydsl_mxfp4_gemm1(
         a_quant=a_quant,
         a_scale_sorted_shuffled=a_scale_sorted_shuffled,
@@ -1969,6 +1970,7 @@ def _mxfp4_a4w4_stage1(
         act=act,
         situ_beta=situ_beta,
         situ_linear_beta=situ_linear_beta,
+        occ2=_p1.get("occ2", False),
     )
     return inter_sorted_quant, inter_sorted_shuffled_scale
 
@@ -2000,7 +2002,9 @@ def _mxfp4_a4w4_stage2(
     cshuffle=False,
     inter_real=None,  # w2.inter_real (unpadded inter for non-256-aligned shards)
 ):
-    _xcd2 = _parse_mxfp4_g2_kname(kernelName2).get("xcd_swizzle", 0)
+    _p2 = _parse_mxfp4_g2_kname(kernelName2)
+    _xcd2 = _p2.get("xcd_swizzle", 0)
+    _ldsepi = _p2.get("ldsepi", False)
     if atomic:
         out_buf = out_dst
     else:
@@ -2085,6 +2089,7 @@ def _mxfp4_a4w4_stage2(
         atomic=atomic,
         mxfp4out=False,
         cshuffle=cshuffle,
+        ldsepi=_ldsepi,
         NE=NE,
         D_HIDDEN=D_HIDDEN,
         D_INTER=D_INTER,

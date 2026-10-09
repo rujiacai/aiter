@@ -31,6 +31,7 @@ def _get_compiled_mxfp4_gemm1_port(
     interleave=False,
     xcd_swizzle=0,
     act="silu",
+    occ2=False,
 ):
     from .kernels.mxfp4_gemm1 import compile_gemm1_a4w4_port
 
@@ -47,11 +48,12 @@ def _get_compiled_mxfp4_gemm1_port(
         interleave=interleave,
         xcd_swizzle=xcd_swizzle,
         act=act,
+        occ2=occ2,
     )
 
 
 def _assert_supported(
-    *, NE, D_HIDDEN, D_INTER, topk, BM, use_nt, inline_quant, BN=256, BK=256
+    *, NE, D_HIDDEN, D_INTER, topk, BM, use_nt, inline_quant, occ2=False, BN=256, BK=256
 ):
     if D_HIDDEN % BK != 0:
         raise NotImplementedError(
@@ -65,6 +67,11 @@ def _assert_supported(
     if (BM, use_nt, inline_quant) not in _SUPPORTED:
         raise NotImplementedError(
             f"flydsl mxfp4 gemm1 unsupported variant "
+            f"(BM={BM}, use_nt={use_nt}, inline_quant={inline_quant})"
+        )
+    if occ2 and (BM, use_nt, inline_quant) != (128, False, False):
+        raise NotImplementedError(
+            f"flydsl mxfp4 gemm1 occ2 needs BM=128 cached without inline quant "
             f"(BM={BM}, use_nt={use_nt}, inline_quant={inline_quant})"
         )
 
@@ -96,6 +103,7 @@ def flydsl_mxfp4_gemm1(
     act="silu",
     situ_beta=1.0,
     situ_linear_beta=1.0,
+    occ2=False,
     stream=None,
 ):
     _assert_supported(
@@ -106,6 +114,7 @@ def flydsl_mxfp4_gemm1(
         BM=BM,
         use_nt=use_nt,
         inline_quant=inline_quant,
+        occ2=occ2,
         BN=BN,
         BK=BK,
     )
@@ -130,6 +139,7 @@ def flydsl_mxfp4_gemm1(
         interleave,
         xcd_swizzle,
         act,
+        occ2,
     )
     grid = gemm1_grid(n_tokens, BM, NE=NE, TOPK=topk, INTER=D_INTER, BN=BN)
     _moe_kernels._run_compiled(

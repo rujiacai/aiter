@@ -6,13 +6,15 @@
 #
 # Name: flydsl_mxmoe_g{1,2}_a4w4_<BM>x256x256[_flag...], lowercase. Shape is in
 # the CSV columns, not the name. g1 flags: f16in (inline act quant), nt (else
-# cached). g2 flags: atomic (else nonatomic), nt (atomic only), f4out / cshuffle.
+# cached), occ2 (BM=128: two WGs per CU). g2 flags: atomic (else nonatomic),
+# nt (atomic only), f4out / cshuffle / ldsepi (bf16 out staged through LDS,
+# full-line stores).
 
 import re
 
 _MXMOE_NUMERIC_TOKENS = {"SK": "kSplitK", "XCD": "xcd_swizzle"}
-_MXMOE_G1_FLAG_TOKENS = {"NT", "F16IN"}
-_MXMOE_G2_FLAG_TOKENS = {"NT", "ATOMIC", "F4OUT", "CSHUFFLE"}
+_MXMOE_G1_FLAG_TOKENS = {"NT", "F16IN", "OCC2"}
+_MXMOE_G2_FLAG_TOKENS = {"NT", "ATOMIC", "F4OUT", "CSHUFFLE", "LDSEPI"}
 _MXMOE_NUMERIC_RE = re.compile(r"^([A-Z]+)(\d+)$")
 _MXMOE_TILE_RE = re.compile(r"^(\d+)x(\d+)x(\d+)$")  # <BM>x<BN>x<BK>
 _MXMOE_PREFIX = {1: "flydsl_mxmoe_g1_a4w4_", 2: "flydsl_mxmoe_g2_a4w4_"}
@@ -59,6 +61,7 @@ def _parse_mxfp4_g1_kname(kname: str) -> dict:
         "kSplitK": nums.get("kSplitK", 0),
         "inline_quant": "F16IN" in flags,
         "use_nt": "NT" in flags,
+        "occ2": "OCC2" in flags,
         "xcd_swizzle": nums.get("xcd_swizzle", 0),
     }
 
@@ -69,11 +72,16 @@ def _parse_mxfp4_g2_kname(kname: str) -> dict:
     atomic = "ATOMIC" in flags
     mxfp4out = "F4OUT" in flags
     cshuffle = "CSHUFFLE" in flags
-    # f4out/cshuffle are nonatomic-only; atomic sizes a different output buffer.
-    if atomic and (mxfp4out or cshuffle):
-        bad = "f4out" if mxfp4out else "cshuffle"
+    ldsepi = "LDSEPI" in flags
+    # f4out/cshuffle/ldsepi are nonatomic-only; atomic sizes a different output buffer.
+    if atomic and (mxfp4out or cshuffle or ldsepi):
+        bad = "f4out" if mxfp4out else ("cshuffle" if cshuffle else "ldsepi")
         raise ValueError(
             f"illegal mxmoe g2 name {kname!r}: atomic incompatible with {bad}"
+        )
+    if ldsepi and (mxfp4out or cshuffle):
+        raise ValueError(
+            f"illegal mxmoe g2 name {kname!r}: ldsepi is a separate bf16 epilogue"
         )
     return {
         "BM": nums["BM"],
@@ -83,6 +91,7 @@ def _parse_mxfp4_g2_kname(kname: str) -> dict:
         "use_nt": "NT" in flags,
         "mxfp4out": mxfp4out,
         "cshuffle": cshuffle,
+        "ldsepi": ldsepi,
         "xcd_swizzle": nums.get("xcd_swizzle", 0),
     }
 
