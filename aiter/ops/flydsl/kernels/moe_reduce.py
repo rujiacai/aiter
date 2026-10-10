@@ -223,7 +223,22 @@ def compile_moe_reduction(
     stays correct.
     """
     V = FP8_VEC if dtype_str == "fp8" else 128 // (32 if dtype_str == "f32" else 16)
-    block = _pick_reduce_block(model_dim, V)
+    # Weighted BF16 reduce at model_dim=6144 (deferred-weight stage2): model_dim / V
+    # is exactly 768, so a 768-thread block avoids the 256 permanently idle threads
+    # of the power-of-two block. Every other configuration keeps the old block.
+    use_768_block = (
+        topk == 8
+        and model_dim == 6144
+        and dtype_str == "bf16"
+        and out_dtype_str in (None, "bf16")
+        and use_weight
+        and not use_mask
+        and num_experts == 0
+        and scale_blk is None
+        and pitch_align is None
+        and V == 8
+    )
+    block = 768 if use_768_block else _pick_reduce_block(model_dim, V)
     gy = (model_dim + block * V - 1) // (block * V)
     out_tag = out_dtype_str or dtype_str
     if dtype_str == "fp8":

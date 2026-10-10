@@ -1788,6 +1788,7 @@ def _flydsl_stage1_wrapper(
         swiglu_limit=swiglu_limit,
         k_wave=parsed.get("k_wave", 1),
         v2_output_layout=v2_output_layout,
+        fp4_round_up=parsed.get("fp4_round_up", False),
     )
 
 
@@ -1809,6 +1810,7 @@ def _flydsl_stage2_wrapper(
     model_dim_pad: int = 0,
     expert_mask=None,
     topk_ids=None,
+    topk_weights=None,
     **_kwargs,
 ):
     inter_dim_pad, model_dim_pad = _get_padding_for_flydsl(
@@ -1828,6 +1830,18 @@ def _flydsl_stage2_wrapper(
     parsed = moe_kernels.get_flydsl_kernel_params(kernelName)
     if parsed is None:
         raise ValueError(f"Invalid FlyDSL kernel name: {kernelName}")
+    # Reduce-mode kernels registered with ``defer_weight`` write unweighted rows
+    # and the reducer applies the FP32 topk weights. Without usable topk_weights
+    # they run as plain reduce.
+    defer_weight = (
+        parsed.get("defer_weight", False)
+        and parsed.get("mode") == "reduce"
+        and topk_weights is not None
+        and topk_weights.dtype == torch.float32
+        and topk_weights.is_contiguous()
+        and expert_mask is None
+        and bias2 is None
+    )
     return moe_kernels.flydsl_moe_stage2(
         inter_states=inter_states,
         w2=w2,
@@ -1845,19 +1859,23 @@ def _flydsl_stage2_wrapper(
         mode=parsed.get("mode", "atomic"),
         w2_scale=w2_scale,
         a2_scale=a2_scale,
-        sorted_weights=sorted_weights,
+        sorted_weights=None if defer_weight else sorted_weights,
         sort_block_m=parsed.get("sort_block_m", 0),
         waves_per_eu=parsed.get("waves_per_eu", None),
         use_async_copy=parsed.get("use_async_copy", False),
         cu_num_mul=parsed.get("cu_num_mul", 1),
+        persist_cu=parsed.get("persist_cu", 0),
         b_nt=parsed.get("b_nt", 0),
         persist=parsed.get("persist", None),
+        persist_m=parsed.get("persist_m", None),
         inter_dim_pad=inter_dim_pad,
         model_dim_pad=model_dim_pad,
         bias=bias2,
         xcd_swizzle=parsed.get("xcd_swizzle", 0),
         expert_mask=expert_mask,
         topk_ids=topk_ids,
+        topk_weights=topk_weights if defer_weight else None,
+        cacheable_out=parsed.get("cacheable_out", False),
     )
 
 
@@ -3637,6 +3655,18 @@ def fused_moe_2stages(
         stage2_func is _flydsl_v2_stage2_wrapper
         and not doweight_stage1
         and _flydsl_stage2_fp8_enabled()
+    ):
+        extra_stage2_args["topk_weights"] = topk_weights.to(torch.float32).contiguous()
+    if (
+        stage2_func is _flydsl_stage2_wrapper
+        and not doweight_stage1
+        and topk_weights is not None
+        and (
+            _get_flydsl_moe_kernels().get_flydsl_kernel_params(
+                getattr(metadata.stage2, "keywords", {}).get("kernelName", "")
+            )
+            or {}
+        ).get("defer_weight", False)
     ):
         extra_stage2_args["topk_weights"] = topk_weights.to(torch.float32).contiguous()
     if m_indices is not None:

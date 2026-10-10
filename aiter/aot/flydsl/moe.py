@@ -247,6 +247,7 @@ def _precompile_to_cache(
     # `compile_flydsl_moe_stage2` for stage 2 AOT compilation.
     use_async_copy: bool = False,
     cu_num_mul: int = 1,
+    fp4_round_up: bool = False,
     _aot_backend=None,
     **kwargs,
 ):
@@ -621,6 +622,7 @@ def _precompile_to_cache(
                 xcd_swizzle=xcd_swizzle,
                 k_wave=k_wave,
                 v2_output_layout=_v2_output_layout,
+                **({"fp4_round_up": True} if fp4_round_up else {}),
             )
             _run_compiled(exe, args)
 

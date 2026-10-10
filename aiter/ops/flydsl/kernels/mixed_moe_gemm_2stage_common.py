@@ -124,8 +124,14 @@ def compile_mixed_moe_gemm1_common(
     k_wave: int = 1,
     shared_expert_id: int | None = None,
     v2_output_layout: bool = False,
+    fp4_round_up: bool = False,
 ):
-    """Compile stage1 kernel: act(X @ W_gate.T, X @ W_up.T) -> [tokens*topk, inter_dim]."""
+    """Compile stage1 kernel: act(X @ W_gate.T, X @ W_up.T) -> [tokens*topk, inter_dim].
+
+    fp4_round_up (fp4 out only): quantize the bf16-rounded activation with
+    ceil_pow2(amax / 6) e8m0 scales, i.e. exactly what the bf16 output followed
+    by the standalone ``fused_mx_quant_moe_sort`` kernel produces.
+    """
     heterogeneous_b = shared_expert_id is not None
     if heterogeneous_b and shared_expert_id != experts - 1:
         raise ValueError(
@@ -240,8 +246,10 @@ def compile_mixed_moe_gemm1_common(
     need_fp8 = out_dtype == "fp8"
     need_quant = need_fp4 or need_fp8
     need_sort = need_quant
+    if fp4_round_up and not need_fp4:
+        raise ValueError("fp4_round_up requires out_dtype='fp4'")
 
-    fp4q_tag = "_fp4q" if need_fp4 else ""
+    fp4q_tag = ("_fp4qru" if fp4_round_up else "_fp4q") if need_fp4 else ""
     fp8q_tag = "_fp8q" if need_fp8 else ""
     sort_tag = "_sort" if need_sort else ""
     async_tag = "_async" if use_async_copy else ""
@@ -2412,8 +2420,16 @@ def compile_mixed_moe_gemm1_common(
                         frag_vals = []
                         for i in range_constexpr(e_vec):
                             frag_vals.append(fx.Vector(frag)[i])
+                        if const_expr(fp4_round_up):
+                            frag_vals = [
+                                v.to(fx.BFloat16).to(fx.Float32) for v in frag_vals
+                            ]
 
-                        local_max = c0_f32
+                        local_max = (
+                            arith.constant(1e-10, type=T.f32)
+                            if const_expr(fp4_round_up)
+                            else c0_f32
+                        )
                         for i in range_constexpr(e_vec):
                             abs_v = llvm.call_intrinsic(
                                 f32, "llvm.fabs.f32", [frag_vals[i].ir_value()], [], []
@@ -2425,10 +2441,28 @@ def compile_mixed_moe_gemm1_common(
                             peer = local_max.shuffle_xor(off, c64_i32)
                             local_max = arith.maximumf(local_max, peer)
 
-                        max_i32 = local_max.bitcast(T.i32)
-                        max_rounded = (max_i32 + c0x400000_i32) & c0xFF800000_i32
-                        exp_field = max_rounded >> c23_i32
-                        e8m0_biased = arith.maxsi(exp_field - c_headroom_i32, c0_i32)
+                        if const_expr(fp4_round_up):
+                            # MxScaleRoundMode::RoundUp: ceil_pow2(amax / 6).
+                            q_i32 = (
+                                fx.Float32(local_max) * fx.Float32(1.0 / 6.0)
+                            ).bitcast(fx.Int32)
+                            exp8 = (q_i32 >> fx.Int32(23)) & fx.Int32(0xFF)
+                            bump = (exp8 < fx.Int32(0xFF)) & (
+                                (q_i32 & fx.Int32(0x7FFFFF)) != fx.Int32(0)
+                            )
+                            e8m0_biased = arith.maxsi(
+                                (
+                                    exp8 + bump.select(fx.Int32(1), fx.Int32(0))
+                                ).ir_value(),
+                                c0_i32,
+                            )
+                        else:
+                            max_i32 = local_max.bitcast(T.i32)
+                            max_rounded = (max_i32 + c0x400000_i32) & c0xFF800000_i32
+                            exp_field = max_rounded >> c23_i32
+                            e8m0_biased = arith.maxsi(
+                                exp_field - c_headroom_i32, c0_i32
+                            )
 
                         quant_exp = c254_i32 - e8m0_biased
                         quant_scale = (quant_exp << c23_i32).bitcast(T.f32)
@@ -3283,12 +3317,27 @@ def compile_mixed_moe_gemm2_common(
     waves_per_eu: int | None = None,
     use_async_copy: bool = False,
     cu_num_mul: int = 1,
+    persist_cu: int = 0,
     b_nt: int = 0,
     xcd_swizzle: int = 0,
     shared_expert_id: int | None = None,
+    cacheable_out: bool = False,
 ):
-    """Compile stage2 kernel (moe_gemm2): A2 @ W2.T -> [tokens, model_dim], atomic-add."""
+    """Compile stage2 kernel (moe_gemm2): A2 @ W2.T -> output.
+
+    ``persist_cu`` is the exact persistent workgroup count when positive; zero
+    preserves the historical ``get_cu_num() * cu_num_mul`` policy.  The grid
+    uses a balanced grid-stride assignment, so the value may legally exceed
+    the number of physical CUs.
+
+    ``cacheable_out`` keeps the reduce-mode route-row stores cacheable instead
+    of non-temporal, so the reducer that consumes them right away can hit in
+    L2/MALL.
+    """
     heterogeneous_b = shared_expert_id is not None
+    if cacheable_out and accumulate:
+        raise ValueError("cacheable_out only applies to reduce-mode (accumulate=False)")
+    route_out_cacheable = bool(cacheable_out)
     if heterogeneous_b and shared_expert_id != experts - 1:
         raise ValueError(
             "FHMoE stage2 requires shared_expert_id == experts - 1; "
@@ -3445,10 +3494,14 @@ def compile_mixed_moe_gemm2_common(
     persistent = persist_m <= 0
     if const_expr(not isinstance(cu_num_mul, int) or cu_num_mul < 1):
         raise ValueError(f"cu_num_mul must be int >= 1, got {cu_num_mul}")
+    if const_expr(not isinstance(persist_cu, int) or persist_cu < 0):
+        raise ValueError(f"persist_cu must be int >= 0, got {persist_cu}")
     if const_expr(persistent):
         from aiter.jit.utils.chip_info import get_cu_num
 
-        cu_num = get_cu_num() * int(cu_num_mul)
+        cu_num = (
+            int(persist_cu) if int(persist_cu) > 0 else get_cu_num() * int(cu_num_mul)
+        )
     else:
         cu_num = 0
     sbm_tag = "" if _sort_block_m == tile_m else f"_sbm{_sort_block_m}"
@@ -3459,7 +3512,7 @@ def compile_mixed_moe_gemm2_common(
     num_k_tiles_per_batch = int(inter_dim) // int(tile_k)
     async_tag = "_async" if use_async_copy else ""
     cumul_tag = f"_cumul{int(cu_num_mul)}" if int(cu_num_mul) != 1 else ""
-    acc_tag = "" if accumulate else "_acc0"
+    acc_tag = "" if accumulate else ("_acc0_cs" if route_out_cacheable else "_acc0")
     xcd_tag = f"_xcd{xcd_swizzle}" if xcd_swizzle > 0 else ""
     heterogeneous_tag = f"_shared_fp8_e{shared_expert_id}" if heterogeneous_b else ""
     serial_n_tag = "_serialn128" if serial_shared_n else ""
@@ -3634,7 +3687,6 @@ def compile_mixed_moe_gemm2_common(
                 if doweight_stage2
                 else None
             )
-
             c_topk = arith.constant(topk, index=True)
 
             c_elem_bytes = arith.constant(int(a_elem_bytes), index=True)
@@ -5054,7 +5106,7 @@ def compile_mixed_moe_gemm2_common(
                             frag_v,
                             out_ptr_v,
                             alignment=e_vec * out_elem_bytes,
-                            nontemporal=True,
+                            nontemporal=not route_out_cacheable,
                         )
                     elif const_expr(use_buf_atomic):
                         col_i32 = fx.Int32(col_g0)
@@ -5311,6 +5363,7 @@ def compile_mixed_moe_gemm2_common(
         waves_per_eu,
         use_async_copy,
         xcd_swizzle,
+        route_out_cacheable,
     )
     if heterogeneous_b:
         cache_tag += (shared_expert_id,)

@@ -48,7 +48,7 @@ def _warn_tile_override(axis: str, inter_dim: int, requested: int, resolved: int
 
 
 _SUFFIX_RE = re.compile(
-    r"(?:_kw(?P<kw>\d+))?(?P<fp4>_fp4)?(?P<fp8>_fp8)?(?:_sbm(?P<sbm>\d+))?$"
+    r"(?:_kw(?P<kw>\d+))?(?P<fp4>_fp4(?P<fp4ru>ru)?)?(?P<fp8>_fp8)?(?:_sbm(?P<sbm>\d+))?$"
 )
 
 
@@ -158,7 +158,9 @@ def resolve_flydsl_stage1_tile_n(inter_dim: int, tile_n: int) -> int:
 def get_flydsl_kernel_params(name: str) -> dict | None:
     """Lookup kernel params by name.
 
-    Strips ``_kw{N}`` / ``_fp4`` / ``_fp8`` / ``_sbm{N}`` suffixes transparently.
+    Strips ``_kw{N}`` / ``_fp4`` / ``_fp4ru`` / ``_fp8`` / ``_sbm{N}`` suffixes
+    transparently. ``_fp4ru`` is ``_fp4`` with the standalone quant's RoundUp
+    e8m0 scales on bf16-rounded values (bitwise equal to bf16 out + quant).
     """
     params = _KERNEL_PARAMS.get(name)
     if params is not None:
@@ -173,6 +175,8 @@ def get_flydsl_kernel_params(name: str) -> dict | None:
                 extra["k_wave"] = int(m.group("kw"))
             if m.group("fp4"):
                 extra["out_dtype"] = "fp4"
+                if m.group("fp4ru"):
+                    extra["fp4_round_up"] = True
             if m.group("fp8"):
                 extra["out_dtype"] = "fp8"
             if m.group("sbm") is not None:
@@ -451,6 +455,86 @@ def _register_production_variants_stage2(
                 "cu_num_mul": 3,
             },
         ),
+        # MODEL_A DPTP8 + MTP4 on gfx950.  The MoE input is gathered across the
+        # eight DP ranks, so local decode BS {8,16,32,64} maps to padded token
+        # tiers {256,512,1024,2048}.  Keep the atomic epilogue used by the
+        # accuracy-validated production path; only tune tiling and the exact
+        # persistent grid size.
+        (
+            "fp4",
+            "fp4",
+            "bf16",
+            16,
+            128,
+            256,
+            "atomic",
+            "_model_a_persist_cu240_w2_sbm32",
+            {
+                "persist": True,
+                "persist_cu": 240,
+                "waves_per_eu": 2,
+                "sort_block_m": 32,
+            },
+        ),
+        (
+            "fp4",
+            "fp4",
+            "bf16",
+            32,
+            128,
+            256,
+            "atomic",
+            "_model_a_persist_cu352_w4",
+            {"persist": True, "persist_cu": 352, "waves_per_eu": 4},
+        ),
+        (
+            "fp4",
+            "fp4",
+            "bf16",
+            32,
+            128,
+            256,
+            "atomic",
+            "_model_a_persist_cu360_w4",
+            {"persist": True, "persist_cu": 360, "waves_per_eu": 4},
+        ),
+        (
+            "fp4",
+            "fp4",
+            "bf16",
+            32,
+            128,
+            256,
+            "atomic",
+            "_model_a_persist_cu736_w1_sbm64",
+            {
+                "persist": True,
+                "persist_cu": 736,
+                "waves_per_eu": 1,
+                "sort_block_m": 64,
+            },
+        ),
+        # Decode reduce-mode variant (E=256, topk=8, H=6144, I=256 on gfx950):
+        # one non-persistent workgroup per tile (pm1), GEMM writes unweighted
+        # route rows (dw) that the reducer weights, with cacheable stores (cs)
+        # so the reducer reads them back from L2/MALL.
+        (
+            "fp4",
+            "fp4",
+            "bf16",
+            64,
+            256,
+            256,
+            "reduce",
+            "_pm1_w4_dw_cs",
+            {
+                "persist": False,
+                "persist_m": 1,
+                "waves_per_eu": 4,
+                "defer_weight": True,
+                "cacheable_out": True,
+            },
+        ),
     )
     for pa, pb, pout, ptm, ptn, ptk, pmode, psuffix, povr in PRODUCTION_VARIANTS:
         if (pa, pb, pout) != (a_dtype, b_dtype, out_dtype):
@@ -633,6 +717,7 @@ def compile_flydsl_moe_stage1(
     xcd_swizzle: int = 0,
     k_wave: int = 1,
     v2_output_layout: bool = False,
+    fp4_round_up: bool = False,
 ):
     """Compile stage1 kernel (cached via underlying lru_cache)."""
     # a16w-mix (bf16 A x {fp4 mxfp4, int4} W): build the ported gemm1
@@ -693,6 +778,7 @@ def compile_flydsl_moe_stage1(
             xcd_swizzle=xcd_swizzle,
             k_wave=k_wave,
             v2_output_layout=v2_output_layout,
+            fp4_round_up=fp4_round_up,
         )
     else:
         raise ValueError(
@@ -718,12 +804,14 @@ def compile_flydsl_moe_stage2(
     waves_per_eu: int | None = None,
     use_async_copy: bool = False,
     cu_num_mul: int = 1,
+    persist_cu: int = 0,
     b_nt: int = 0,
     model_dim_pad: int = 0,
     inter_dim_pad: int = 0,
     xcd_swizzle: int = 0,
     enable_bias: bool = False,
     mode: str = "atomic",
+    cacheable_out: bool = False,
 ):
     """Compile stage2 kernel (cached via underlying lru_cache)."""
     # a16w-mix (bf16 A x {fp4 mxfp4, int4} W) down-proj: build the ported gemm2
@@ -771,6 +859,7 @@ def compile_flydsl_moe_stage2(
             waves_per_eu=waves_per_eu,
             use_async_copy=use_async_copy,
             cu_num_mul=cu_num_mul,
+            persist_cu=persist_cu,
             # API parity (reviewer #3): forward `b_nt` and `xcd_swizzle`
             # from the kernel-name parser. They are accepted as ignored
             # kwargs on the fp4xfp4 path so callers parsing the
@@ -781,6 +870,7 @@ def compile_flydsl_moe_stage2(
             model_dim_pad=model_dim_pad,
             inter_dim_pad=inter_dim_pad,
             enable_bias=enable_bias,
+            cacheable_out=cacheable_out,
         )
     else:
         raise ValueError(
@@ -1463,6 +1553,7 @@ def _flydsl_moe_stage1_impl(
     swiglu_limit: float | None = None,
     k_wave: int = 1,
     v2_output_layout: bool = False,
+    fp4_round_up: bool = False,
     _compile_kernel=compile_flydsl_moe_stage1,
     _build_mx_args=_s1_args_fp4,
 ):
@@ -1746,6 +1837,8 @@ def _flydsl_moe_stage1_impl(
     # The injected FHMoE compiler does not implement the v2 sorted-row layout.
     if _v2_output_layout:
         compile_kwargs["v2_output_layout"] = True
+    if fp4_round_up:
+        compile_kwargs["fp4_round_up"] = True
     exe = _compile_kernel(**compile_kwargs)
     _run_compiled(exe, args)
 
@@ -1927,6 +2020,7 @@ def flydsl_moe_stage1(
     swiglu_limit: float | None = None,
     k_wave: int = 1,
     v2_output_layout: bool = False,
+    fp4_round_up: bool = False,
 ):
     """Fused gate+up GEMM (MOE stage1).
 
@@ -1984,6 +2078,7 @@ def flydsl_moe_stage1(
         swiglu_limit=swiglu_limit,
         k_wave=k_wave,
         v2_output_layout=v2_output_layout,
+        fp4_round_up=fp4_round_up,
     )
 
 
@@ -2008,9 +2103,11 @@ def _flydsl_moe_stage2_impl(
     sorted_weights: torch.Tensor | None = None,
     sort_block_m: int = 0,
     persist: bool | None = None,
+    persist_m: int | None = None,
     waves_per_eu: int | None = None,
     use_async_copy: bool = False,
     cu_num_mul: int = 1,
+    persist_cu: int = 0,
     b_nt: int = 0,
     model_dim_pad: int = 0,
     inter_dim_pad: int = 0,
@@ -2019,6 +2116,8 @@ def _flydsl_moe_stage2_impl(
     return_per_slot: bool = False,
     expert_mask: torch.Tensor | None = None,
     topk_ids: torch.Tensor | None = None,
+    topk_weights: torch.Tensor | None = None,
+    cacheable_out: bool = False,
     _compile_kernel=compile_flydsl_moe_stage2,
     _build_mx_args=_s2_args_fp4,
 ) -> torch.Tensor:
@@ -2163,7 +2262,11 @@ def _flydsl_moe_stage2_impl(
     sw = (
         sorted_weights
         if sorted_weights is not None
-        else torch.empty(sorted_token_ids.shape, dtype=torch.float32, device=dev)
+        else (
+            topk_weights
+            if topk_weights is not None
+            else torch.empty(sorted_token_ids.shape, dtype=torch.float32, device=dev)
+        )
     )
 
     _sbm = sort_block_m if sort_block_m > 0 else tile_m
@@ -2172,7 +2275,11 @@ def _flydsl_moe_stage2_impl(
     else:
         total_sorted = sorted_expert_ids.shape[0] * _sbm
         m_blocks = (total_sorted + tile_m - 1) // tile_m
-    if persist is True:
+    if persist_m is not None:
+        if int(persist_m) < 1:
+            raise ValueError(f"persist_m must be >= 1, got {persist_m}")
+        _persist_m = int(persist_m)
+    elif persist is True:
         _persist_m = -1
     elif persist is False:
         _persist_m = 4 if m_blocks > 256 else 1
@@ -2276,11 +2383,13 @@ def _flydsl_moe_stage2_impl(
         waves_per_eu=waves_per_eu,
         use_async_copy=use_async_copy,
         cu_num_mul=cu_num_mul,
+        persist_cu=persist_cu,
         b_nt=b_nt,
         model_dim_pad=model_dim_pad,
         inter_dim_pad=inter_dim_pad,
         xcd_swizzle=xcd_swizzle,
         enable_bias=(bias is not None),
+        **({"cacheable_out": True} if cacheable_out and not accumulate else {}),
     )
     _run_compiled(exe, args)
 
@@ -2300,6 +2409,7 @@ def _flydsl_moe_stage2_impl(
             expert_mask,
             topk_ids,
             is_fp8=_s2_fp8_inter,
+            topk_weights=topk_weights,
             fp8_scale_blk=_S2_LEGACY_FP8_SCALE_BLK,
             fp8_pitch_align=_S2_LEGACY_FP8_PITCH_ALIGN,
         )
@@ -2327,9 +2437,11 @@ def flydsl_moe_stage2(
     sorted_weights: torch.Tensor | None = None,
     sort_block_m: int = 0,
     persist: bool | None = None,
+    persist_m: int | None = None,
     waves_per_eu: int | None = None,
     use_async_copy: bool = False,
     cu_num_mul: int = 1,
+    persist_cu: int = 0,
     b_nt: int = 0,
     model_dim_pad: int = 0,
     inter_dim_pad: int = 0,
@@ -2338,6 +2450,8 @@ def flydsl_moe_stage2(
     return_per_slot: bool = False,
     expert_mask: torch.Tensor | None = None,
     topk_ids: torch.Tensor | None = None,
+    topk_weights: torch.Tensor | None = None,
+    cacheable_out: bool = False,
 ) -> torch.Tensor:
     """Down-projection GEMM (MOE stage2). Supports atomic/reduce modes.
 
@@ -2351,6 +2465,11 @@ def flydsl_moe_stage2(
     persist: if True, use persistent round-robin mode (grid_y=cu_num);
         if False, use legacy persist_m mode; if None, auto-select.
 
+    persist_cu: exact persistent grid size when positive. A value of 0 keeps
+        the default ``physical_cu_count * cu_num_mul`` behavior. This is a
+        workgroup count, not a hardware-CU count, so a tuned value may be
+        greater than the number of physical CUs.
+
     return_per_slot: when True, return the raw per-(token, slot) output as a
         contiguous (token_num, topk, model_dim) tensor without applying the
         topk reduction.
@@ -2359,6 +2478,13 @@ def flydsl_moe_stage2(
         post-GEMM reduction fuses the EP validity gather
         ``valid = expert_mask[topk_ids[t, k]] != 0`` and only sums valid
         slots. expert_mask is [num_experts] i32, topk_ids is [token_num, topk] i32.
+
+    topk_weights: reduce mode only. When given (with sorted_weights=None) the
+        GEMM writes unweighted route rows and the reducer applies these
+        token-major FP32 weights ("deferred weight").
+
+    cacheable_out: reduce mode only. Store route rows cacheable instead of
+        non-temporal so the reducer can read them back from L2/MALL.
     """
     return _flydsl_moe_stage2_impl(
         inter_states=inter_states,
@@ -2380,9 +2506,11 @@ def flydsl_moe_stage2(
         sorted_weights=sorted_weights,
         sort_block_m=sort_block_m,
         persist=persist,
+        persist_m=persist_m,
         waves_per_eu=waves_per_eu,
         use_async_copy=use_async_copy,
         cu_num_mul=cu_num_mul,
+        persist_cu=persist_cu,
         b_nt=b_nt,
         model_dim_pad=model_dim_pad,
         inter_dim_pad=inter_dim_pad,
@@ -2391,6 +2519,8 @@ def flydsl_moe_stage2(
         return_per_slot=return_per_slot,
         expert_mask=expert_mask,
         topk_ids=topk_ids,
+        topk_weights=topk_weights,
+        cacheable_out=cacheable_out,
     )
 
 
