@@ -125,12 +125,19 @@ def compile_mixed_moe_gemm1_common(
     shared_expert_id: int | None = None,
     v2_output_layout: bool = False,
     fp4_round_up: bool = False,
+    a_scale_token: bool = False,
 ):
     """Compile stage1 kernel: act(X @ W_gate.T, X @ W_up.T) -> [tokens*topk, inter_dim].
 
     fp4_round_up (fp4 out only): quantize the bf16-rounded activation with
     ceil_pow2(amax / 6) e8m0 scales, i.e. exactly what the bf16 output followed
     by the standalone ``fused_mx_quant_moe_sort`` kernel produces.
+
+    a_scale_token: ``arg_scale_x`` is the unsorted per-token e8m0 scale
+    ``[tokens, model_dim // 32]`` (``per_1x32_mx_quant_hip(shuffle=False)``)
+    instead of the sorted, swizzled ``mxfp4_moe_sort`` output; the kernel
+    gathers it through ``sorted_token_ids`` like it gathers A, so the separate
+    scale-sort kernel is not needed. The MFMA sees the same scale bytes.
     """
     heterogeneous_b = shared_expert_id is not None
     if heterogeneous_b and shared_expert_id != experts - 1:
@@ -248,6 +255,23 @@ def compile_mixed_moe_gemm1_common(
     need_sort = need_quant
     if fp4_round_up and not need_fp4:
         raise ValueError("fp4_round_up requires out_dtype='fp4'")
+    if a_scale_token and (
+        a_scale_one
+        or not is_f4_a
+        or tile_m % 32 != 0
+        or model_dim % 256 != 0
+        or total_threads % (tile_m // 2) != 0
+    ):
+        raise ValueError(
+            "a_scale_token requires fp4 A with real scales, tile_m % 32 == 0, "
+            "model_dim % 256 == 0 and a thread count divisible by tile_m / 2; got "
+            f"{a_dtype=}, {a_scale_one=}, {tile_m=}, {model_dim=}, {total_threads=}"
+        )
+    # LDS copy of the block's A scale in the sorted layout: per 32-row group,
+    # model_dim / 256 K tiles of 64 dwords.
+    a_scale_lds_bytes = (
+        (tile_m // 32) * (model_dim // 256) * 256 if a_scale_token else 0
+    )
 
     fp4q_tag = ("_fp4qru" if fp4_round_up else "_fp4q") if need_fp4 else ""
     fp8q_tag = "_fp8q" if need_fp8 else ""
@@ -258,6 +282,7 @@ def compile_mixed_moe_gemm1_common(
     go_tag = "_go" if mock_gate_only else ""
     gui_tag = "_gui" if gate_up_interleave else ""
     as1_tag = "_as1" if a_scale_one else ""
+    tsc_tag = "_tsc" if a_scale_token else ""
     xcd_tag = f"_xcd{xcd_swizzle}" if xcd_swizzle > 0 else ""
     v2out_tag = "_v2out" if v2_output_layout else ""
     # Keep the historical name for silu; swiglu/situv2 get distinct symbols so
@@ -270,7 +295,7 @@ def compile_mixed_moe_gemm1_common(
     kernel_version = 34 if heterogeneous_b else 33
     module_name = (
         f"mfma_moe1_silu_mul_a{a_dtype}_w{b_dtype}_{out_s}"
-        f"_t{tile_m}x{tile_n}x{tile_k}_pm{persist_m}{fp4q_tag}{fp8q_tag}{sort_tag}{async_tag}{sk_tag}{kw_tag}{go_tag}{gui_tag}{as1_tag}{xcd_tag}{act_tag}{v2out_tag}{heterogeneous_tag}_v{kernel_version}"
+        f"_t{tile_m}x{tile_n}x{tile_k}_pm{persist_m}{fp4q_tag}{fp8q_tag}{sort_tag}{async_tag}{sk_tag}{kw_tag}{go_tag}{gui_tag}{as1_tag}{tsc_tag}{xcd_tag}{act_tag}{v2out_tag}{heterogeneous_tag}_v{kernel_version}"
     ).replace("-", "_")
 
     cshuffle_elem_bytes = 4 if need_quant else (4 if out_is_f32 else 2)
@@ -322,7 +347,7 @@ def compile_mixed_moe_gemm1_common(
     if waves_per_eu is not None and waves_per_eu >= 1:
         total_cu_lds = 160 * 1024
         min_lds = total_cu_lds // (waves_per_eu + 1) + 1
-        cur_lds = pong_field_bytes + ping_field_bytes
+        cur_lds = pong_field_bytes + ping_field_bytes + a_scale_lds_bytes
         if cur_lds < min_lds:
             ping_field_bytes += min_lds - cur_lds
 
@@ -572,14 +597,27 @@ def compile_mixed_moe_gemm1_common(
             # Two independent LDS arenas (ping/pong) as separate fly-shared byte
             # fields; sub-buffers are carved by recast_iter at the same byte
             # offsets the legacy allocator used, so the layout is unchanged.
-            @fx.struct
-            class _MoeGemm1Smem:
-                pong: fx.Array[fx.Uint8, pong_field_bytes, 16]
-                ping: fx.Array[fx.Uint8, ping_field_bytes, 16]
+            if const_expr(a_scale_token):
+
+                @fx.struct
+                class _MoeGemm1Smem:
+                    pong: fx.Array[fx.Uint8, pong_field_bytes, 16]
+                    ping: fx.Array[fx.Uint8, ping_field_bytes, 16]
+                    ascale: fx.Array[fx.Uint8, a_scale_lds_bytes, 16]
+
+            else:
+
+                @fx.struct
+                class _MoeGemm1Smem:
+                    pong: fx.Array[fx.Uint8, pong_field_bytes, 16]
+                    ping: fx.Array[fx.Uint8, ping_field_bytes, 16]
 
             _lds = fx.SharedAllocator().allocate(_MoeGemm1Smem).peek()
             lds_x_pong = _lds.pong.ptr
             lds_x_ping = _lds.ping.ptr
+            lds_ascale = (
+                fx.recast_iter(fx.Int32, _lds.ascale.ptr) if a_scale_token else None
+            )
             base_ptr_pong = lds_x_pong
             base_ptr_ping = lds_x_ping
             if _use_cshuffle_epilog:
@@ -617,11 +655,14 @@ def compile_mixed_moe_gemm1_common(
             if const_expr(not a_scale_one):
                 c32 = arith.constant(32, index=True)
                 kblk = k_in // c32
-                scale_rows = (
-                    (sorted_m + arith.constant(31, index=True))
-                    // arith.constant(32, index=True)
-                    * arith.constant(32, index=True)
-                )
+                if const_expr(a_scale_token):
+                    scale_rows = tokens_in
+                else:
+                    scale_rows = (
+                        (sorted_m + arith.constant(31, index=True))
+                        // arith.constant(32, index=True)
+                        * arith.constant(32, index=True)
+                    )
                 sx_nbytes_idx = scale_rows * kblk
                 sx_nbytes_i32 = fx.Int32(sx_nbytes_idx)
                 sx_rsrc = ptr_buffer_resource(arg_scale_x, sx_nbytes_i32)
@@ -1029,7 +1070,116 @@ def compile_mixed_moe_gemm1_common(
                             up_mni * layout_b_scale.stride_n0 + scale_lane_elem
                         )
 
-                if const_expr(not a_scale_one):
+                if const_expr(a_scale_token):
+                    # The block's A scale is gathered once into LDS in the sorted
+                    # layout (per 32-row group and K tile: dword c * 16 + r packs
+                    # rows r, r + 16 x K-groups c, c + 4). Thread t fills rows
+                    # t % 16 and t % 16 + 16 of group (t / 16) % groups for K
+                    # tiles t / (tile_m / 2) + i * total_threads / (tile_m / 2).
+                    # Invalid rows point one row past the buffer and read 0,
+                    # like the sorted layout's padding rows.
+                    as_groups = tile_m // 32
+                    as_ktiles = model_dim // 256
+                    as_kt_stride = total_threads // (16 * as_groups)
+                    as_iters = (as_ktiles + as_kt_stride - 1) // as_kt_stride
+                    c_tok_row_dw = arith.constant(model_dim // 128, index=True)
+                    as_r = tx % arith.constant(16, index=True)
+                    as_g = (tx // arith.constant(16, index=True)) % arith.constant(
+                        as_groups, index=True
+                    )
+                    as_kt0 = tx // arith.constant(16 * as_groups, index=True)
+                    as_kt_last = arith.constant(as_ktiles - 1, index=True)
+
+                    def issue_a_scale_gather():
+                        rows_dw = []
+                        for half in range_constexpr(2):
+                            sorted_row = (
+                                bx_m
+                                + as_g * arith.constant(32, index=True)
+                                + arith.constant(half * 16, index=True)
+                                + as_r
+                            )
+                            fused = fx.Uint32(
+                                buffer_ops.buffer_load(
+                                    sorted_rsrc, sorted_row, vec_width=1, dtype=T.i32
+                                )
+                            )
+                            tok = fused & fx.Uint32(mask24)
+                            ok = (tok < fx.Uint32(tokens_i32)) & (
+                                (fused >> fx.Uint32(24)) < fx.Uint32(topk_i32)
+                            )
+                            rows_dw.append(
+                                fx.Index(ok.select(tok, fx.Uint32(tokens_i32)))
+                                * c_tok_row_dw
+                            )
+                        loads = []
+                        for it in range_constexpr(as_iters):
+                            kt = as_kt0 + arith.constant(it * as_kt_stride, index=True)
+                            if const_expr((it + 1) * as_kt_stride > as_ktiles):
+                                kt = arith.select(
+                                    arith.cmpi(CmpIPredicate.ult, kt, as_kt_last),
+                                    kt,
+                                    as_kt_last,
+                                )
+                            pairs = [
+                                fx.Vector(
+                                    buffer_ops.buffer_load(
+                                        sx_rsrc,
+                                        rows_dw[half]
+                                        + kt * arith.constant(2, index=True),
+                                        vec_width=2,
+                                        dtype=T.i32,
+                                    )
+                                )
+                                for half in range_constexpr(2)
+                            ]
+                            loads.append((kt, pairs))
+                        return loads
+
+                    def store_a_scale_lds(loads):
+                        byte = fx.Uint32(0xFF)
+                        for kt, (p0, p1) in loads:
+                            r0_lo, r0_hi = fx.Uint32(p0[0]), fx.Uint32(p0[1])
+                            r1_lo, r1_hi = fx.Uint32(p1[0]), fx.Uint32(p1[1])
+                            base = (
+                                as_g * arith.constant(as_ktiles * 64, index=True)
+                                + kt * arith.constant(64, index=True)
+                                + as_r
+                            )
+                            for c in range_constexpr(4):
+                                sh = fx.Uint32(8 * c)
+                                packed = (
+                                    ((r0_lo >> sh) & byte)
+                                    | (((r1_lo >> sh) & byte) << fx.Uint32(8))
+                                    | (((r0_hi >> sh) & byte) << fx.Uint32(16))
+                                    | ((r1_hi >> sh) << fx.Uint32(24))
+                                )
+                                fx.ptr_store(
+                                    fx.Vector.from_elements(
+                                        [packed.ir_value()], fx.Int32
+                                    ),
+                                    lds_ascale
+                                    + fx.Int64(
+                                        base + arith.constant(c * 16, index=True)
+                                    ),
+                                )
+                        rocdl.sched_barrier(0)
+                        barrier(lgkmcnt=0)
+                        rocdl.sched_barrier(0)
+
+                    as_lane = lane_div_16 * arith.constant(16, index=True) + lane_mod_16
+
+                    def load_a_scale_token(mi, k_group):
+                        return fx.ptr_load(
+                            lds_ascale
+                            + fx.Int64(
+                                as_lane
+                                + arith.constant(mi * as_ktiles * 64, index=True)
+                                + k_group * arith.constant(64, index=True)
+                            )
+                        ).ir_value()
+
+                elif const_expr(not a_scale_one):
                     a_scale_bases = []
                     for mi in range_constexpr(m_repeat_packed):
                         a_mni = mi + bx_m // scale_mn_pack // 16
@@ -1094,6 +1244,11 @@ def compile_mixed_moe_gemm1_common(
                         for mi in range_constexpr(m_repeat_packed):
                             if const_expr(a_scale_one):
                                 a_scale_tile.append(as1_vec)
+                            elif const_expr(a_scale_token):
+                                s = load_a_scale_token(
+                                    mi, base_k + arith.constant(ku, index=True)
+                                )
+                                a_scale_tile.append(fx.Vector.from_elements([s], i32_t))
                             else:
                                 s = buffer_ops.buffer_load(
                                     sx_rsrc,
@@ -1587,6 +1742,13 @@ def compile_mixed_moe_gemm1_common(
                                 for mi_p in range_constexpr(m_repeat_packed):
                                     if const_expr(a_scale_one):
                                         new_as_list.append(as1_const)
+                                    elif const_expr(a_scale_token):
+                                        new_as_list.append(
+                                            load_a_scale_token(
+                                                mi_p,
+                                                sk + arith.constant(ku_s, index=True),
+                                            )
+                                        )
                                     else:
                                         raw_as = buffer_ops.buffer_load(
                                             sx_rsrc,
@@ -1748,6 +1910,9 @@ def compile_mixed_moe_gemm1_common(
 
                 rocdl.sched_barrier(0)
 
+                # Issued before the first A tile so waiting on them does not
+                # also wait on that tile's loads.
+                as_loads = issue_a_scale_gather() if a_scale_token else None
                 k0 = body_k_base_idx
                 if const_expr(use_async_copy):
                     prefetch_x_to_lds(k0, body_lds_x_pong)
@@ -1755,6 +1920,8 @@ def compile_mixed_moe_gemm1_common(
                     x_regs0 = load_x_tile(k0)
                     store_x_tile_to_lds(x_regs0, body_lds_x_pong)
                 rocdl.sched_barrier(0)
+                if const_expr(a_scale_token):
+                    store_a_scale_lds(as_loads)
                 k0_scale = body_k_base_idx // arith.constant(pack_K * 128, index=True)
                 a_scale_pong, gate_bs_pong, up_bs_pong = prefetch_ab_scale_tile(
                     k0_scale

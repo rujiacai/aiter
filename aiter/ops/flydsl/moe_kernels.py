@@ -48,7 +48,8 @@ def _warn_tile_override(axis: str, inter_dim: int, requested: int, resolved: int
 
 
 _SUFFIX_RE = re.compile(
-    r"(?:_kw(?P<kw>\d+))?(?P<fp4>_fp4(?P<fp4ru>ru)?)?(?P<fp8>_fp8)?(?:_sbm(?P<sbm>\d+))?$"
+    r"(?:_kw(?P<kw>\d+))?(?P<fp4>_fp4(?P<fp4ru>ru)?)?(?P<fp8>_fp8)?(?P<tsc>_tsc)?"
+    r"(?:_sbm(?P<sbm>\d+))?$"
 )
 
 
@@ -158,9 +159,11 @@ def resolve_flydsl_stage1_tile_n(inter_dim: int, tile_n: int) -> int:
 def get_flydsl_kernel_params(name: str) -> dict | None:
     """Lookup kernel params by name.
 
-    Strips ``_kw{N}`` / ``_fp4`` / ``_fp4ru`` / ``_fp8`` / ``_sbm{N}`` suffixes
-    transparently. ``_fp4ru`` is ``_fp4`` with the standalone quant's RoundUp
-    e8m0 scales on bf16-rounded values (bitwise equal to bf16 out + quant).
+    Strips ``_kw{N}`` / ``_fp4`` / ``_fp4ru`` / ``_fp8`` / ``_tsc`` / ``_sbm{N}``
+    suffixes transparently. ``_fp4ru`` is ``_fp4`` with the standalone quant's
+    RoundUp e8m0 scales on bf16-rounded values (bitwise equal to bf16 out +
+    quant). ``_tsc`` makes stage1 read the unsorted per-token A scale, so
+    fused_moe skips the A-scale sort kernel.
     """
     params = _KERNEL_PARAMS.get(name)
     if params is not None:
@@ -179,6 +182,8 @@ def get_flydsl_kernel_params(name: str) -> dict | None:
                     extra["fp4_round_up"] = True
             if m.group("fp8"):
                 extra["out_dtype"] = "fp8"
+            if m.group("tsc"):
+                extra["a_scale_token"] = True
             if m.group("sbm") is not None:
                 extra["sort_block_m"] = int(m.group("sbm"))
             return {**params, **extra}
@@ -718,6 +723,7 @@ def compile_flydsl_moe_stage1(
     k_wave: int = 1,
     v2_output_layout: bool = False,
     fp4_round_up: bool = False,
+    a_scale_token: bool = False,
 ):
     """Compile stage1 kernel (cached via underlying lru_cache)."""
     # a16w-mix (bf16 A x {fp4 mxfp4, int4} W): build the ported gemm1
@@ -779,6 +785,7 @@ def compile_flydsl_moe_stage1(
             k_wave=k_wave,
             v2_output_layout=v2_output_layout,
             fp4_round_up=fp4_round_up,
+            a_scale_token=a_scale_token,
         )
     else:
         raise ValueError(
@@ -1554,6 +1561,7 @@ def _flydsl_moe_stage1_impl(
     k_wave: int = 1,
     v2_output_layout: bool = False,
     fp4_round_up: bool = False,
+    a_scale_token: bool = False,
     _compile_kernel=compile_flydsl_moe_stage1,
     _build_mx_args=_s1_args_fp4,
 ):
@@ -1839,6 +1847,8 @@ def _flydsl_moe_stage1_impl(
         compile_kwargs["v2_output_layout"] = True
     if fp4_round_up:
         compile_kwargs["fp4_round_up"] = True
+    if a_scale_token:
+        compile_kwargs["a_scale_token"] = True
     exe = _compile_kernel(**compile_kwargs)
     _run_compiled(exe, args)
 
@@ -2021,6 +2031,7 @@ def flydsl_moe_stage1(
     k_wave: int = 1,
     v2_output_layout: bool = False,
     fp4_round_up: bool = False,
+    a_scale_token: bool = False,
 ):
     """Fused gate+up GEMM (MOE stage1).
 
@@ -2079,6 +2090,7 @@ def flydsl_moe_stage1(
         k_wave=k_wave,
         v2_output_layout=v2_output_layout,
         fp4_round_up=fp4_round_up,
+        a_scale_token=a_scale_token,
     )
 
 

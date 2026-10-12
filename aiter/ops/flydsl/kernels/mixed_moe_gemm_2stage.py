@@ -56,6 +56,7 @@ def compile_mixed_moe_gemm1(
     k_wave: int = 1,
     v2_output_layout: bool = False,
     fp4_round_up: bool = False,
+    a_scale_token: bool = False,
 ):
     """Compile an ordinary stage1 MoE kernel."""
     return compile_mixed_moe_gemm1_common(
@@ -86,6 +87,7 @@ def compile_mixed_moe_gemm1(
         k_wave=k_wave,
         v2_output_layout=v2_output_layout,
         fp4_round_up=fp4_round_up,
+        a_scale_token=a_scale_token,
     )
 
 

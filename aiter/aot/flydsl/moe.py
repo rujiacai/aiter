@@ -248,6 +248,7 @@ def _precompile_to_cache(
     use_async_copy: bool = False,
     cu_num_mul: int = 1,
     fp4_round_up: bool = False,
+    a_scale_token: bool = False,
     _aot_backend=None,
     **kwargs,
 ):
@@ -623,6 +624,7 @@ def _precompile_to_cache(
                 k_wave=k_wave,
                 v2_output_layout=_v2_output_layout,
                 **({"fp4_round_up": True} if fp4_round_up else {}),
+                **({"a_scale_token": True} if a_scale_token else {}),
             )
             _run_compiled(exe, args)
 

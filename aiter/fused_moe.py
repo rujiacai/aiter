@@ -20,6 +20,7 @@ from aiter import (
     fused_dynamic_mxfp8_quant_moe_sort,
     logger,
     mxfp4_moe_sort_fwd,
+    per_1x32_mx_quant_hip,
 )
 from aiter import get_hip_quant as get_quant
 from aiter.jit.core import AITER_CONFIGS, AITER_CSRC_DIR, PY, bd_dir, mp_lock
@@ -1674,9 +1675,11 @@ class MOEMetadata:
     # Feature flags:
     #  - output_aux: the sort emits the gemm/scatter extras (m_indices/reverse_sorted).
     #  - prequant: fused_moe_2stages quantizes a1 before stage1.
+    #  - a1_scale_by_token: stage1 reads the unsorted per-token a1 scale.
     output_aux: bool = False
     prequant: bool = True
     skip_inter_quant: bool = False
+    a1_scale_by_token: bool = False
     route_bucket: str = ""
     expected_sorted_blocks: int | None = None
     min_sorted_blocks: int | None = None
@@ -1789,6 +1792,7 @@ def _flydsl_stage1_wrapper(
         k_wave=parsed.get("k_wave", 1),
         v2_output_layout=v2_output_layout,
         fp4_round_up=parsed.get("fp4_round_up", False),
+        a_scale_token=parsed.get("a_scale_token", False),
     )
 
 
@@ -2945,7 +2949,14 @@ def get_2stage_cfgs(
         enable_bias = (
             _needs_swiglu_bias_support(dtype, q_type) and q_dtype_w == dtypes.fp4x2
         )
-        _s1_fp4q = is_flydsl1 and "_fp4" in kernelName1.split("_t")[-1]
+        _s1_suffix = re.split(r"_t\d+x\d+x\d+", kernelName1)[-1] if is_flydsl1 else ""
+        _s1_fp4q = "_fp4" in _s1_suffix
+        _s1_params = (
+            _get_flydsl_moe_kernels().get_flydsl_kernel_params(kernelName1)
+            if is_flydsl1
+            else None
+        )
+        _s1_tsc = bool(_s1_params and _s1_params.get("a_scale_token"))
         if is_opus1:
             stage1_func = functools.partial(
                 _opus_a8w4_stage1_wrapper,
@@ -3015,7 +3026,7 @@ def get_2stage_cfgs(
                 quant_type=q_type,
                 use_non_temporal_load=use_non_temporal_load,
             )
-        _s1_fp8q = is_opus1 or (is_flydsl1 and "_fp8" in kernelName1.split("_t")[-1])
+        _s1_fp8q = is_opus1 or "_fp8" in _s1_suffix
         _fuse_quant = "fp8" if _s1_fp8q else ("fp4" if _s1_fp4q else "")
         if flydsl_v2_stage2_cfg is not None:
             stage1_func.keywords["out_dtype"] = flydsl_v2_stage2_cfg["a_dtype"]
@@ -3030,6 +3041,7 @@ def get_2stage_cfgs(
             fuse_quant=_fuse_quant,
             stage2_has_bias=enable_bias and (is_flydsl2 or is_cktile2),
             skip_inter_quant="_moe2_layout_" in str(kernelName2),
+            a1_scale_by_token=_s1_tsc,
             **route_bucket_metadata,
         )
     if (
@@ -3541,12 +3553,21 @@ def fused_moe_2stages(
             # Input is already quantized to fp4x2 (e.g., from FP4 dispatch),
             # skip re-quantization, only sort the scale
             a1 = hidden_states
-            a1_scale = mxfp4_moe_sort_fwd(
-                a1_scale,
-                sorted_ids=sorted_ids,
-                num_valid_ids=num_valid_ids,
-                token_num=token_num,
-                cols=model_dim,
+            if not metadata.a1_scale_by_token:
+                a1_scale = mxfp4_moe_sort_fwd(
+                    a1_scale,
+                    sorted_ids=sorted_ids,
+                    num_valid_ids=num_valid_ids,
+                    token_num=token_num,
+                    cols=model_dim,
+                )
+        elif metadata.a1_scale_by_token:
+            a1, a1_scale = per_1x32_mx_quant_hip(
+                hidden_states,
+                scale=None,
+                quant_dtype=dtypes.fp4x2,
+                shuffle=False,
+                num_rows=num_local_tokens,
             )
         else:
             a1, a1_scale = fused_dynamic_mxfp4_quant_moe_sort(
