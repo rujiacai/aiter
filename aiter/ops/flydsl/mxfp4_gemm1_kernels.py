@@ -32,6 +32,7 @@ def _get_compiled_mxfp4_gemm1_port(
     xcd_swizzle=0,
     act="silu",
     occ2=False,
+    bf16_quant=False,
 ):
     from .kernels.mxfp4_gemm1 import compile_gemm1_a4w4_port
 
@@ -49,6 +50,7 @@ def _get_compiled_mxfp4_gemm1_port(
         xcd_swizzle=xcd_swizzle,
         act=act,
         occ2=occ2,
+        bf16_quant=bf16_quant,
     )
 
 
@@ -103,7 +105,9 @@ def flydsl_mxfp4_gemm1(
     act="silu",
     situ_beta=1.0,
     situ_linear_beta=1.0,
+    swiglu_limit=None,
     occ2=False,
+    bf16_quant=False,
     stream=None,
 ):
     _assert_supported(
@@ -140,6 +144,7 @@ def flydsl_mxfp4_gemm1(
         xcd_swizzle,
         act,
         occ2,
+        bf16_quant,
     )
     grid = gemm1_grid(n_tokens, BM, NE=NE, TOPK=topk, INTER=D_INTER, BN=BN)
     _moe_kernels._run_compiled(
@@ -159,6 +164,7 @@ def flydsl_mxfp4_gemm1(
             hidden_states.data_ptr(),
             float(situ_beta),
             float(situ_linear_beta),
+            _moe_kernels.runtime_swiglu_limit(swiglu_limit, act),
             torch.cuda.current_stream() if stream is None else stream,
         ),
     )

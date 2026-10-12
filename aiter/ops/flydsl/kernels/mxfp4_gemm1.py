@@ -178,6 +178,7 @@ def _gemm1_body(
     i32_total_m_blocks,
     f32_situ_beta,
     f32_situ_linear_beta,
+    f32_swiglu_limit,
     *,
     BM,
     BN,
@@ -189,6 +190,7 @@ def _gemm1_body(
     interleave=False,
     act="silu",
     occ2=False,
+    bf16_quant=False,
 ):
     KH_TILE = BK // 2
     K_HALF = k_half_for(K)
@@ -831,15 +833,26 @@ def _gemm1_body(
                 up_col = fx.Int32(128) + gate_col
                 gate_vs[ee] = acc_load(acc_idx(row_lds, gate_col))
                 up_vs[ee] = acc_load(acc_idx(row_lds, up_col))
+            if const_expr(act == "silu"):
+                # swiglu_limit clamp (+inf when unset): gate <= limit, |up| <= limit.
+                lim = _raw(f32_swiglu_limit)
+                neg_lim = _raw(-f32_swiglu_limit)
+                gate_vs = [fx.Float32(arith.minnumf(_raw(g), lim)) for g in gate_vs]
+                up_vs = [
+                    fx.Float32(rocdl.fmed3(T.f32, _raw(u), neg_lim, lim)) for u in up_vs
+                ]
             result = _activation_mul_batch(
                 gate_vs, up_vs, act, f32_situ_beta, f32_situ_linear_beta
             )
-
             local_max = _fabs_f32(result[0])
             for ee in range_constexpr(1, 8):
                 local_max = local_max.maximumf(_fabs_f32(result[ee]))
             lm_i = _inline_dpp_quad_amax(fx.Int32(_raw(local_max).bitcast(T.i32)))
             local_max = fx.Float32(_raw(lm_i).bitcast(T.f32))
+            if const_expr(bf16_quant):
+                # Rounding to bf16 is monotonic: the rounded amax is the amax of
+                # the rounded values.
+                local_max = local_max.to(fx.BFloat16).to(fx.Float32)
 
             e8m0, qscale = _e8m0_from_amax(local_max)
             scales_per_mr[mr] = e8m0
@@ -847,14 +860,26 @@ def _gemm1_body(
             packed_i32 = _raw(fx.Int32(0))
             qscale_raw = _raw(qscale)
             for w in range_constexpr(4):
-                packed_i32 = rocdl.cvt_scalef32_pk_fp4_f32(
-                    T.i32,
-                    packed_i32,
-                    _raw(result[2 * w]),
-                    _raw(result[2 * w + 1]),
-                    qscale_raw,
-                    w,
-                )
+                if const_expr(bf16_quant):
+                    pair_bf16 = fx.Vector.from_elements(
+                        [
+                            result[2 * w].to(fx.BFloat16),
+                            result[2 * w + 1].to(fx.BFloat16),
+                        ],
+                        fx.BFloat16,
+                    )
+                    packed_i32 = rocdl.cvt_scalef32_pk_fp4_bf16(
+                        T.i32, packed_i32, _raw(pair_bf16), qscale_raw, w
+                    )
+                else:
+                    packed_i32 = rocdl.cvt_scalef32_pk_fp4_f32(
+                        T.i32,
+                        packed_i32,
+                        _raw(result[2 * w]),
+                        _raw(result[2 * w + 1]),
+                        qscale_raw,
+                        w,
+                    )
             packed = fx.Int32(packed_i32)
 
             byte_pos = (
@@ -919,6 +944,7 @@ def compile_gemm1_a4w4_port(
     xcd_swizzle=0,
     act="silu",
     occ2=False,
+    bf16_quant=False,
 ):
     if act not in ("silu", "situv2"):
         raise ValueError(f"unsupported activation variant {act!r}")
@@ -961,6 +987,8 @@ def compile_gemm1_a4w4_port(
         name_suffix += f"_xcd{xcd_swizzle}"
     if occ2:
         name_suffix += "_occ2"
+    if bf16_quant:
+        name_suffix += "_bf16q"
 
     @fx.struct
     class SharedStorage:
@@ -981,6 +1009,7 @@ def compile_gemm1_a4w4_port(
         arg_hidden: fx.Int64,
         f32_situ_beta: fx.Float32,
         f32_situ_linear_beta: fx.Float32,
+        f32_swiglu_limit: fx.Float32,
     ):
         lds_raw_ptr = fx.SharedAllocator().allocate(SharedStorage).peek().raw.ptr
         tx = gpu.thread_id("x")
@@ -1039,6 +1068,7 @@ def compile_gemm1_a4w4_port(
                 total_m_blocks,
                 f32_situ_beta,
                 f32_situ_linear_beta,
+                f32_swiglu_limit,
                 BM=BM,
                 BN=BN,
                 BK=BK,
@@ -1049,6 +1079,7 @@ def compile_gemm1_a4w4_port(
                 interleave=interleave,
                 act=act,
                 occ2=occ2,
+                bf16_quant=bf16_quant,
             )
 
     @flyc.jit
@@ -1067,6 +1098,7 @@ def compile_gemm1_a4w4_port(
         arg_hidden: fx.Int64,
         f32_situ_beta: fx.Float32,
         f32_situ_linear_beta: fx.Float32,
+        f32_swiglu_limit: fx.Float32,
         stream: fx.Stream,
     ):
         grid_x = fx.Int64(i32_grid)
@@ -1084,6 +1116,7 @@ def compile_gemm1_a4w4_port(
             arg_hidden,
             f32_situ_beta,
             f32_situ_linear_beta,
+            f32_swiglu_limit,
         ).launch(grid=(grid_x, 1, 1), block=(256, 1, 1), stream=stream)
 
     if occ2:

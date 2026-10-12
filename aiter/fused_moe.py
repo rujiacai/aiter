@@ -1918,6 +1918,7 @@ def _mxfp4_a4w4_stage1(
     act="silu",
     situ_beta=1.0,
     situ_linear_beta=1.0,
+    swiglu_limit=None,
 ):
     if not inline_quant:
         aiter.mxfp4_moe_quant(
@@ -1992,7 +1993,9 @@ def _mxfp4_a4w4_stage1(
         act=act,
         situ_beta=situ_beta,
         situ_linear_beta=situ_linear_beta,
+        swiglu_limit=swiglu_limit,
         occ2=_p1.get("occ2", False),
+        bf16_quant=_p1.get("bf16_quant", False),
     )
     return inter_sorted_quant, inter_sorted_shuffled_scale
 
@@ -2161,6 +2164,7 @@ def _mxfp4_a4w4_stage1_fw(
     act="silu",
     situ_beta=1.0,
     situ_linear_beta=1.0,
+    swiglu_limit=None,
     **_kwargs,
 ):
     device = hidden_states.device
@@ -2208,6 +2212,7 @@ def _mxfp4_a4w4_stage1_fw(
         act=act,
         situ_beta=situ_beta,
         situ_linear_beta=situ_linear_beta,
+        swiglu_limit=swiglu_limit,
     )
 
 
@@ -3634,7 +3639,11 @@ def fused_moe_2stages(
                 extra_stage1_args["topk_ids"] = topk_ids
         if metadata.stage2_has_bias:
             extra_stage2_args["bias2"] = _normalize_bias_for_kernel(bias2)
-    if stage1_func in (_flydsl_stage1_wrapper, _opus_a8w4_stage1_wrapper):
+    if stage1_func in (
+        _flydsl_stage1_wrapper,
+        _opus_a8w4_stage1_wrapper,
+        _mxfp4_a4w4_stage1_fw,
+    ):
         extra_stage1_args["swiglu_limit"] = swiglu_limit
     if stage1_func is _flydsl_stage1_wrapper:
         if metadata.skip_inter_quant:

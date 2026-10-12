@@ -6,14 +6,15 @@
 #
 # Name: flydsl_mxmoe_g{1,2}_a4w4_<BM>x256x256[_flag...], lowercase. Shape is in
 # the CSV columns, not the name. g1 flags: f16in (inline act quant), nt (else
-# cached), occ2 (BM=128: two WGs per CU). g2 flags: atomic (else nonatomic),
-# nt (atomic only), f4out / cshuffle / ldsepi (bf16 out staged through LDS,
-# full-line stores).
+# cached), occ2 (BM=128: two WGs per CU), bf16q (quantize the bf16-rounded
+# activation, as a bf16 output + standalone quant does). g2 flags: atomic
+# (else nonatomic), nt (atomic only), f4out / cshuffle / ldsepi (bf16 out
+# staged through LDS, full-line stores).
 
 import re
 
 _MXMOE_NUMERIC_TOKENS = {"SK": "kSplitK", "XCD": "xcd_swizzle"}
-_MXMOE_G1_FLAG_TOKENS = {"NT", "F16IN", "OCC2"}
+_MXMOE_G1_FLAG_TOKENS = {"NT", "F16IN", "OCC2", "BF16Q"}
 _MXMOE_G2_FLAG_TOKENS = {"NT", "ATOMIC", "F4OUT", "CSHUFFLE", "LDSEPI"}
 _MXMOE_NUMERIC_RE = re.compile(r"^([A-Z]+)(\d+)$")
 _MXMOE_TILE_RE = re.compile(r"^(\d+)x(\d+)x(\d+)$")  # <BM>x<BN>x<BK>
@@ -62,6 +63,7 @@ def _parse_mxfp4_g1_kname(kname: str) -> dict:
         "inline_quant": "F16IN" in flags,
         "use_nt": "NT" in flags,
         "occ2": "OCC2" in flags,
+        "bf16_quant": "BF16Q" in flags,
         "xcd_swizzle": nums.get("xcd_swizzle", 0),
     }
 

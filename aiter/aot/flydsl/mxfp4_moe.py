@@ -75,6 +75,7 @@ def _job_key(job: dict) -> tuple:
             job["xcd_swizzle"],
             job.get("activation", "silu"),
             job.get("occ2", False),
+            job.get("bf16_quant", False),
         )
     return (
         2,
@@ -144,6 +145,7 @@ def parse_csv(csv_path: str):
                         "topk": topk,
                         "xcd_swizzle": p1["xcd_swizzle"],
                         "occ2": p1["occ2"],
+                        "bf16_quant": p1["bf16_quant"],
                     }
                 )
             if v2_g2 is not None:
@@ -261,6 +263,7 @@ def _compile_stage1(job):
         situ_beta=DEFAULT_SITUV2_BETA,
         situ_linear_beta=DEFAULT_SITUV2_LINEAR_BETA,
         occ2=job.get("occ2", False),
+        bf16_quant=job.get("bf16_quant", False),
         stream=0,
     )
 
