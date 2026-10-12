@@ -73,6 +73,194 @@ def parse_num_expert_activated():
 
 AITER_MOE_NUM_EXPERT_ACTIVATED = parse_num_expert_activated()
 
+HBM_PEAK_TBPS = 8.0  # MI355X HBM3E spec
+MFMA_PEAK_TFLOPS = {0.5: 10100.0, 1: 5000.0, 2: 2500.0}  # MI355X dense fp4/fp8/bf16
+
+
+def _elem_bytes(dt):
+    if dt is None:  # unquantized bf16/fp16
+        return 2
+    if dt in (dtypes.fp4x2, dtypes.i4x2, torch.int4):  # two values per byte
+        return 0.5
+    return dt.itemsize
+
+
+def _scale_bytes(q_type, dt, rows, k, weight=False):
+    if _elem_bytes(dt) >= 2:
+        return 0
+    if q_type == aiter.QuantType.per_1x32:
+        return rows * k / 32 * (2 if dt == dtypes.i4x2 else 1)
+    if q_type == aiter.QuantType.per_128x128:
+        return rows * k / (128 * 128 if weight else 128) * 4
+    if q_type == aiter.QuantType.per_Token:
+        return rows * 4
+    return 0
+
+
+def _tensor_bytes(q_type, dt, rows, k, weight=False):
+    return rows * k * _elem_bytes(dt) + _scale_bytes(q_type, dt, rows, k, weight)
+
+
+def moe_stage1_bytes(
+    token, model_dim, inter_dim, topk, n_active, q_type, a_dtype, w_dtype, use_g1u1=True
+):
+    n1 = inter_dim * (2 if use_g1u1 else 1)
+    return (
+        _tensor_bytes(q_type, a_dtype, token, model_dim)
+        + _tensor_bytes(q_type, w_dtype, n_active * n1, model_dim, weight=True)
+        + _tensor_bytes(q_type, a_dtype, token * topk, inter_dim)
+    )
+
+
+def moe_stage2_bytes(
+    token,
+    model_dim,
+    inter_dim,
+    topk,
+    n_active,
+    q_type,
+    a_dtype,
+    w_dtype,
+    route_out=False,
+):
+    out_rows = token * topk if route_out else token
+    return (
+        _tensor_bytes(q_type, a_dtype, token * topk, inter_dim)
+        + _tensor_bytes(q_type, w_dtype, n_active * model_dim, inter_dim, weight=True)
+        + out_rows * model_dim * 2
+    )
+
+
+def moe_stage_flops(token, model_dim, inter_dim, topk, use_g1u1=True):
+    flops2 = 2 * token * topk * model_dim * inter_dim
+    return flops2 * (2 if use_g1u1 else 1), flops2
+
+
+def mfma_peak_tflops(a_dtype, w_dtype):
+    return MFMA_PEAK_TFLOPS[max(_elem_bytes(a_dtype), _elem_bytes(w_dtype))]
+
+
+def bandwidth_tbps(nbytes, us):
+    return nbytes / us / 1e6
+
+
+def mbu(nbytes, us, peak_tbps=HBM_PEAK_TBPS):
+    return bandwidth_tbps(nbytes, us) / peak_tbps
+
+
+def mfu(flops, us, peak_tflops):
+    return flops / us / 1e6 / peak_tflops
+
+
+def moe_perf_stats(
+    token,
+    model_dim,
+    inter_dim,
+    topk,
+    n_active,
+    q_type,
+    a_dtype,
+    w_dtype,
+    us1=None,
+    us2=None,
+    us=None,
+    use_g1u1=True,
+    route_out=False,
+):
+    """route_out: stage2 GEMM writes per-route rows for a separate reducer; s2_*
+    then counts that write (the GEMM's own traffic), the total keeps the
+    minimal bytes."""
+    args = (token, model_dim, inter_dim, topk, n_active, q_type, a_dtype, w_dtype)
+    b1 = moe_stage1_bytes(*args, use_g1u1=use_g1u1)
+    b2 = moe_stage2_bytes(*args)
+    b2_gemm = moe_stage2_bytes(*args, route_out=route_out)
+    f1, f2 = moe_stage_flops(token, model_dim, inter_dim, topk, use_g1u1)
+    peak = mfma_peak_tflops(a_dtype, w_dtype)
+    if us is None and us1 and us2:
+        us = us1 + us2
+    stats = {}
+    for tag, b, f, t in (
+        ("s1_", b1, f1, us1),
+        ("s2_", b2_gemm, f2, us2),
+        ("", b1 + b2, f1 + f2, us),
+    ):
+        stats[f"{tag}MB"] = round(b / 1e6, 2)
+        if t:
+            stats[f"{tag}TB/s"] = round(bandwidth_tbps(b, t), 2)
+            stats[f"{tag}MBU%"] = round(100 * mbu(b, t), 1)
+            stats[f"{tag}MFU%"] = round(100 * mfu(f, t, peak), 1)
+    return stats
+
+
+PERF_STAT_KEYS = {
+    f"{tag}{name}"
+    for tag in ("s1_", "s2_", "")
+    for name in ("MB", "TB/s", "MBU%", "MFU%")
+} | {"us_stage1", "us_stage2", "us_reduce", "us_gemm1", "us_gemm2"}
+
+_STAGE1_GEMM_KEYS = ("moe1", "gemm1", "stage1")
+_STAGE2_GEMM_KEYS = ("moe2", "gemm2", "stage2")
+_ROUTE_REDUCE_KEYS = ("moe_reduction", "scatter_reduce")
+
+
+def stage_gemm_us(kernel_times):
+    """Split per-kernel times of one fused_moe call into (stage1 GEMM us, stage2
+    GEMM us, route_out), matched by kernel name. Sorting, quant, scale sort and
+    the stage2 reducer are not counted; route_out says a reducer ran, i.e. the
+    stage2 GEMM wrote per-route rows."""
+
+    def pick(keys):
+        ts = [t for n, t in kernel_times.items() if any(k in n.lower() for k in keys)]
+        return sum(ts) if ts else None
+
+    return (
+        pick(_STAGE1_GEMM_KEYS),
+        pick(_STAGE2_GEMM_KEYS),
+        pick(_ROUTE_REDUCE_KEYS) is not None,
+    )
+
+
+def stage_kernel_names(run):
+    """Kernel names that fused_moe's stage1 / stage2 calls launch: run() once with
+    the kernel_bench_callable hook, then profile each captured stage launch."""
+    calls = []
+    aiter.fused_moe.kernel_bench_callable = calls
+    try:
+        run()
+    finally:
+        aiter.fused_moe.kernel_bench_callable = None
+    names = {}
+    for stage, call in calls:
+        call()
+        torch.cuda.synchronize()
+        with torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CUDA]
+        ) as prof:
+            call()
+            torch.cuda.synchronize()
+        names[stage] = {
+            e.name
+            for e in prof.events()
+            if e.device_type == torch.autograd.DeviceType.CUDA
+        }
+    return names
+
+
+def stage_us(kernel_times, names):
+    """(stage1 us, stage2 us, stage2 reducer us): per-kernel times summed over the
+    kernels each stage launches."""
+
+    def total(kernels):
+        ts = [kernel_times[n] for n in kernels if n in kernel_times]
+        return sum(ts) if ts else None
+
+    stage2 = names.get("stage2", set())
+    return (
+        total(names.get("stage1", set())),
+        total(stage2),
+        total(n for n in stage2 if any(k in n.lower() for k in _ROUTE_REDUCE_KEYS)),
+    )
+
 
 @benchmark()
 def test_fmoe(
@@ -476,6 +664,14 @@ def test_fmoe(
         "linear_beta": linear_beta,
         "gate_mode": gateMode,
     }
+    aq_dtype = (
+        _runtime_swiglu_mxfp4_q_dtype_a(
+            token, actType, gateMode, qType, AQDType, WQDType
+        )
+        or reference_aq_dtype
+    )
+    n_active = topk_ids.unique().numel()
+    perf_args = (token, model_dim, inter_dim, topk, n_active, qType, aq_dtype, WQDType)
 
     if kernel_bench:
         # Kernel-bench: time the stage1 / stage2 kernels in isolation. One eager
@@ -497,7 +693,7 @@ def test_fmoe(
             aiter.fused_moe.kernel_bench_callable = None
         kernel_us = {}
         for _name, _call in kernel_bench_callable:
-            _, _us = run_perftest(_call, num_iters=20, num_warmup=3)
+            _, _us = run_perftest(_call, num_iters=100, num_warmup=5)
             kernel_us[_name] = _us
         us1 = kernel_us.get("stage1")
         us2_stage = kernel_us.get("stage2")
@@ -517,8 +713,10 @@ def test_fmoe(
             "us": (us1 or 0.0) + (us2_stage or 0.0),
             "us_stage1": us1,
             "us_stage2": us2_stage,
+            **moe_perf_stats(*perf_args, us1=us1, us2=us2_stage, use_g1u1=use_g1u1),
         }
 
+    kernel_times = {}
     out2_ck, us2 = run_perftest(
         fused_moe,
         input,
@@ -526,10 +724,12 @@ def test_fmoe(
         w2_qt_aiter,
         topk_weights,
         topk_ids,
-        num_iters=5,
-        num_warmup=2,
+        num_iters=100,
+        num_warmup=5,
+        kernel_times=kernel_times,
         **_fused_moe_kwargs,
     )
+    us_s1, us_s2, route_out = stage_gemm_us(kernel_times)
     # Regression guard for aiter #3117 (MXFP4 fused-MoE stage2 EP-prefill):
     # the unfixed K-padding tail-tile path leaves the padded lanes uninitialized,
     # producing NaN in the fused_moe output. checkAllclose's err/logits_diff can be
@@ -568,7 +768,36 @@ def test_fmoe(
             f"accuracy check failed (non-strict): err={err}, logits_diff={logits_diff}"
         )
 
-    return {"us": us2, "logits_diff": float(logits_diff)}
+    us_stage1, us_stage2, us_reduce = stage_us(
+        kernel_times,
+        stage_kernel_names(
+            lambda: fused_moe(
+                input,
+                w1_qt_aiter,
+                w2_qt_aiter,
+                topk_weights,
+                topk_ids,
+                **_fused_moe_kwargs,
+            )
+        ),
+    )
+    return {
+        "us": us2,
+        "us_stage1": us_stage1,
+        "us_stage2": us_stage2,
+        "us_reduce": us_reduce,
+        "us_gemm1": us_s1,
+        "us_gemm2": us_s2,
+        "logits_diff": float(logits_diff),
+        **moe_perf_stats(
+            *perf_args,
+            us1=us_s1,
+            us2=us_s2,
+            us=us2,
+            use_g1u1=use_g1u1,
+            route_out=route_out,
+        ),
+    }
 
 
 l_quant = [
@@ -1421,7 +1650,7 @@ _csv_out = os.environ.get("AITER_TUNED_OP_BENCH_CSV", "tuned_op_bench.csv")
 def _write_bench_csv(rows):
     if not _csv_out or len(rows) == 0:
         return
-    row = rows[-1]
+    row = {k: v for k, v in rows[-1].items() if k not in PERF_STAT_KEYS}
     if row.get("model") == "legacy":
         return
     written = append_tuned_op_bench_rows(

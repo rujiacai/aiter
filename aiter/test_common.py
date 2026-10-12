@@ -52,6 +52,7 @@ def perftest(
     num_rotate_args=0,
     needTrace=False,
     use_cuda_event=False,
+    kernel_times=None,
 ):
     def decorator(func):
         def wrapper(*args, **kwargs):
@@ -108,7 +109,7 @@ def perftest(
                 data = run_iters_rotate(num_iters, func, rotate_args)
                 torch.cuda.synchronize()
                 torch.cuda.empty_cache()
-            avg = get_trace_perf(prof, num_iters)
+            avg = get_trace_perf(prof, num_iters, kernel_times)
 
             if testGraph:
                 graph = torch.cuda.CUDAGraph()
@@ -212,8 +213,11 @@ def run_perftest(
     num_rotate_args=0,
     needTrace=False,
     use_cuda_event=False,
+    kernel_times=None,
     **kwargs,
 ):
+    """kernel_times: optional dict, filled with {kernel name: avg us per iter}."""
+
     @perftest(
         num_iters=num_iters,
         num_warmup=num_warmup,
@@ -221,6 +225,7 @@ def run_perftest(
         num_rotate_args=num_rotate_args,
         needTrace=needTrace,
         use_cuda_event=use_cuda_event,
+        kernel_times=kernel_times,
     )
     def worker(*args, **kwargs):
         return func(*args, **kwargs)
@@ -324,7 +329,7 @@ def post_process_data(df, num_iters, warm_iter=1):
     return list(indices), out_range_num + warm_iter + num_iters - act_iters
 
 
-def get_trace_perf(prof, num_iters):
+def get_trace_perf(prof, num_iters, kernel_times=None):
     assert num_iters > 1
     warm_iter = 1
     num_iters -= warm_iter
@@ -393,6 +398,9 @@ def get_trace_perf(prof, num_iters):
     if df.empty:
         logger.info("no valida data after post process!")
 
+    if kernel_times is not None:
+        for _, r in df[df.device_type == "CUDA"].iterrows():
+            kernel_times[r["name"]] = r["device_time_sum"] / actual_iters
     avg_name = "[avg us/iter]"
     for el in timerList:
         if el == "host_time_sum":
