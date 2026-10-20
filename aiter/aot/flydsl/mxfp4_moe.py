@@ -217,6 +217,7 @@ def parse_csv(csv_path: str):
                             "D_INTER_REAL": d_inter_real,
                             "topk": topk,  # unused by the kernel; for the entry signature
                             "xcd_swizzle": p2["xcd_swizzle"],
+                            "skippad": p2["skippad"],
                         }
                     )
 
@@ -297,6 +298,7 @@ def _compile_stage2(job):
         flat_out_scale=_dummy() if mxfp4out else None,
         cshuffle=epilog == "nonatomic_cshuffle",
         ldsepi=epilog == "nonatomic_lds",
+        skippad=job.get("skippad", False),
         D_INTER_REAL=job["D_INTER_REAL"],
         xcd_swizzle=job["xcd_swizzle"],
         stream=0,

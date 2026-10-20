@@ -2030,6 +2030,7 @@ def _mxfp4_a4w4_stage2(
     _p2 = _parse_mxfp4_g2_kname(kernelName2)
     _xcd2 = _p2.get("xcd_swizzle", 0)
     _ldsepi = _p2.get("ldsepi", False)
+    _skippad = _p2.get("skippad", False)
     if atomic:
         out_buf = out_dst
     else:
@@ -2115,6 +2116,7 @@ def _mxfp4_a4w4_stage2(
         mxfp4out=False,
         cshuffle=cshuffle,
         ldsepi=_ldsepi,
+        skippad=_skippad,
         NE=NE,
         D_HIDDEN=D_HIDDEN,
         D_INTER=D_INTER,

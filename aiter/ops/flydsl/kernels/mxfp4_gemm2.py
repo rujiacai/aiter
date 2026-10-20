@@ -97,8 +97,12 @@ def compile_gemm2_a4w4_port(
     BN=256,
     BK=256,
     xcd_swizzle=0,
+    skippad=False,
 ):
     assert BN == 256 and BK == 256, f"only BN==BK==256 supported, got BN={BN} BK={BK}"
+    assert not skippad or (
+        epilog == "nonatomic_lds" and BM == 128
+    ), f"skippad needs the nonatomic_lds epilogue with BM=128, got {epilog} BM={BM}"
     KH_TILE = BK // 2
     _K = D_INTER
     _K_REAL = D_INTER if D_INTER_REAL is None else D_INTER_REAL
@@ -135,6 +139,8 @@ def compile_gemm2_a4w4_port(
     _tag = f"ne{NE}_h{N_OUT}_i{_K}{_rtag}_bm{BM}{'_nt' if use_nt else ''}_{_epi_tag}"
     if xcd_swizzle > 0:
         _tag += f"_xcd{xcd_swizzle}"
+    if skippad:
+        _tag += "_skippad"
     _name = f"gemm2_a4w4_port_{_tag}"
 
     @fx.struct
@@ -217,6 +223,7 @@ def compile_gemm2_a4w4_port(
                 BN=BN,
                 BK=BK,
                 KH_TILE=KH_TILE,
+                skippad=skippad,
             )
 
         if const_expr(_persistent):
@@ -354,6 +361,7 @@ def _gemm2_body(
     BN,
     BK,
     KH_TILE,
+    skippad=False,
 ):
     _aStages = aStages
     _kMChunks = kmchunks_for(BM)
@@ -380,6 +388,27 @@ def _gemm2_body(
     e = llvm.load(T.i32, _global_ptr1(arg_eids, m_block_idx * fx.Int32(4)))
     e = rocdl.readfirstlane(T.i32, e)
     m_row = m_block_idx * fx.Int32(BM)
+
+    pad_skip = None
+    if const_expr(skippad):
+        # Sorted token ids of rows lane and 64 + lane; issued before the K loop so
+        # the latency hides behind the MFMAs. Padding rows hold M.
+        stids_rsrc = _buffer_rsrc(
+            arg_stids,
+            arith.index_cast(T.index, _raw(i32_max_m_blocks)) * fx.Index(BM * 4),
+        )
+        tok = [
+            buffer_ops.buffer_load(
+                stids_rsrc, m_row + lane + fx.Int32(h * 64), vec_width=1, dtype=T.i32
+            )
+            for h in range_constexpr(2)
+        ]
+        out_rsrc = _buffer_rsrc(
+            arg_out,
+            arith.index_cast(T.index, _raw(i32_max_m_blocks))
+            * fx.Index(BM * N_OUT * 2),
+        )
+        pad_skip = (tok, i32_M, out_rsrc)
 
     _asc_num = arith.index_cast(T.index, _raw(i32_max_m_blocks)) * fx.Index(_asc_per_mb)
     ascale_rsrc = _buffer_rsrc(arg_ascale, _asc_num)
@@ -615,6 +644,7 @@ def _gemm2_body(
             BM,
             _kMChunks,
             lds_acc_base_i32,
+            pad_skip=pad_skip,
         )
     elif epilog == "nonatomic_cshuffle":
         _cshuffle_flat_bf16_epilog(
@@ -683,14 +713,29 @@ def _flat_bf16_epilog(
 
 
 def _lds_flat_bf16_epilog(
-    accm, arg_out, m_row, n_block_idx, wave, lane, N_OUT, BN, BM, kMChunks, stage_i32
+    accm,
+    arg_out,
+    m_row,
+    n_block_idx,
+    wave,
+    lane,
+    N_OUT,
+    BN,
+    BM,
+    kMChunks,
+    stage_i32,
+    pad_skip=None,
 ):
     """Epilogue for the swapped-operand layout (lane l: row l%16, columns
     4*(l//16)..+3 of each 16x16 block). Each wave stages its BM x 64 bf16 slice
     in a private LDS tile and stores it back row-contiguous, 16 B per lane, so
     every global store writes 8 full 128 B rows. Writing 32 B pieces of 4-16
     rows per instruction instead leaves the kernel bound by partial-line
-    write traffic between L1 and L2."""
+    write traffic between L1 and L2.
+
+    With pad_skip = (sorted token ids of rows lane / 64 + lane, M, out rsrc),
+    padding rows are dropped: the stores go through the buffer descriptor and a
+    padding row gets an out-of-range offset."""
     lane_div_16 = lane // fx.Int32(16)
     lane_mod_16 = lane % fx.Int32(16)
     base_ptr = _lds_ptr3(
@@ -709,18 +754,45 @@ def _lds_flat_bf16_epilog(
     r_chunk = lane % fx.Int32(8)
     r_off = r_row * fx.Int32(_LDS_EPI_ROW_BYTES) + r_chunk * fx.Int32(16)
     col = n_block_idx * fx.Int32(BN) + wave * fx.Int32(BN // 4) + r_chunk * fx.Int32(8)
-    out_base = _global_base_ptr1(arg_out)
-    byte_base = (fx.Int64(m_row + r_row) * fx.Int64(N_OUT) + fx.Int64(col)) * fx.Int64(
-        2
-    )
-    for k in range_constexpr(BM // 8):
-        v = llvm.load(
-            T.vec(4, T.i32),
-            _gep3(base_ptr, r_off + fx.Int32(k * 8 * _LDS_EPI_ROW_BYTES)),
-        )
-        llvm.StoreOp(
-            v, _gep1(out_base, byte_base + fx.Int64(k * 8 * N_OUT * 2)), alignment=16
-        )
+    if const_expr(pad_skip is None):
+        out_base = _global_base_ptr1(arg_out)
+        byte_base = (
+            fx.Int64(m_row + r_row) * fx.Int64(N_OUT) + fx.Int64(col)
+        ) * fx.Int64(2)
+        for k in range_constexpr(BM // 8):
+            v = llvm.load(
+                T.vec(4, T.i32),
+                _gep3(base_ptr, r_off + fx.Int32(k * 8 * _LDS_EPI_ROW_BYTES)),
+            )
+            llvm.StoreOp(
+                v,
+                _gep1(out_base, byte_base + fx.Int64(k * 8 * N_OUT * 2)),
+                alignment=16,
+            )
+    else:
+        tok, i32_M, out_rsrc = pad_skip
+        # Bit r of half h: row 64 * h + r of this M block is a real token.
+        valid_rows = [
+            fx.Int64(rocdl.ballot(T.i64, (fx.Int32(t) & fx.Int32(0x00FFFFFF)) < i32_M))
+            for t in tok
+        ]
+        off_base = (m_row + r_row) * fx.Int32(N_OUT * 2) + col * fx.Int32(2)
+        for k in range_constexpr(BM // 8):
+            v = llvm.load(
+                T.vec(4, T.i32),
+                _gep3(base_ptr, r_off + fx.Int32(k * 8 * _LDS_EPI_ROW_BYTES)),
+            )
+            bit = fx.Int64(r_row + fx.Int32((k % 8) * 8))
+            valid = ((valid_rows[k // 8] >> bit) & fx.Int64(1)) != fx.Int64(0)
+            # Keep the stores unconditional: a branch around all-padding ones sinks
+            # the LDS read into it, and every store then waits for its own read.
+            buffer_ops.buffer_store(
+                v,
+                out_rsrc,
+                off_base + fx.Int32(k * 8 * N_OUT * 2),
+                mask=valid,
+                offset_is_bytes=True,
+            )
 
 
 def _cshuffle_flat_bf16_epilog(

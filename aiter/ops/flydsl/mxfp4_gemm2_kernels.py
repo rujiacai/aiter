@@ -46,6 +46,7 @@ def _get_compiled_mxfp4_gemm2_port(
     BN=256,
     BK=256,
     xcd_swizzle=0,
+    skippad=False,
 ):
     from .kernels.mxfp4_gemm2 import compile_gemm2_a4w4_port
 
@@ -60,6 +61,7 @@ def _get_compiled_mxfp4_gemm2_port(
         BN=BN,
         BK=BK,
         xcd_swizzle=xcd_swizzle,
+        skippad=skippad,
     )
 
 
@@ -80,9 +82,12 @@ def _assert_supported(
     mxfp4out,
     cshuffle=False,
     ldsepi=False,
+    skippad=False,
     BN=256,
     BK=256,
 ):
+    if skippad and not ldsepi:
+        raise NotImplementedError("flydsl mxfp4 gemm2 skippad requires ldsepi")
     if D_INTER % BK != 0:
         raise NotImplementedError(
             f"flydsl mxfp4 gemm2 contraction D_INTER (=inter_dim) must be a "
@@ -127,6 +132,7 @@ def flydsl_mxfp4_gemm2(
     flat_out_scale=None,
     cshuffle=False,
     ldsepi=False,
+    skippad=False,
     D_INTER_REAL=None,
     BN=256,
     BK=256,
@@ -144,15 +150,32 @@ def flydsl_mxfp4_gemm2(
         mxfp4out=mxfp4out,
         cshuffle=cshuffle,
         ldsepi=ldsepi,
+        skippad=skippad,
         BN=BN,
         BK=BK,
     )
     epilog = _epilog_of(atomic, mxfp4out, cshuffle, ldsepi)
     launch = _get_compiled_mxfp4_gemm2_port(
-        BM, use_nt, NE, D_HIDDEN, epilog, D_INTER, D_INTER_REAL, BN, BK, xcd_swizzle
+        BM,
+        use_nt,
+        NE,
+        D_HIDDEN,
+        epilog,
+        D_INTER,
+        D_INTER_REAL,
+        BN,
+        BK,
+        xcd_swizzle,
+        skippad,
     )
 
     max_m_blocks = (max_sorted + BM - 1) // BM
+    # skippad stores through a buffer descriptor with 32-bit byte offsets.
+    if skippad and max_m_blocks * BM * D_HIDDEN * 2 > 0x7FFFFFF0:
+        raise NotImplementedError(
+            f"flydsl mxfp4 gemm2 skippad: output of {max_m_blocks * BM} x "
+            f"{D_HIDDEN} bf16 exceeds the 2 GiB buffer-offset range"
+        )
 
     out_scale = flat_out_scale if mxfp4out else _dummy_out_scale(flat_out.device)
 
