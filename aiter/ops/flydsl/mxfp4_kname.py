@@ -10,13 +10,22 @@
 # activation, as a bf16 output + standalone quant does). g2 flags: atomic
 # (else nonatomic), nt (atomic only), f4out / cshuffle / ldsepi (bf16 out
 # staged through LDS, full-line stores), skippad (ldsepi only: padding rows of
-# the sorted layout are not stored).
+# the sorted layout are not stored), occ2 (ldsepi only: two WGs per CU taking
+# tiles from a per-XCD counter).
 
 import re
 
 _MXMOE_NUMERIC_TOKENS = {"SK": "kSplitK", "XCD": "xcd_swizzle"}
 _MXMOE_G1_FLAG_TOKENS = {"NT", "F16IN", "OCC2", "BF16Q"}
-_MXMOE_G2_FLAG_TOKENS = {"NT", "ATOMIC", "F4OUT", "CSHUFFLE", "LDSEPI", "SKIPPAD"}
+_MXMOE_G2_FLAG_TOKENS = {
+    "NT",
+    "ATOMIC",
+    "F4OUT",
+    "CSHUFFLE",
+    "LDSEPI",
+    "SKIPPAD",
+    "OCC2",
+}
 _MXMOE_NUMERIC_RE = re.compile(r"^([A-Z]+)(\d+)$")
 _MXMOE_TILE_RE = re.compile(r"^(\d+)x(\d+)x(\d+)$")  # <BM>x<BN>x<BK>
 _MXMOE_PREFIX = {1: "flydsl_mxmoe_g1_a4w4_", 2: "flydsl_mxmoe_g2_a4w4_"}
@@ -89,6 +98,9 @@ def _parse_mxfp4_g2_kname(kname: str) -> dict:
     skippad = "SKIPPAD" in flags
     if skippad and not ldsepi:
         raise ValueError(f"illegal mxmoe g2 name {kname!r}: skippad requires ldsepi")
+    occ2 = "OCC2" in flags
+    if occ2 and not ldsepi:
+        raise ValueError(f"illegal mxmoe g2 name {kname!r}: occ2 requires ldsepi")
     return {
         "BM": nums["BM"],
         "splitk": "kSplitK" in nums,
@@ -99,6 +111,7 @@ def _parse_mxfp4_g2_kname(kname: str) -> dict:
         "cshuffle": cshuffle,
         "ldsepi": ldsepi,
         "skippad": skippad,
+        "occ2": occ2,
         "xcd_swizzle": nums.get("xcd_swizzle", 0),
     }
 

@@ -47,6 +47,7 @@ def _get_compiled_mxfp4_gemm2_port(
     BK=256,
     xcd_swizzle=0,
     skippad=False,
+    occ2=False,
 ):
     from .kernels.mxfp4_gemm2 import compile_gemm2_a4w4_port
 
@@ -62,6 +63,7 @@ def _get_compiled_mxfp4_gemm2_port(
         BK=BK,
         xcd_swizzle=xcd_swizzle,
         skippad=skippad,
+        occ2=occ2,
     )
 
 
@@ -83,11 +85,19 @@ def _assert_supported(
     cshuffle=False,
     ldsepi=False,
     skippad=False,
+    occ2=False,
     BN=256,
     BK=256,
 ):
     if skippad and not ldsepi:
         raise NotImplementedError("flydsl mxfp4 gemm2 skippad requires ldsepi")
+    if occ2 and not ldsepi:
+        raise NotImplementedError("flydsl mxfp4 gemm2 occ2 requires ldsepi")
+    if occ2 and D_INTER != 2 * BK:
+        raise NotImplementedError(
+            f"flydsl mxfp4 gemm2 occ2 supports D_INTER == {2 * BK} only, "
+            f"got {D_INTER}"
+        )
     if D_INTER % BK != 0:
         raise NotImplementedError(
             f"flydsl mxfp4 gemm2 contraction D_INTER (=inter_dim) must be a "
@@ -133,6 +143,7 @@ def flydsl_mxfp4_gemm2(
     cshuffle=False,
     ldsepi=False,
     skippad=False,
+    occ2=False,
     D_INTER_REAL=None,
     BN=256,
     BK=256,
@@ -151,9 +162,12 @@ def flydsl_mxfp4_gemm2(
         cshuffle=cshuffle,
         ldsepi=ldsepi,
         skippad=skippad,
+        occ2=occ2,
         BN=BN,
         BK=BK,
     )
+    if occ2 and D_INTER_REAL not in (None, D_INTER):
+        raise NotImplementedError("flydsl mxfp4 gemm2 occ2 needs an unpadded D_INTER")
     epilog = _epilog_of(atomic, mxfp4out, cshuffle, ldsepi)
     launch = _get_compiled_mxfp4_gemm2_port(
         BM,
@@ -167,6 +181,7 @@ def flydsl_mxfp4_gemm2(
         BK,
         xcd_swizzle,
         skippad,
+        occ2,
     )
 
     max_m_blocks = (max_sorted + BM - 1) // BM
@@ -178,6 +193,12 @@ def flydsl_mxfp4_gemm2(
         )
 
     out_scale = flat_out_scale if mxfp4out else _dummy_out_scale(flat_out.device)
+    # occ2: tile counters, one per XCD, that must be zero at launch.
+    counter = (
+        torch.zeros(8, dtype=torch.int32, device=flat_out.device)
+        if occ2
+        else _dummy_out_scale(flat_out.device)
+    )
 
     _moe_kernels._run_compiled(
         launch,
@@ -194,6 +215,7 @@ def flydsl_mxfp4_gemm2(
             max_m_blocks,
             flat_out.data_ptr(),
             out_scale.data_ptr(),
+            counter.data_ptr(),
             torch.cuda.current_stream() if stream is None else stream,
         ),
     )

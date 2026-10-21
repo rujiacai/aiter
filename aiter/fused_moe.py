@@ -2031,6 +2031,7 @@ def _mxfp4_a4w4_stage2(
     _xcd2 = _p2.get("xcd_swizzle", 0)
     _ldsepi = _p2.get("ldsepi", False)
     _skippad = _p2.get("skippad", False)
+    _g2occ2 = _p2.get("occ2", False)
     if atomic:
         out_buf = out_dst
     else:
@@ -2117,6 +2118,7 @@ def _mxfp4_a4w4_stage2(
         cshuffle=cshuffle,
         ldsepi=_ldsepi,
         skippad=_skippad,
+        occ2=_g2occ2,
         NE=NE,
         D_HIDDEN=D_HIDDEN,
         D_INTER=D_INTER,

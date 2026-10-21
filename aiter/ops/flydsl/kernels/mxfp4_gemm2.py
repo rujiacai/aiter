@@ -98,11 +98,12 @@ def compile_gemm2_a4w4_port(
     BK=256,
     xcd_swizzle=0,
     skippad=False,
+    occ2=False,
 ):
     assert BN == 256 and BK == 256, f"only BN==BK==256 supported, got BN={BN} BK={BK}"
-    assert not skippad or (
+    assert not (skippad or occ2) or (
         epilog == "nonatomic_lds" and BM == 128
-    ), f"skippad needs the nonatomic_lds epilogue with BM=128, got {epilog} BM={BM}"
+    ), f"skippad / occ2 need nonatomic_lds with BM=128, got {epilog} BM={BM}"
     KH_TILE = BK // 2
     _K = D_INTER
     _K_REAL = D_INTER if D_INTER_REAL is None else D_INTER_REAL
@@ -120,8 +121,15 @@ def compile_gemm2_a4w4_port(
     _slot_bytes = saq_slot_bytes(BM, KH_TILE)
     _aStages = kStages if _K_TILES_TOTAL <= kStages else 3
     _acc_rows = min(BM, 64) if epilog == "nonatomic_cshuffle" else BM
+    assert not occ2 or (
+        _K_TILES_TOTAL == kStages and _K_REAL == _K
+    ), f"occ2 needs D_INTER == {kStages * BK} without padding, got {_K} ({_K_REAL})"
     if epilog == "nonatomic":
         _lds_bytes = _aStages * _slot_bytes
+    elif epilog == "nonatomic_lds" and occ2:
+        # Staging holds half the rows at a time, so 32 + 36 KB fits two WGs per
+        # CU; the last 16 bytes pass the next tile index between the waves.
+        _lds_bytes = _aStages * _slot_bytes + 4 * (BM // 2) * _LDS_EPI_ROW_BYTES + 16
     elif epilog == "nonatomic_lds":
         _lds_bytes = _aStages * _slot_bytes + 4 * BM * _LDS_EPI_ROW_BYTES
     else:
@@ -141,7 +149,10 @@ def compile_gemm2_a4w4_port(
         _tag += f"_xcd{xcd_swizzle}"
     if skippad:
         _tag += "_skippad"
+    if occ2:
+        _tag += "_occ2"
     _name = f"gemm2_a4w4_port_{_tag}"
+    _wgs_per_cu = 2 if occ2 else 1
 
     @fx.struct
     class SharedStorage:
@@ -161,6 +172,7 @@ def compile_gemm2_a4w4_port(
         i32_max_m_blocks: fx.Int32,
         arg_out: fx.Int64,
         arg_out_scale: fx.Int64,
+        arg_counter: fx.Int64,
     ):
         tx = gpu.thread_id("x")
         bx = gpu.block_id("x")
@@ -195,7 +207,7 @@ def compile_gemm2_a4w4_port(
                         k_half=_K_HALF,
                     )
 
-        def _run_tile(tile_i32):
+        def _run_tile(tile_i32, next_tile=None):
             _gemm2_body(
                 lds_raw_ptr,
                 arg_ascale,
@@ -224,6 +236,8 @@ def compile_gemm2_a4w4_port(
                 BK=BK,
                 KH_TILE=KH_TILE,
                 skippad=skippad,
+                occ2=occ2,
+                next_tile=next_tile,
             )
 
         if const_expr(_persistent):
@@ -258,18 +272,50 @@ def compile_gemm2_a4w4_port(
                 n_block = wig // group_size_m
                 return m_block * fx.Int32(_num_n_blocks) + n_block
 
-            if bx_i32 < bound:
-                tile = _xcd(bx_i32)
-                _issue_all_a_loads(_udiv(tile, _num_n_blocks) * fx.Int32(BM))
-                rocdl.sched_barrier(0)
-                _run_tile(tile)
+            if const_expr(occ2):
+                # Two WGs on a CU run at different speeds, so a static tile split
+                # leaves a tail. Work items of XCD xc are xc, xc + 8, ...: WG bx
+                # starts on item bx (the XCD's first ceil((grid - xc) / 8) items
+                # go to its WGs this way), then claims the following ones from
+                # the XCD's counter. _xcd() maps items to tiles as before.
+                xc = _umod(bx_i32, _NXCD)
+                first_claim = xc + fx.Int32(_NXCD) * _udiv(
+                    grid_nb - xc + fx.Int32(_NXCD - 1), _NXCD
+                )
+                ctr_rsrc = _buffer_rsrc(arg_counter, fx.Index(_NXCD * 4))
+                slot0 = saq_base_i32 + fx.Int32(_lds_bytes - 16)
+                pid = bx_i32
+                par = fx.Int32(0)
+                while pid < bound:
+                    tile = _xcd(pid)
+                    _issue_all_a_loads(_udiv(tile, _num_n_blocks) * fx.Int32(BM))
+                    # Keep the A DMA ahead of the tile's other loads: issued
+                    # after them, the wait for it before the first barrier
+                    # becomes a vmcnt(0).
+                    rocdl.sched_barrier(0)
+                    slot = slot0 + (par ^ fx.Int32(1)) * fx.Int32(4)
+                    _run_tile(tile, next_tile=(ctr_rsrc, pid, xc, first_claim, slot))
+                    rocdl.s_waitcnt(lgkmcnt=0)
+                    gpu.barrier()
+                    pid = fx.Int32(
+                        rocdl.readfirstlane(
+                            T.i32, llvm.load(T.i32, _lds_ptr3(slot, fx.Int32(0)))
+                        )
+                    )
+                    par = par ^ fx.Int32(1)
+            else:
+                if bx_i32 < bound:
+                    tile = _xcd(bx_i32)
+                    _issue_all_a_loads(_udiv(tile, _num_n_blocks) * fx.Int32(BM))
+                    rocdl.sched_barrier(0)
+                    _run_tile(tile)
 
-            for iv in range(bx_i32 + grid_nb, bound, gpu.grid_dim.x):
-                wu = fx.Int32(iv)
-                gpu.barrier()
-                tile = _xcd(wu)
-                _issue_all_a_loads(_udiv(tile, _num_n_blocks) * fx.Int32(BM))
-                _run_tile(tile)
+                for iv in range(bx_i32 + grid_nb, bound, gpu.grid_dim.x):
+                    wu = fx.Int32(iv)
+                    gpu.barrier()
+                    tile = _xcd(wu)
+                    _issue_all_a_loads(_udiv(tile, _num_n_blocks) * fx.Int32(BM))
+                    _run_tile(tile)
         else:
             m_row0 = _udiv(bx_i32, _num_n_blocks) * fx.Int32(BM)
             if const_expr(_n_load_waves < 4):
@@ -300,12 +346,15 @@ def compile_gemm2_a4w4_port(
         i32_max_m_blocks: fx.Int32,
         arg_out: fx.Int64,
         arg_out_scale: fx.Int64,
+        arg_counter: fx.Int64,
         stream: fx.Stream,
     ):
         if const_expr(_persistent):
             tw = i32_max_m_blocks * fx.Int32(_num_n_blocks)
             persist = _raw(tw > fx.Int32(NUM_CU * 4))
-            grid_i32 = arith.select(persist, _raw(fx.Int32(NUM_CU)), _raw(tw))
+            grid_i32 = arith.select(
+                persist, _raw(fx.Int32(NUM_CU * _wgs_per_cu)), _raw(tw)
+            )
             grid_x = arith.index_cast(T.index, grid_i32)
         else:
             grid_x = arith.index_cast(T.index, i32_max_m_blocks) * fx.Index(
@@ -324,10 +373,13 @@ def compile_gemm2_a4w4_port(
             i32_max_m_blocks,
             arg_out,
             arg_out_scale,
+            arg_counter,
         ).launch(grid=(grid_x, 1, 1), block=(256, 1, 1), stream=stream)
 
     if BM == 16:
         launch_gemm2.compile_hints["llvm_options"] = {"enable-post-misched": False}
+    if occ2:
+        launch_gemm2.compile_hints["waves_per_eu"] = 2
 
     return launch_gemm2
 
@@ -362,6 +414,8 @@ def _gemm2_body(
     BK,
     KH_TILE,
     skippad=False,
+    occ2=False,
+    next_tile=None,
 ):
     _aStages = aStages
     _kMChunks = kmchunks_for(BM)
@@ -516,13 +570,13 @@ def _gemm2_body(
                 k_half=_K_HALF,
             )
 
-    def issue_a_ds_read(slot):
+    def issue_a_ds_read(slot, halves=(0, 1)):
         lane_row = lane_mod_16
         lane_col = lane_div_16 * fx.Int32(16)
         mask = _lds_swizzle_mask(lane_row)
         base_ptr = _lds_ptr3(saq_base_i32, fx.Int32(0))
         a = [[None, None] for _ in range(_kMChunks)]
-        for k in range_constexpr(2):
+        for k in halves:
             lds_col = (lane_col + fx.Int32(k * 64)) ^ mask
             for i in range_constexpr(_kMChunks):
                 lds_row = lane_row + fx.Int32(i * 16)
@@ -546,7 +600,9 @@ def _gemm2_body(
     zero4 = Vec.filled(4, 0.0, fx.Float32)
     accm = [[None, None, None, None] for _ in range(_kMChunks)]
 
-    def mfma_cluster(b_tile, a, a_scale_sub, b_scale_slot, init, kt=0):
+    def mfma_cluster(b_tile, a, a_scale_sub, b_scale_slot, init, kt=0, half=None):
+        # half: only that K half of the tile. Calls for half 0 then half 1 issue
+        # each accumulator's MFMAs in the same order as one call for both.
         _skip_h1 = (kt * 2 + 1) >= _n_real_half
         for J in range_constexpr(4):
             mni = J // 2
@@ -558,26 +614,18 @@ def _gemm2_body(
                 sa = a_scale_sub[sub]
                 i0 = sub * 2
                 i1 = sub * 2 + 1
-                if const_expr(init):
+                if const_expr(half != 1):
+                    c0 = zero4 if const_expr(init) else accm[i0][J]
                     accm[i0][J] = _mfma(
-                        mfma_res_ty, [a[i0][0], b_J0, zero4, 4, 4, 0, sa, 0 + in_b, sb]
+                        mfma_res_ty, [a[i0][0], b_J0, c0, 4, 4, 0, sa, 0 + in_b, sb]
                     )
                     if const_expr(_kMChunks > 1):
+                        c1 = zero4 if const_expr(init) else accm[i1][J]
                         accm[i1][J] = _mfma(
                             mfma_res_ty,
-                            [a[i1][0], b_J0, zero4, 4, 4, 1, sa, 0 + in_b, sb],
+                            [a[i1][0], b_J0, c1, 4, 4, 1, sa, 0 + in_b, sb],
                         )
-                else:
-                    accm[i0][J] = _mfma(
-                        mfma_res_ty,
-                        [a[i0][0], b_J0, accm[i0][J], 4, 4, 0, sa, 0 + in_b, sb],
-                    )
-                    if const_expr(_kMChunks > 1):
-                        accm[i1][J] = _mfma(
-                            mfma_res_ty,
-                            [a[i1][0], b_J0, accm[i1][J], 4, 4, 1, sa, 0 + in_b, sb],
-                        )
-                if const_expr(not _skip_h1):
+                if const_expr(half != 0 and not _skip_h1):
                     accm[i0][J] = _mfma(
                         mfma_res_ty,
                         [a[i0][1], b_J1, accm[i0][J], 4, 4, 2, sa, 2 + in_b, sb],
@@ -591,7 +639,26 @@ def _gemm2_body(
     def _kloop_fence():
         gpu.barrier()
 
-    if const_expr(_K_TILES_TOTAL <= kStages):
+    if const_expr(occ2):
+        # Two WGs per CU leave 256 VGPRs: hold the A operand one K half at a time.
+        a_scale_v = [load_a_scale_tile(kt) for kt in range_constexpr(_K_TILES_TOTAL)]
+        b_scale_v = [load_b_scale_tile(kt) for kt in range_constexpr(_K_TILES_TOTAL)]
+        b = [load_b_tile(kt) for kt in range_constexpr(_K_TILES_TOTAL)]
+        for kt in range_constexpr(_K_TILES_TOTAL):
+            _kloop_fence()
+            a_scale_sub = [a_scale_v[kt][sub] for sub in range_constexpr(_kSubBlocks)]
+            for h in range_constexpr(2):
+                a = issue_a_ds_read(kt % kStages, halves=(h,))
+                mfma_cluster(
+                    b[kt],
+                    a,
+                    a_scale_sub,
+                    b_scale_v[kt],
+                    init=(kt == 0 and h == 0),
+                    kt=kt,
+                    half=h,
+                )
+    elif const_expr(_K_TILES_TOTAL <= kStages):
         a_scale_v = [load_a_scale_tile(kt) for kt in range_constexpr(_K_TILES_TOTAL)]
         b_scale_v = [load_b_scale_tile(kt) for kt in range_constexpr(_K_TILES_TOTAL)]
         b = [load_b_tile(kt) for kt in range_constexpr(_K_TILES_TOTAL)]
@@ -626,6 +693,36 @@ def _gemm2_body(
             a_scale_sub = [a_scale_v[kt][sub] for sub in range_constexpr(_kSubBlocks)]
             mfma_cluster(b[kt], a, a_scale_sub, b_scale_v[kt], init=False)
 
+    if const_expr(next_tile is not None):
+        # Claim the next work item here, where the VGPRs of A and B are free; the
+        # epilogue stores cover the atomic's latency. Only thread 0's offset is in
+        # range, so the other lanes are dropped without a divergent branch (a
+        # VMEM result defined in one gets a vmcnt(0) where it joins). pid >> 31
+        # is 0; it keeps the select from being hoisted out of the tile loop.
+        ctr_rsrc, pid, xc, first_claim, slot_i32 = next_tile
+        ctr_off = fx.Int32(
+            arith.select(
+                _raw(lane == (pid >> fx.Int32(31))),
+                _raw(xc * fx.Int32(4) + wave * fx.Int32(32)),
+                _raw(fx.Int32(32)),
+            )
+        )
+        claimed = fx.Int32(
+            llvm.call_intrinsic(
+                T.i32,
+                "llvm.amdgcn.raw.ptr.buffer.atomic.add.i32",
+                [
+                    _raw(fx.Int32(1)),
+                    _raw(ctr_rsrc),
+                    _raw(ctr_off),
+                    _raw(fx.Int32(0)),
+                    _raw(fx.Int32(0)),
+                ],
+                [],
+                [],
+            )
+        )
+
     if epilog == "nonatomic":
         out_base = _global_base_ptr1(arg_out)
         _flat_bf16_epilog(
@@ -645,6 +742,7 @@ def _gemm2_body(
             _kMChunks,
             lds_acc_base_i32,
             pad_skip=pad_skip,
+            passes=2 if occ2 else 1,
         )
     elif epilog == "nonatomic_cshuffle":
         _cshuffle_flat_bf16_epilog(
@@ -694,6 +792,14 @@ def _gemm2_body(
             BN,
         )
 
+    if const_expr(next_tile is not None):  # noqa: SIM102 - device predicate
+        # Wave 0 publishes thread 0's claim for the barrier after the tile.
+        if wave == fx.Int32(0):
+            nxt = first_claim + fx.Int32(8) * fx.Int32(
+                rocdl.readfirstlane(T.i32, _raw(claimed))
+            )
+            llvm.StoreOp(_raw(nxt), _lds_ptr3(slot_i32, fx.Int32(0)))
+
 
 def _flat_bf16_epilog(
     accm, out_base, m_row, n_block_idx, wave, lane, N_OUT, BN, kMChunks
@@ -725,6 +831,7 @@ def _lds_flat_bf16_epilog(
     kMChunks,
     stage_i32,
     pad_skip=None,
+    passes=1,
 ):
     """Epilogue for the swapped-operand layout (lane l: row l%16, columns
     4*(l//16)..+3 of each 16x16 block). Each wave stages its BM x 64 bf16 slice
@@ -735,64 +842,81 @@ def _lds_flat_bf16_epilog(
 
     With pad_skip = (sorted token ids of rows lane / 64 + lane, M, out rsrc),
     padding rows are dropped: the stores go through the buffer descriptor and a
-    padding row gets an out-of-range offset."""
+    padding row gets an out-of-range offset.
+
+    passes=2 stages the slice one row half at a time through a tile of BM/2
+    rows, for half the LDS."""
+    rows = BM // passes
+    chunks = kMChunks // passes
     lane_div_16 = lane // fx.Int32(16)
     lane_mod_16 = lane % fx.Int32(16)
     base_ptr = _lds_ptr3(
-        stage_i32 + wave * fx.Int32(BM * _LDS_EPI_ROW_BYTES), fx.Int32(0)
+        stage_i32 + wave * fx.Int32(rows * _LDS_EPI_ROW_BYTES), fx.Int32(0)
     )
     w_off = lane_mod_16 * fx.Int32(_LDS_EPI_ROW_BYTES) + lane_div_16 * fx.Int32(8)
-    for i in range_constexpr(kMChunks):
-        for J in range_constexpr(4):
-            pk = Vec(accm[i][J]).to(fx.BFloat16)
-            byte_off = w_off + fx.Int32(i * 16 * _LDS_EPI_ROW_BYTES + J * 32)
-            llvm.StoreOp(_raw(pk), _gep3(base_ptr, byte_off), alignment=8)
-    # A wave only reads back what it wrote itself, and LDS executes one wave's
-    # operations in order, so no barrier is needed.
-    rocdl.sched_barrier(0)
-    r_row = lane // fx.Int32(8)
-    r_chunk = lane % fx.Int32(8)
-    r_off = r_row * fx.Int32(_LDS_EPI_ROW_BYTES) + r_chunk * fx.Int32(16)
-    col = n_block_idx * fx.Int32(BN) + wave * fx.Int32(BN // 4) + r_chunk * fx.Int32(8)
-    if const_expr(pad_skip is None):
-        out_base = _global_base_ptr1(arg_out)
-        byte_base = (
-            fx.Int64(m_row + r_row) * fx.Int64(N_OUT) + fx.Int64(col)
-        ) * fx.Int64(2)
-        for k in range_constexpr(BM // 8):
+    for p in range_constexpr(passes):
+        for il in range_constexpr(chunks):
+            for J in range_constexpr(4):
+                pk = Vec(accm[p * chunks + il][J]).to(fx.BFloat16)
+                byte_off = w_off + fx.Int32(il * 16 * _LDS_EPI_ROW_BYTES + J * 32)
+                llvm.StoreOp(_raw(pk), _gep3(base_ptr, byte_off), alignment=8)
+        # A wave only reads back what it wrote itself, and LDS executes one wave's
+        # operations in order, so no barrier is needed, here or before the next
+        # pass overwrites the tile.
+        rocdl.sched_barrier(0)
+        if const_expr(p == 0):
+            r_row = lane // fx.Int32(8)
+            r_chunk = lane % fx.Int32(8)
+            r_off = r_row * fx.Int32(_LDS_EPI_ROW_BYTES) + r_chunk * fx.Int32(16)
+            col = (
+                n_block_idx * fx.Int32(BN)
+                + wave * fx.Int32(BN // 4)
+                + r_chunk * fx.Int32(8)
+            )
+            if const_expr(pad_skip is None):
+                out_base = _global_base_ptr1(arg_out)
+                byte_base = (
+                    fx.Int64(m_row + r_row) * fx.Int64(N_OUT) + fx.Int64(col)
+                ) * fx.Int64(2)
+            else:
+                tok, i32_M, out_rsrc = pad_skip
+                # Bit r of half h: row 64 * h + r of this M block is a real token.
+                valid_rows = [
+                    fx.Int64(
+                        rocdl.ballot(
+                            T.i64, (fx.Int32(t) & fx.Int32(0x00FFFFFF)) < i32_M
+                        )
+                    )
+                    for t in tok
+                ]
+                off_base = (m_row + r_row) * fx.Int32(N_OUT * 2) + col * fx.Int32(2)
+        for kl in range_constexpr(rows // 8):
+            k = p * (rows // 8) + kl
             v = llvm.load(
                 T.vec(4, T.i32),
-                _gep3(base_ptr, r_off + fx.Int32(k * 8 * _LDS_EPI_ROW_BYTES)),
+                _gep3(base_ptr, r_off + fx.Int32(kl * 8 * _LDS_EPI_ROW_BYTES)),
             )
-            llvm.StoreOp(
-                v,
-                _gep1(out_base, byte_base + fx.Int64(k * 8 * N_OUT * 2)),
-                alignment=16,
-            )
-    else:
-        tok, i32_M, out_rsrc = pad_skip
-        # Bit r of half h: row 64 * h + r of this M block is a real token.
-        valid_rows = [
-            fx.Int64(rocdl.ballot(T.i64, (fx.Int32(t) & fx.Int32(0x00FFFFFF)) < i32_M))
-            for t in tok
-        ]
-        off_base = (m_row + r_row) * fx.Int32(N_OUT * 2) + col * fx.Int32(2)
-        for k in range_constexpr(BM // 8):
-            v = llvm.load(
-                T.vec(4, T.i32),
-                _gep3(base_ptr, r_off + fx.Int32(k * 8 * _LDS_EPI_ROW_BYTES)),
-            )
-            bit = fx.Int64(r_row + fx.Int32((k % 8) * 8))
-            valid = ((valid_rows[k // 8] >> bit) & fx.Int64(1)) != fx.Int64(0)
-            # Keep the stores unconditional: a branch around all-padding ones sinks
-            # the LDS read into it, and every store then waits for its own read.
-            buffer_ops.buffer_store(
-                v,
-                out_rsrc,
-                off_base + fx.Int32(k * 8 * N_OUT * 2),
-                mask=valid,
-                offset_is_bytes=True,
-            )
+            if const_expr(pad_skip is None):
+                llvm.StoreOp(
+                    v,
+                    _gep1(out_base, byte_base + fx.Int64(k * 8 * N_OUT * 2)),
+                    alignment=16,
+                )
+            else:
+                bit = fx.Int64(r_row + fx.Int32((k % 8) * 8))
+                valid = ((valid_rows[k // 8] >> bit) & fx.Int64(1)) != fx.Int64(0)
+                # Keep the stores unconditional: a branch around all-padding ones
+                # sinks the LDS read into it, and every store then waits for its
+                # own read.
+                buffer_ops.buffer_store(
+                    v,
+                    out_rsrc,
+                    off_base + fx.Int32(k * 8 * N_OUT * 2),
+                    mask=valid,
+                    offset_is_bytes=True,
+                )
+        if const_expr(passes > 1):
+            rocdl.sched_barrier(0)
 
 
 def _cshuffle_flat_bf16_epilog(
