@@ -165,15 +165,15 @@ def moe_perf_stats(
     us2=None,
     us=None,
     use_g1u1=True,
-    route_out=False,
 ):
-    """route_out: stage2 GEMM writes per-route rows for a separate reducer; s2_*
-    then counts that write (the GEMM's own traffic), the total keeps the
-    minimal bytes."""
+    """s2_* count the stage2 GEMM's own traffic: it writes one model_dim row per
+    (token, expert) route, as atomics into the output or as rows for a separate
+    reducer, so both reductions count the same bytes. The total keeps the minimal
+    bytes (output written once)."""
     args = (token, model_dim, inter_dim, topk, n_active, q_type, a_dtype, w_dtype)
     b1 = moe_stage1_bytes(*args, use_g1u1=use_g1u1)
     b2 = moe_stage2_bytes(*args)
-    b2_gemm = moe_stage2_bytes(*args, route_out=route_out)
+    b2_gemm = moe_stage2_bytes(*args, route_out=True)
     f1, f2 = moe_stage_flops(token, model_dim, inter_dim, topk, use_g1u1)
     peak = mfma_peak_tflops(a_dtype, w_dtype)
     if us is None and us1 and us2:
@@ -204,10 +204,9 @@ _ROUTE_REDUCE_KEYS = ("moe_reduction", "scatter_reduce")
 
 
 def stage_gemm_us(kernel_times):
-    """Split per-kernel times of one fused_moe call into (stage1 GEMM us, stage2
-    GEMM us, route_out), matched by kernel name. Sorting, quant, scale sort and
-    the stage2 reducer are not counted; route_out says a reducer ran, i.e. the
-    stage2 GEMM wrote per-route rows."""
+    """Split per-kernel times into (stage1 GEMM us, stage2 GEMM us, stage2 reducer
+    us), matched by kernel name; None where no kernel matches. Sorting, quant and
+    scale sort are not counted."""
 
     def pick(keys):
         ts = [t for n, t in kernel_times.items() if any(k in n.lower() for k in keys)]
@@ -216,7 +215,7 @@ def stage_gemm_us(kernel_times):
     return (
         pick(_STAGE1_GEMM_KEYS),
         pick(_STAGE2_GEMM_KEYS),
-        pick(_ROUTE_REDUCE_KEYS) is not None,
+        pick(_ROUTE_REDUCE_KEYS),
     )
 
 
@@ -691,12 +690,15 @@ def test_fmoe(
             )
         finally:
             aiter.fused_moe.kernel_bench_callable = None
-        kernel_us = {}
+        kernel_us, kernel_times = {}, {}
         for _name, _call in kernel_bench_callable:
-            _, _us = run_perftest(_call, num_iters=100, num_warmup=5)
+            _, _us = run_perftest(
+                _call, num_iters=100, num_warmup=5, kernel_times=kernel_times
+            )
             kernel_us[_name] = _us
         us1 = kernel_us.get("stage1")
         us2_stage = kernel_us.get("stage2")
+        us_g1, us_g2, us_reduce = stage_gemm_us(kernel_times)
         if not kernel_us:
             logger.warning(
                 "kernel_bench: no kernels captured (non-2stage/1stage path?) (quant:%s)",
@@ -709,11 +711,17 @@ def test_fmoe(
                 "n/a" if us2_stage is None else f"{us2_stage:.2f}",
                 AQDType,
             )
+        us_total = (us1 or 0.0) + (us2_stage or 0.0)
         return {
-            "us": (us1 or 0.0) + (us2_stage or 0.0),
+            "us": us_total,
             "us_stage1": us1,
             "us_stage2": us2_stage,
-            **moe_perf_stats(*perf_args, us1=us1, us2=us2_stage, use_g1u1=use_g1u1),
+            "us_reduce": us_reduce,
+            "us_gemm1": us_g1,
+            "us_gemm2": us_g2,
+            **moe_perf_stats(
+                *perf_args, us1=us_g1, us2=us_g2, us=us_total, use_g1u1=use_g1u1
+            ),
         }
 
     kernel_times = {}
@@ -729,7 +737,7 @@ def test_fmoe(
         kernel_times=kernel_times,
         **_fused_moe_kwargs,
     )
-    us_s1, us_s2, route_out = stage_gemm_us(kernel_times)
+    us_s1, us_s2, _ = stage_gemm_us(kernel_times)
     # Regression guard for aiter #3117 (MXFP4 fused-MoE stage2 EP-prefill):
     # the unfixed K-padding tail-tile path leaves the padded lanes uninitialized,
     # producing NaN in the fused_moe output. checkAllclose's err/logits_diff can be
@@ -795,7 +803,6 @@ def test_fmoe(
             us2=us_s2,
             us=us2,
             use_g1u1=use_g1u1,
-            route_out=route_out,
         ),
     }
 
